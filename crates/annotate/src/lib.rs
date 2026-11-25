@@ -443,6 +443,155 @@ impl Item {
         }
     }
 
+    pub fn text(&self) -> Option<&str> {
+        match &self.shape {
+            Shape::Text { text, .. } | Shape::Balloon { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Top-left of the first line of an editable item's text, as it is drawn.
+    pub fn text_origin(&self) -> Option<PointF> {
+        match &self.shape {
+            Shape::Text { at, .. } => Some(*at),
+            Shape::Balloon { r, .. } => {
+                let n = r.norm();
+                let pad = self.style.font_size * 0.5;
+                Some(PointF::new(n.x0 + pad, n.y0 + pad))
+            }
+            _ => None,
+        }
+    }
+
+    fn text_line_height(&self) -> f32 {
+        text::layout(" ", self.style.font_size, false).line_height
+    }
+
+    /// Byte index of the caret position nearest to `p` in an editable item's text.
+    pub fn caret_index_at(&self, p: PointF) -> Option<usize> {
+        let s = self.text()?;
+        let o = self.text_origin()?;
+        let lh = self.text_line_height();
+        let lines: Vec<&str> = s.split('\n').collect();
+        let li = (((p.y - o.y) / lh).floor().max(0.0) as usize).min(lines.len() - 1);
+        let start: usize = lines[..li].iter().map(|l| l.len() + 1).sum();
+        let line = lines[li];
+        let pos = text::caret_positions(line, self.style.font_size, false);
+        let x = p.x - o.x;
+        let ci = (0..pos.len()).min_by(|&a, &b| (pos[a] - x).abs().total_cmp(&(pos[b] - x).abs())).unwrap_or(0);
+        Some(start + line.char_indices().nth(ci).map_or(line.len(), |(b, _)| b))
+    }
+
+    /// Where to draw the caret at byte index `caret`: (x, top y, height) in document space.
+    pub fn caret_point(&self, caret: usize) -> Option<(f32, f32, f32)> {
+        let s = self.text()?;
+        let o = self.text_origin()?;
+        let lh = self.text_line_height();
+        let c = floor_boundary(s, caret);
+        let before = &s[..c];
+        let li = before.matches('\n').count();
+        let ls = before.rfind('\n').map_or(0, |i| i + 1);
+        let x = text::caret_positions(&s[ls..c], self.style.font_size, false).last().copied().unwrap_or(0.0);
+        Some((o.x + x, o.y + li as f32 * lh, lh))
+    }
+
+    /// Inserts `s` at byte index `caret` and moves the caret past it.
+    pub fn insert_at_caret(&mut self, caret: &mut usize, s: &str) -> bool {
+        let Some(t) = self.text_mut() else { return false };
+        let c = floor_boundary(t, *caret);
+        t.insert_str(c, s);
+        *caret = c + s.len();
+        true
+    }
+
+    /// Deletes the char before (Backspace) or after (Delete) the caret.
+    pub fn delete_at_caret(&mut self, caret: &mut usize, forward: bool) -> bool {
+        let Some(t) = self.text_mut() else { return false };
+        let c = floor_boundary(t, *caret);
+        let range = if forward {
+            let Some(ch) = t[c..].chars().next() else { return false };
+            c..c + ch.len_utf8()
+        } else {
+            let Some(ch) = t[..c].chars().next_back() else { return false };
+            c - ch.len_utf8()..c
+        };
+        *caret = range.start;
+        t.replace_range(range, "");
+        true
+    }
+
+    /// Removes the text between byte indices `a` and `b` (either order). Returns the start.
+    pub fn delete_range(&mut self, a: usize, b: usize) -> usize {
+        let Some(t) = self.text_mut() else { return a.min(b) };
+        let (lo, hi) = (floor_boundary(t, a.min(b)), floor_boundary(t, a.max(b)));
+        t.replace_range(lo..hi, "");
+        lo
+    }
+
+    /// Highlight boxes (document space) covering the text between `a` and `b`, one per line.
+    pub fn selection_rects(&self, a: usize, b: usize) -> Vec<Bx> {
+        let (Some(t), Some(o)) = (self.text(), self.text_origin()) else { return Vec::new() };
+        let (lo, hi) = (floor_boundary(t, a.min(b)), floor_boundary(t, a.max(b)));
+        if lo == hi {
+            return Vec::new();
+        }
+        let size = self.style.font_size;
+        let lh = self.text_line_height();
+        let mut out = Vec::new();
+        let mut ls = 0;
+        for (li, line) in t.split('\n').enumerate() {
+            let le = ls + line.len();
+            let (s, e) = (lo.max(ls), hi.min(le));
+            let covers_break = lo <= le && hi > le;
+            if s < e || covers_break {
+                let pos = text::caret_positions(line, size, false);
+                let x_of = |i: usize| pos[line[..i - ls].chars().count()];
+                // A selected line break shows as a little extra width, as in Windows.
+                let x1 = x_of(e) + if covers_break { size * 0.3 } else { 0.0 };
+                let y = o.y + li as f32 * lh;
+                out.push(Bx { x0: o.x + x_of(s), y0: y, x1: o.x + x1, y1: y + lh });
+            }
+            ls = le + 1;
+        }
+        out
+    }
+
+    /// The word (or run of spaces / punctuation) around byte index `i`, for double-click.
+    pub fn word_at(&self, i: usize) -> (usize, usize) {
+        let Some(t) = self.text() else { return (i, i) };
+        let i = floor_boundary(t, i);
+        let class = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c == '\n' { 2 } else if c.is_whitespace() { 1 } else { 3 };
+        let Some(k) = t[i..].chars().next().or_else(|| t[..i].chars().next_back()).map(class) else { return (i, i) };
+        if k == 2 {
+            return (i, i);
+        }
+        let start = t[..i].char_indices().rev().take_while(|&(_, c)| class(c) == k).last().map_or(i, |(b, _)| b);
+        let end = t[i..].char_indices().find(|&(_, c)| class(c) != k).map_or(t.len(), |(b, _)| i + b);
+        (start, end)
+    }
+
+    /// The caret index after an arrow / Home / End key.
+    pub fn move_caret(&self, caret: usize, m: CaretMove) -> usize {
+        let Some(t) = self.text() else { return caret };
+        let c = floor_boundary(t, caret);
+        let ls = t[..c].rfind('\n').map_or(0, |i| i + 1);
+        let le = t[c..].find('\n').map_or(t.len(), |i| c + i);
+        match m {
+            CaretMove::Left => t[..c].chars().next_back().map_or(c, |ch| c - ch.len_utf8()),
+            CaretMove::Right => t[c..].chars().next().map_or(c, |ch| c + ch.len_utf8()),
+            CaretMove::Home => ls,
+            CaretMove::End => le,
+            CaretMove::Up | CaretMove::Down => {
+                let Some((x, y, h)) = self.caret_point(c) else { return c };
+                let y = if m == CaretMove::Up { y - h / 2.0 } else { y + h * 1.5 };
+                if (m == CaretMove::Up && ls == 0) || (m == CaretMove::Down && le == t.len()) {
+                    return c;
+                }
+                self.caret_index_at(PointF::new(x, y)).unwrap_or(c)
+            }
+        }
+    }
+
     pub fn translate(&mut self, dx: f32, dy: f32) {
         let mv = |p: &mut PointF| *p = p.offset(dx, dy);
         match &mut self.shape {
@@ -960,6 +1109,26 @@ pub fn draw_image(pm: &mut PixmapMut, img: &Pixmap, r: Bx, t: Transform) {
     pm.fill_rect(rect, &paint, t, None);
 }
 
+/// Caret keys while typing into a text or balloon item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaretMove {
+    Left,
+    Right,
+    Home,
+    End,
+    Up,
+    Down,
+}
+
+/// `i` clamped into `s` and moved back to a char boundary.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut c = i.min(s.len());
+    while !s.is_char_boundary(c) {
+        c -= 1;
+    }
+    c
+}
+
 /// Simple snapshot-based undo/redo.
 #[derive(Clone, Debug, Default)]
 pub struct History<T: Clone> {
@@ -1015,6 +1184,59 @@ mod tests {
         ];
         v.extend(Sticker::ALL.iter().map(|s| Tool::Sticker(*s)));
         v
+    }
+
+    #[test]
+    fn caret_maps_clicks_to_text_positions_and_back() {
+        if !text::available() {
+            return; // no system fonts (non-Windows CI)
+        }
+        let mut it = Item::begin(Tool::Text, PointF::new(10.0, 20.0), Style::default(), &[], Rgba::WHITE).unwrap();
+        it.text_mut().unwrap().push_str("Hello\nWörld");
+        let s = it.text().unwrap().to_string();
+        // Every char boundary round-trips: its caret point clicks back to it.
+        for (b, _) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
+            let (x, y, h) = it.caret_point(b).unwrap();
+            assert_eq!(it.caret_index_at(PointF::new(x, y + h / 2.0)), Some(b), "byte {b}");
+        }
+        // Clicks left of, right of, above and below the text clamp to the nearest position.
+        let (_, y2, h) = it.caret_point(7).unwrap();
+        assert_eq!(it.caret_index_at(PointF::new(-50.0, 0.0)), Some(0));
+        assert_eq!(it.caret_index_at(PointF::new(500.0, 25.0)), Some(5));
+        assert_eq!(it.caret_index_at(PointF::new(500.0, y2 + h * 5.0)), Some(s.len()));
+        assert!(Item::begin(Tool::Rect, PointF::new(0.0, 0.0), Style::default(), &[], Rgba::WHITE).unwrap().caret_point(0).is_none());
+
+        // Typing, deleting and moving happen at the caret, never inside a multi-byte char.
+        let mut c = 1;
+        assert!(it.insert_at_caret(&mut c, "é"));
+        assert_eq!((it.text().unwrap(), c), ("Héello\nWörld", 3));
+        assert!(it.delete_at_caret(&mut c, false));
+        assert_eq!((it.text().unwrap(), c), ("Hello\nWörld", 1));
+        assert!(it.delete_at_caret(&mut c, true));
+        assert_eq!((it.text().unwrap(), c), ("Hllo\nWörld", 1));
+        assert!(!it.delete_at_caret(&mut 0, false));
+        assert_eq!(it.move_caret(1, CaretMove::End), 4);
+        assert_eq!(it.move_caret(4, CaretMove::Right), 5);
+        assert_eq!(it.move_caret(6, CaretMove::Right), 8); // over "ö"
+        assert_eq!(it.move_caret(8, CaretMove::Left), 6);
+        assert_eq!(it.move_caret(7, CaretMove::Left), 5); // mid-char index snaps back first
+        assert_eq!(it.move_caret(6, CaretMove::Home), 5);
+        assert!(it.move_caret(2, CaretMove::Down) > 5);
+        assert!(it.move_caret(8, CaretMove::Up) <= 4);
+        assert_eq!(it.move_caret(2, CaretMove::Up), 2);
+        assert_eq!(it.move_caret(8, CaretMove::Down), 8);
+
+        // Selections: one highlight per touched line, words for double-click, range delete.
+        assert!(it.selection_rects(3, 3).is_empty());
+        assert_eq!(it.selection_rects(1, 3).len(), 1);
+        let two = it.selection_rects(8, 2); // "lo\nWö" — either order
+        assert_eq!(two.len(), 2);
+        assert!(two[0].y1 <= two[1].y0 + 0.01 && two[0].x0 > two[1].x0);
+        assert_eq!(it.word_at(2), (0, 4));
+        assert_eq!(it.word_at(8), (5, 11));
+        assert_eq!(it.word_at(4), (4, 4)); // the line break itself
+        assert_eq!(it.delete_range(8, 2), 2);
+        assert_eq!(it.text().unwrap(), "Hlrld");
     }
 
     #[test]

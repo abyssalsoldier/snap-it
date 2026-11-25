@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::chrome::Chrome;
 use super::dialogs::{self, Answer};
 use super::icons::Icon;
+use super::text_caret::{TextCaret, TextUndo, Typed};
 use super::theme::{self, Theme};
 use super::tool_options::{ColorHit, ColorPopup, Opt, OptHit, OptionsBar, Values};
 use super::toolbar::{self, StickerPopup, Toolbar};
@@ -90,6 +91,8 @@ enum Drag {
     ResizeItem { idx: usize, corner: usize, before: Vec<Item> },
     Crop { a: PointF, b: PointF },
     Cut { a: PointF, b: PointF },
+    /// Dragging across the text being edited to select it.
+    SelectText,
 }
 
 type Snapshot = (Rc<Pixmap>, Vec<Item>);
@@ -129,6 +132,10 @@ struct Editor {
     drag: Drag,
     editing: Option<usize>,
     edit_before: Option<Vec<Item>>,
+    /// Caret and selection in the text being edited.
+    caret: TextCaret,
+    /// Step-by-step undo inside the text box being edited.
+    text_undo: TextUndo,
     selected: Option<usize>,
     cursor: (i32, i32),
     space: bool,
@@ -197,6 +204,8 @@ fn create(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>, blank: bool) {
         drag: Drag::None,
         editing: None,
         edit_before: None,
+        caret: TextCaret::default(),
+        text_undo: TextUndo::default(),
         selected: None,
         cursor: (0, 0),
         space: false,
@@ -467,14 +476,26 @@ impl Editor {
 
     // ---------- editing operations ----------
 
+    /// One Ctrl+Z (or Ctrl+Y, `redo`) inside the text box being edited. False when the
+    /// box has no step left, so the window's own undo / redo should run instead.
+    fn text_step(&mut self, redo: bool) -> bool {
+        let Some(it) = self.editing.and_then(|i| self.items.get_mut(i)) else { return false };
+        let done = if redo { self.text_undo.redo(it, &mut self.caret) } else { self.text_undo.undo(it, &mut self.caret) };
+        if done {
+            self.comp_dirty = true;
+        }
+        done
+    }
+
     fn commit_text(&mut self) {
         let Some(i) = self.editing.take() else { return };
+        self.text_undo = TextUndo::default();
         let before = self.edit_before.take();
         if i < self.items.len() {
             let empty = self.items[i].text_mut().is_some_and(|t| t.trim().is_empty());
             if empty && matches!(self.items[i].shape, Shape::Text { .. }) {
                 self.items.remove(i);
-            } else if let Some(b) = before {
+            } else if let Some(b) = before.filter(|b| *b != self.items) {
                 self.push_items(b);
                 self.dirty = true;
             }
@@ -482,7 +503,43 @@ impl Editor {
         self.comp_dirty = true;
     }
 
+    /// Reopens an existing text or balloon item for typing (double-click with the pointer),
+    /// with the caret where it was clicked.
+    fn edit_existing_text(&mut self, i: usize, p: PointF) -> bool {
+        let Some(caret) = self.items.get(i).and_then(|it| it.caret_index_at(p)) else { return false };
+        self.select(Some(i));
+        self.selected = None;
+        self.editing = Some(i);
+        self.edit_before = Some(self.items.clone());
+        self.caret = TextCaret::at(caret);
+        self.comp_dirty = true;
+        true
+    }
+
+    /// A press on the text being edited moves the caret there and starts a drag-select
+    /// (Shift extends the selection, a double-click selects the word). False when it missed.
+    fn click_in_edit(&mut self, p: PointF, dbl: bool) -> bool {
+        let Some(it) = self.editing.and_then(|i| self.items.get(i)) else { return false };
+        if !it.bounds().contains(p) {
+            return false;
+        }
+        if let Some(c) = it.caret_index_at(p) {
+            if dbl {
+                let (a, b) = it.word_at(c);
+                self.caret = TextCaret { caret: b, anchor: a };
+            } else {
+                self.caret.place(c, super::shift());
+                self.drag = Drag::SelectText;
+            }
+        }
+        true
+    }
+
     fn undo(&mut self) {
+        // While typing, step back inside the text box first.
+        if self.text_step(false) {
+            return;
+        }
         self.commit_text();
         if let Some((b, i)) = self.history.undo(self.undo_state()) {
             self.base = b;
@@ -494,6 +551,10 @@ impl Editor {
     }
 
     fn redo(&mut self) {
+        if self.text_step(true) {
+            return;
+        }
+        self.commit_text();
         if let Some((b, i)) = self.history.redo(self.undo_state()) {
             self.base = b;
             self.items = i;
@@ -934,7 +995,7 @@ impl Editor {
 
     // ---------- input ----------
 
-    fn mouse_down(&mut self, w: &mut Win, x: i32, y: i32) {
+    fn mouse_down(&mut self, w: &mut Win, x: i32, y: i32, dbl: bool) {
         if let Some(pr) = self.popup_rect() {
             if pr.contains(x, y) {
                 match self.popup {
@@ -979,6 +1040,18 @@ impl Editor {
             self.drag = Drag::Pan { start: (x, y), off0: self.off };
             return;
         }
+        if self.click_in_edit(self.to_img(x, y), dbl) {
+            return;
+        }
+        if dbl && self.tool == ETool::Ann(Tool::Pointer) {
+            self.commit_text();
+            let p = self.to_img(x, y);
+            if let Some(i) = ann::hit_test(&self.items, p) {
+                if self.edit_existing_text(i, p) {
+                    return;
+                }
+            }
+        }
         self.commit_text();
         let p = self.to_img(x, y);
         match self.tool {
@@ -1007,6 +1080,7 @@ impl Editor {
                         Tool::Text => {
                             self.editing = Some(self.items.len() - 1);
                             self.edit_before = Some(before);
+                            self.caret = TextCaret::at(0);
                         }
                         Tool::Step => {
                             self.push_items(before);
@@ -1028,6 +1102,11 @@ impl Editor {
         let shift = super::shift();
         match &mut self.drag {
             Drag::None => {}
+            Drag::SelectText => {
+                if let Some(c) = self.editing.and_then(|i| self.items.get(i)).and_then(|it| it.caret_index_at(p)) {
+                    self.caret.place(c, true);
+                }
+            }
             Drag::Pan { start, off0 } => {
                 self.off = (off0.0 + (x - start.0) as f32, off0.1 + (y - start.1) as f32);
                 self.fit = false;
@@ -1096,6 +1175,7 @@ impl Editor {
                         }
                         self.editing = Some(self.items.len() - 1);
                         self.edit_before = Some(before);
+                        self.caret = TextCaret::at(0);
                     }
                     Some(it) if it.is_degenerate() => {
                         self.items.pop();
@@ -1125,17 +1205,19 @@ impl Editor {
         let ctrl = super::ctrl();
         let shift = super::shift();
         if self.editing.is_some() {
-            if vk == 0x1B {
-                self.commit_text();
-            } else if vk == 0x56 && ctrl {
-                if let (Some(i), Some(t)) = (self.editing, crate::clipboard::get_text()) {
-                    if let Some(s) = self.items.get_mut(i).and_then(|it| it.text_mut()) {
-                        s.push_str(&t.replace("\r\n", "\n"));
+            if ctrl && matches!(vk, 0x5A | 0x59) {
+                // Falls through to undo / redo, which step through the box's own
+                // history first.
+            } else {
+                if vk == 0x1B {
+                    self.commit_text();
+                } else if let Some(it) = self.editing.and_then(|i| self.items.get_mut(i)) {
+                    if self.caret.key_down(it, &mut self.text_undo, vk, ctrl, shift) {
                         self.comp_dirty = true;
                     }
                 }
+                return;
             }
-            return;
         }
         match vk {
             0x20 => self.space = true,
@@ -1206,26 +1288,12 @@ impl Editor {
 
     fn char_input(&mut self, c: u32) {
         let Some(i) = self.editing else { return };
-        let Some(s) = self.items.get_mut(i).and_then(|it| it.text_mut()) else { return };
-        match c {
-            0x08 => {
-                s.pop();
-            }
-            0x0D => {
-                if super::shift() {
-                    s.push('\n');
-                } else {
-                    return self.commit_text();
-                }
-            }
-            c if c >= 0x20 => {
-                if let Some(ch) = char::from_u32(c) {
-                    s.push(ch);
-                }
-            }
-            _ => return,
+        let Some(it) = self.items.get_mut(i) else { return };
+        match self.caret.char_input(it, &mut self.text_undo, c) {
+            Typed::Edited => self.comp_dirty = true,
+            Typed::Commit => self.commit_text(),
+            Typed::Ignored => {}
         }
-        self.comp_dirty = true;
     }
 
     fn cursor_shape(&self) -> windows::core::PCWSTR {
@@ -1346,23 +1414,22 @@ impl Editor {
                 let dash = Stroke { width: 1.0, dash: StrokeDash::new(vec![3.0, 3.0], 0.0), ..Default::default() };
                 pm.stroke_path(&p, &t.accent.paint(), &dash, id, None);
             }
-            // Caret at the end of the text.
-            let l = text::layout(it.text_mut_clone().as_deref().unwrap_or(""), it.style.font_size, false);
-            let (tx, ty) = match &it.shape {
-                Shape::Text { at, .. } => (at.x, at.y),
-                Shape::Balloon { r, .. } => {
-                    let n = r.norm();
-                    (n.x0 + it.style.font_size * 0.5, n.y0 + it.style.font_size * 0.5)
+            let (lo, hi) = self.caret.range();
+            for r in it.selection_rects(lo, hi) {
+                let (x0, y0) = self.to_screen(PointF::new(r.x0, r.y0));
+                let (x1, y1) = self.to_screen(PointF::new(r.x1, r.y1));
+                if let Some(rc) = snapit_gfx::tiny_skia::Rect::from_ltrb(x0, y0, x1, y1) {
+                    pm.fill_rect(rc, &t.accent.with_alpha(90).paint(), id, None);
                 }
-                _ => (0.0, 0.0),
-            };
-            let line_y = ty + (l.lines.max(1) - 1) as f32 * l.line_height;
-            let (sx, sy) = self.to_screen(PointF::new(tx + l.last_line_width + 1.0, line_y));
-            let mut pb = PathBuilder::new();
-            pb.move_to(sx, sy);
-            pb.line_to(sx, sy + l.line_height * self.zoom);
-            if let Some(p) = pb.finish() {
-                pm.stroke_path(&p, &t.text.paint(), &Stroke { width: 1.5 * s, ..Default::default() }, id, None);
+            }
+            if let Some((cx, cy, ch)) = it.caret_point(self.caret.caret) {
+                let (sx, sy) = self.to_screen(PointF::new(cx + 1.0, cy));
+                let mut pb = PathBuilder::new();
+                pb.move_to(sx, sy);
+                pb.line_to(sx, sy + ch * self.zoom);
+                if let Some(p) = pb.finish() {
+                    pm.stroke_path(&p, &t.text.paint(), &Stroke { width: 1.5 * s, ..Default::default() }, id, None);
+                }
             }
         }
         // Crop / cut-out previews.
@@ -1478,19 +1545,6 @@ fn tool_options_empty(t: Tool) -> bool {
     super::tool_options::options_for(t).is_empty() && !matches!(t, Tool::Pointer)
 }
 
-trait TextClone {
-    fn text_mut_clone(&self) -> Option<String>;
-}
-
-impl TextClone for Item {
-    fn text_mut_clone(&self) -> Option<String> {
-        match &self.shape {
-            Shape::Text { text, .. } | Shape::Balloon { text, .. } => Some(text.clone()),
-            _ => None,
-        }
-    }
-}
-
 impl Handler for Editor {
     fn snapshot(&self) -> Option<Pixmap> {
         self.bb.as_ref()?.to_pixmap()
@@ -1569,7 +1623,7 @@ impl Handler for Editor {
                     self.chrome.press(self.client.0, self.scale, x, y);
                     return Some(LRESULT(0));
                 }
-                self.mouse_down(w, x, y);
+                self.mouse_down(w, x, y, msg == WM_LBUTTONDBLCLK);
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {

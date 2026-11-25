@@ -275,7 +275,7 @@ pub fn run(dir: &Path) -> i32 {
     key(ov, b'T');
     click(ov, 600, 470);
     type_text(ov, "Ship it!");
-    send(ov, WM_CHAR, 0x0D, 0);
+    send(ov, WM_CHAR, 0x0A, 0); // Ctrl+Enter finishes the text (Enter adds a line)
     key(ov, b'N');
     click(ov, 135, 410);
     click(ov, 135, 440);
@@ -286,7 +286,7 @@ pub fn run(dir: &Path) -> i32 {
     key(ov, b'K');
     drag(ov, (720, 520), (900, 580));
     type_text(ov, "Looks great");
-    send(ov, WM_CHAR, 0x0D, 0);
+    send(ov, WM_CHAR, 0x0A, 0); // Ctrl+Enter finishes the text (Enter adds a line)
     key(ov, b'G');
     drag(ov, (600, 280), (940, 300));
     key(ov, b'M');

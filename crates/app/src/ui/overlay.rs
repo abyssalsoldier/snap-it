@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETCURSOR, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use super::text_caret::{TextCaret, TextUndo, Typed};
 use super::theme::{self, Theme};
 use super::tool_options::{options_for, ColorHit, ColorPopup, Opt, OptHit, OptionsBar, Values};
 use super::toolbar::{self, StickerPopup, Toolbar};
@@ -104,6 +105,8 @@ enum Drag {
     Draw { start: PointF, before: Vec<Item> },
     MoveItem { idx: usize, last: PointF, before: Option<Vec<Item>> },
     Ruler,
+    /// Dragging across the text being edited to select it.
+    SelectText,
 }
 
 struct Overlay {
@@ -140,6 +143,10 @@ struct Overlay {
     style: Style,
     editing: Option<usize>,
     edit_before: Option<Vec<Item>>,
+    /// Caret and selection in the text being edited.
+    caret: TextCaret,
+    /// Step-by-step undo inside the text box being edited.
+    text_undo: TextUndo,
     selected: Option<usize>,
     /// Full-screen screenshot + annotations. Patched locally when items change, so
     /// moving or resizing the selection never re-renders anything.
@@ -248,6 +255,8 @@ pub fn open(mode: Mode) {
         style,
         editing: None,
         edit_before: None,
+        caret: TextCaret::default(),
+        text_undo: TextUndo::default(),
         selected: None,
         comp_dirty: false,
         item_sigs: Vec::new(),
@@ -764,18 +773,65 @@ impl Overlay {
 
     // ---------- finishing ----------
 
+    /// One Ctrl+Z (or Ctrl+Y, `redo`) inside the text box being edited. False when the
+    /// box has no step left, so the window's own undo / redo should run instead.
+    fn text_step(&mut self, redo: bool) -> bool {
+        let Some(it) = self.editing.and_then(|i| self.items.get_mut(i)) else { return false };
+        let done = if redo { self.text_undo.redo(it, &mut self.caret) } else { self.text_undo.undo(it, &mut self.caret) };
+        if done {
+            self.comp_dirty = true;
+        }
+        done
+    }
+
     fn commit_text(&mut self) {
         let Some(i) = self.editing.take() else { return };
+        self.text_undo = TextUndo::default();
         let before = self.edit_before.take();
         if i < self.items.len() {
             let empty = self.items[i].text_mut().is_some_and(|t| t.trim().is_empty());
             if empty && matches!(self.items[i].shape, Shape::Text { .. }) {
                 self.items.remove(i);
-            } else if let Some(b) = before {
+            } else if let Some(b) = before.filter(|b| *b != self.items) {
                 self.history.push(b);
             }
         }
         self.comp_dirty = true;
+    }
+
+    /// Reopens the text or balloon item under (x, y) for typing (double-click with the pointer).
+    fn edit_text_at(&mut self, x: i32, y: i32) -> bool {
+        // Committing may drop an empty text item, so hit-test afterwards.
+        self.commit_text();
+        let p = self.doc_point(x, y);
+        let Some(i) = ann::hit_test(&self.items, p) else { return false };
+        let Some(caret) = self.items[i].caret_index_at(p) else { return false };
+        self.select(Some(i));
+        self.selected = None;
+        self.editing = Some(i);
+        self.edit_before = Some(self.items.clone());
+        self.caret = TextCaret::at(caret);
+        self.comp_dirty = true;
+        true
+    }
+
+    /// A press on the text being edited moves the caret there and starts a drag-select
+    /// (Shift extends the selection, a double-click selects the word). False when it missed.
+    fn click_in_edit(&mut self, p: PointF, dbl: bool) -> bool {
+        let Some(it) = self.editing.and_then(|i| self.items.get(i)) else { return false };
+        if !it.bounds().contains(p) {
+            return false;
+        }
+        if let Some(c) = it.caret_index_at(p) {
+            if dbl {
+                let (a, b) = it.word_at(c);
+                self.caret = TextCaret { caret: b, anchor: a };
+            } else {
+                self.caret.place(c, super::shift());
+                self.drag = Drag::SelectText;
+            }
+        }
+        true
     }
 
     /// Tool options are saved as they change; this keeps the last region.
@@ -881,6 +937,10 @@ impl Overlay {
     }
 
     fn undo(&mut self) {
+        // While typing, step back inside the text box first.
+        if self.text_step(false) {
+            return;
+        }
         self.commit_text();
         if let Some(prev) = self.history.undo(self.items.clone()) {
             self.items = prev;
@@ -890,6 +950,10 @@ impl Overlay {
     }
 
     fn redo(&mut self) {
+        if self.text_step(true) {
+            return;
+        }
+        self.commit_text();
         if let Some(next) = self.history.redo(self.items.clone()) {
             self.items = next;
             self.selected = None;
@@ -961,6 +1025,9 @@ impl Overlay {
             self.drag = Drag::NewSel { x0: x, y0: y, moved: false };
             return;
         }
+        if self.click_in_edit(self.doc_point(x, y), false) {
+            return;
+        }
         self.commit_text();
         let p = self.doc_point(x, y);
         let sel = self.sel.unwrap_or_default();
@@ -995,6 +1062,7 @@ impl Overlay {
             if self.tool == Tool::Text {
                 self.editing = Some(self.items.len() - 1);
                 self.edit_before = Some(before);
+                self.caret = TextCaret::at(0);
             } else if self.tool == Tool::Step {
                 self.history.push(before);
             } else {
@@ -1067,6 +1135,12 @@ impl Overlay {
                     self.comp_dirty = true;
                 }
             }
+            Drag::SelectText => {
+                let p = self.doc_point(x, y);
+                if let Some(c) = self.editing.and_then(|i| self.items.get(i)).and_then(|it| it.caret_index_at(p)) {
+                    self.caret.place(c, true);
+                }
+            }
             Drag::MoveItem { idx, last, .. } => {
                 let p = PointF::new(x as f32, y as f32);
                 if let Some(it) = self.items.get_mut(*idx) {
@@ -1110,6 +1184,7 @@ impl Overlay {
                     }
                     self.editing = Some(self.items.len() - 1);
                     self.edit_before = Some(before);
+                    self.caret = TextCaret::at(0);
                 } else if degenerate {
                     self.items.pop();
                 } else {
@@ -1141,19 +1216,19 @@ impl Overlay {
     fn key_down(&mut self, w: &mut Win, vk: u16) {
         let ctrl = super::ctrl();
         if self.editing.is_some() {
-            match vk {
-                0x1B => self.commit_text(), // Esc
-                0x56 if ctrl => {
-                    if let (Some(i), Some(t)) = (self.editing, crate::clipboard::get_text()) {
-                        if let Some(s) = self.items.get_mut(i).and_then(|it| it.text_mut()) {
-                            s.push_str(&t.replace("\r\n", "\n"));
-                            self.comp_dirty = true;
-                        }
+            if ctrl && matches!(vk, 0x5A | 0x59) {
+                // Falls through to undo / redo, which step through the box's own
+                // history first.
+            } else {
+                if vk == 0x1B {
+                    self.commit_text(); // Esc
+                } else if let Some(it) = self.editing.and_then(|i| self.items.get_mut(i)) {
+                    if self.caret.key_down(it, &mut self.text_undo, vk, ctrl, super::shift()) {
+                        self.comp_dirty = true;
                     }
                 }
-                _ => {}
+                return;
             }
-            return;
         }
         match vk {
             0x1B => {
@@ -1222,26 +1297,12 @@ impl Overlay {
 
     fn char_input(&mut self, c: u32) {
         let Some(i) = self.editing else { return };
-        let Some(s) = self.items.get_mut(i).and_then(|it| it.text_mut()) else { return };
-        match c {
-            0x08 => {
-                s.pop();
-            }
-            0x0D => {
-                if super::shift() {
-                    s.push('\n');
-                } else {
-                    return self.commit_text();
-                }
-            }
-            c if c >= 0x20 => {
-                if let Some(ch) = char::from_u32(c) {
-                    s.push(ch);
-                }
-            }
-            _ => return,
+        let Some(it) = self.items.get_mut(i) else { return };
+        match self.caret.char_input(it, &mut self.text_undo, c) {
+            Typed::Edited => self.comp_dirty = true,
+            Typed::Commit => self.commit_text(),
+            Typed::Ignored => {}
         }
-        self.comp_dirty = true;
     }
 
     fn wheel(&mut self, delta: i16) {
@@ -1517,7 +1578,7 @@ impl Overlay {
                 }
             }
             if let Some(it) = self.editing.and_then(|i| self.items.get(i)) {
-                draw_caret(pm, it, s);
+                draw_caret(pm, it, self.caret, t.accent, s);
             }
         }
         if self.settings.region.crosshair && !self.annotating {
@@ -1738,23 +1799,15 @@ fn merge_rects(mut v: Vec<Rect>) -> Vec<Rect> {
     v
 }
 
-fn draw_caret(pm: &mut PixmapMut, it: &Item, s: f32) {
-    let size = it.style.font_size;
-    let (x, y, h) = match &it.shape {
-        Shape::Text { at, text: t, .. } => {
-            let l = text::layout(if t.is_empty() { " " } else { t }, size, false);
-            let lw = if t.is_empty() { 0.0 } else { text::layout(t.rsplit('\n').next().unwrap_or(""), size, false).width };
-            (at.x + lw + 1.0, at.y + (l.lines.max(1) - 1) as f32 * l.line_height + if t.ends_with('\n') { l.line_height } else { 0.0 }, l.line_height)
+fn draw_caret(pm: &mut PixmapMut, it: &Item, caret: TextCaret, accent: Rgba, s: f32) {
+    let (lo, hi) = caret.range();
+    for r in it.selection_rects(lo, hi) {
+        if let Some(rc) = r.skia() {
+            pm.fill_rect(rc, &accent.with_alpha(90).paint(), Transform::identity(), None);
         }
-        Shape::Balloon { r, text: t, .. } => {
-            let n = r.norm();
-            let pad = size * 0.5;
-            let l = text::layout(if t.is_empty() { " " } else { t }, size, false);
-            let lw = text::layout(t.rsplit('\n').next().unwrap_or(""), size, false).width;
-            (n.x0 + pad + lw + 1.0, n.y0 + pad + (l.lines.max(1) - 1) as f32 * l.line_height, l.line_height)
-        }
-        _ => return,
-    };
+    }
+    let Some((x, y, h)) = it.caret_point(caret.caret) else { return };
+    let x = x + 1.0;
     let mut pb = PathBuilder::new();
     pb.move_to(x, y);
     pb.line_to(x, y + h);
@@ -1840,8 +1893,11 @@ impl Handler for Overlay {
             WM_LBUTTONDBLCLK => {
                 let (x, y) = super::lparam_xy(lp);
                 let inside = self.sel.is_some_and(|s| s.contains(x, y));
-                if self.annotating && self.tool == Tool::Pointer && inside && ann::hit_test(&self.items, self.doc_point(x, y)).is_none() {
-                    self.finish(w, Finish::Tasks);
+                let pointer = self.annotating && self.tool == Tool::Pointer && inside;
+                if self.annotating && self.click_in_edit(self.doc_point(x, y), true) {
+                    self.redraw(w); // a word in the text being typed is selected
+                } else if pointer && self.edit_text_at(x, y) {
+                    self.redraw(w);
                 } else {
                     self.mouse_down(w, x, y);
                     self.redraw(w);

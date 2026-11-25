@@ -17,6 +17,7 @@ pub mod overlay;
 pub mod pin;
 pub mod qr_dialog;
 pub mod settings_window;
+pub mod text_caret;
 pub mod text_input;
 pub mod theme;
 pub mod tool_options;
