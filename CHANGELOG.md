@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-11-25
+### Changed
+- **A finished scrolling capture opens in the editor**, fitted to the window, as well as
+  running the usual after-capture tasks. Before, the only sign it had finished was a "Saved"
+  tray balloon, which Windows may hide. A scrolling workflow with its own `tasks` in
+  settings.toml still uses those instead.
+
 ## [0.3.5] - 2026-11-25
 ### Fixed
 - **Scrolling capture stopped after one scroll** on most real pages: each new screen had to
@@ -149,7 +156,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.5...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.6...dev
+[0.3.6]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.2...v0.3.3
