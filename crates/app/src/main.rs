@@ -158,6 +158,7 @@ fn handle_args(args: &[String]) {
                 }
             }
             "--help" | "-h" | "/?" => log(USAGE),
+            "--version" | "-V" => log(concat!("Snap It ", env!("CARGO_PKG_VERSION"))),
             other => log(&format!("ignoring argument '{other}'")),
         }
     }
@@ -180,6 +181,14 @@ fn main() -> Result<()> {
         let _ = windows::Win32::System::LibraryLoader::SetDefaultDllDirectories(windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if args.first().is_some_and(|a| a == "--version" || a == "-V") {
+        // Release builds have no console, so show the version in a message box there.
+        #[cfg(debug_assertions)]
+        println!("Snap It {}", env!("CARGO_PKG_VERSION"));
+        #[cfg(not(debug_assertions))]
+        ui::dialogs::info(None, "Snap It", concat!("Snap It ", env!("CARGO_PKG_VERSION")));
+        return Ok(());
+    }
 
     #[cfg(debug_assertions)]
     if args.first().map(String::as_str) == Some("--selftest") {

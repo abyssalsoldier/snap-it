@@ -109,6 +109,32 @@ Extra checks:
   Nothing is shown, captured or copied to the clipboard.
 - After changing the icon art, regenerate it with `cargo run -p snapit-gfx --example make_icon`.
 
+## Branches and versioning
+
+**Branches**
+
+| Branch | Purpose |
+|---|---|
+| `dev` | Day-to-day work. The default branch; `git push` goes here. |
+| `master` | Released code only. Every release is a tagged commit (`vX.Y.Z`). |
+
+**Versions** follow [Semantic Versioning](https://semver.org/).
+- There is one version for the whole workspace: `[workspace.package] version` in `Cargo.toml`.
+- It is embedded in the exe's version info, the tray tooltip and `snapit --version`.
+- Notable changes go under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) as you work.
+
+**Release steps**
+
+```powershell
+./scripts/bump-version.ps1 patch      # or minor / major / 1.2.3 (run on dev; commits the bump)
+git push                              # dev
+git switch master; git merge --ff-only dev
+git tag -a v0.1.1 -m "Snap It 0.1.1"
+git push origin master v0.1.1
+git switch dev
+./scripts/release.ps1 -CertThumbprint <sha1>   # build, sign, scan -> dist/
+```
+
 ## Command line
 
 ```

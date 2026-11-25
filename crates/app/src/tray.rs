@@ -40,7 +40,7 @@ pub fn add(hwnd: HWND, icon: HICON) -> Result<()> {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = icon;
-    copy_into(&mut nid.szTip, "Snap It");
+    copy_into(&mut nid.szTip, concat!("Snap It ", env!("CARGO_PKG_VERSION")));
     unsafe { Shell_NotifyIconW(NIM_ADD, &nid).ok() }
 }
 
