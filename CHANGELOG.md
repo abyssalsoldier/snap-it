@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- **MSI setup wizard** with the same choices as the setup .exe: license, install folder,
+  desktop shortcut, and "Launch Snap It" at the end (it used to install silently).
+  Upgrades keep the previous folder and desktop-shortcut choice; `msiexec /qn` still
+  installs silently.
+- The setup .exe wizard shows the license too.
+
 ## [0.3.0] - 2026-11-24
 ### Added
 - **Update prompt:** when a newer release exists, a dialog shows what's new with Download,

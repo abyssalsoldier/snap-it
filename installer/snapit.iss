@@ -37,6 +37,7 @@ MinVersion=10.0
 OutputDir={#DistDir}
 OutputBaseFilename=SnapIt-{#AppVersion}-setup-x64
 SetupIconFile=..\assets\snapit.ico
+LicenseFile=..\LICENSE
 UninstallDisplayIcon={app}\snapit.exe
 UninstallDisplayName=Snap It
 Compression=lzma2

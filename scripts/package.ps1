@@ -12,7 +12,8 @@
   Both installers install per user (no admin prompt) with a Start menu shortcut.
 
   Tools: Inno Setup 6 (winget install JRSoftware.InnoSetup) and WiX v5
-  (dotnet tool install --global wix --version 5.0.2 --add-source https://api.nuget.org/v3/index.json).
+  (dotnet tool install --global wix --version 5.0.2 --add-source https://api.nuget.org/v3/index.json)
+  with its UI extension (wix extension add -g WixToolset.UI.wixext/5.0.2).
   CI installs both itself.
 
 .EXAMPLE
@@ -103,7 +104,11 @@ $wix = (Get-Command wix -ErrorAction SilentlyContinue).Source
 if (-not $wix) { throw "WiX not found (dotnet tool install --global wix --version 5.0.2)" }
 # The WiX tool targets an older .NET; let it run on whatever runtime is installed.
 $env:DOTNET_ROLL_FORWARD = "Major"
-& $wix build (Join-Path $root "installer\snapit.wxs") -arch x64 -d "Version=$version" -d "ExePath=$exe" -d "IconPath=$(Join-Path $root 'assets\snapit.ico')" -o $msi
+# The MSI wizard pages come from WiX's UI extension.
+if (-not ((& $wix extension list -g 2>$null) -match 'WixToolset\.UI\.wixext 5\.')) {
+    throw "WiX UI extension not found (wix extension add -g WixToolset.UI.wixext/5.0.2)"
+}
+& $wix build (Join-Path $root "installer\snapit.wxs") -arch x64 -ext WixToolset.UI.wixext -d "Version=$version" -d "ExePath=$exe" -d "IconPath=$(Join-Path $root 'assets\snapit.ico')" -d "LicenseRtf=$(Join-Path $root 'installer\license.rtf')" -o $msi
 if ($LASTEXITCODE) { throw "WiX failed" }
 Remove-Item ([IO.Path]::ChangeExtension($msi, ".wixpdb")) -ErrorAction SilentlyContinue
 

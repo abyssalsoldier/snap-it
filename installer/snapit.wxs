@@ -2,13 +2,16 @@
 <!--
   Snap It: .msi (WiX Toolset v5).
 
-  Built by scripts/package.ps1:
-    wix build installer/snapit.wxs -arch x64 -d Version=0.1.0 -d ExePath=dist/snapit.exe -d IconPath=assets/snapit.ico -o dist/SnapIt-0.1.0-x64.msi
+  Built by scripts/package.ps1 (needs the WixToolset.UI.wixext extension):
+    wix build installer/snapit.wxs -arch x64 -ext WixToolset.UI.wixext -d Version=0.1.0 -d ExePath=dist/snapit.exe -d IconPath=assets/snapit.ico -d LicenseRtf=installer/license.rtf -o dist/SnapIt-0.1.0-x64.msi
 
-  Per-user install (no admin prompt) to %LOCALAPPDATA%\Programs\Snap It, with a Start menu
-  shortcut. A newer MSI upgrades an older one in place (same UpgradeCode).
+  Per-user install (no admin prompt), by default to %LOCALAPPDATA%\Programs\Snap It, with a
+  Start menu shortcut. A newer MSI upgrades an older one in place (same UpgradeCode).
+
+  Wizard (same choices as the setup .exe): license, install folder, desktop shortcut (off by
+  default), and "Launch Snap It" on the last page. `msiexec /qn` still installs silently.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <!-- Never change UpgradeCode: it is how upgrades find the existing install. -->
   <Package
       Name="Snap It"
@@ -33,7 +36,48 @@
     <Icon Id="SnapIt.ico" SourceFile="$(IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="SnapIt.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/abyssalsoldier/snap-it" />
-    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- ARPNOMODIFY (no "Modify" in Apps) is set by the WixUI_InstallDir dialog set. -->
+
+    <!-- Upgrades keep the previous folder and desktop-shortcut choice. -->
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch Id="PreviousInstallDir" Root="HKCU" Key="Software\SnapIt\Installer" Name="InstallDir" Type="raw" />
+    </Property>
+    <Property Id="DESKTOPSHORTCUT">
+      <RegistrySearch Id="PreviousDesktopShortcut" Root="HKCU" Key="Software\SnapIt\Installer" Name="DesktopShortcut" Type="raw" />
+    </Property>
+
+    <!-- ===== Wizard ===== -->
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Snap It" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <CustomAction Id="LaunchSnapIt" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]snapit.exe&quot;" Execute="immediate" Return="asyncNoWait" />
+
+    <UI>
+      <!-- An extra page between the folder page and "Ready to install", like the setup .exe's
+           "Select additional tasks" page. -->
+      <Dialog Id="OptionsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" />
+        </Control>
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Additional tasks" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="Choose any extra shortcuts, then click Next." />
+        <Control Id="DesktopShortcut" Type="CheckBox" X="20" Y="60" Width="330" Height="18" Property="DESKTOPSHORTCUT" CheckBoxValue="1" Text="Create a &amp;desktop shortcut" />
+      </Dialog>
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="OptionsDlg" Order="5" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="OptionsDlg" Order="5" Condition="NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchSnapIt" Order="999" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed AND NOT REMOVE" />
+    </UI>
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="UserProgramsDir" Name="Programs">
@@ -41,6 +85,7 @@
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
     <StandardDirectory Id="StartupFolder" />
 
     <!-- Per-user components keep an HKCU value as their key path (MSI rule for profile folders),
@@ -67,9 +112,21 @@
       <RegistryValue Root="HKCU" Key="Software\SnapIt\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="9B1C2E7A-4F3D-4E8B-9C61-2D7A5B0E83F4" Condition="DESKTOPSHORTCUT = 1">
+      <Shortcut
+          Id="SnapItDesktop"
+          Name="Snap It"
+          Description="Screenshots, annotation and screen recording"
+          Target="[INSTALLFOLDER]snapit.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="SnapIt.ico" />
+      <RegistryValue Root="HKCU" Key="Software\SnapIt\Installer" Name="DesktopShortcut" Type="string" Value="1" KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main" Title="Snap It" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
     </Feature>
   </Package>
 </Wix>

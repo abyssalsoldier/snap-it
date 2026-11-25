@@ -39,6 +39,8 @@ jobs:
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 5.0.2 --add-source https://api.nuget.org/v3/index.json
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE) { throw "wix extension add failed" }
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
             choco install innosetup --yes --no-progress
           }
