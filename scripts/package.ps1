@@ -81,7 +81,7 @@ Remove-Item (Join-Path $dist "zip") -Recurse -Force -ErrorAction SilentlyContinu
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item $exe $stage
 New-Item -ItemType File (Join-Path $stage "portable") | Out-Null
-Copy-Item README.md, CHANGELOG.md $stage
+Copy-Item README.md, CHANGELOG.md, LICENSE $stage
 Remove-Item $zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $stage -DestinationPath $zip
 Remove-Item (Join-Path $dist "zip") -Recurse -Force

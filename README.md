@@ -189,3 +189,7 @@ crates/annotate  annotation model, renderer, stickers, undo history (shared by o
 crates/record    Windows.Graphics.Capture → Media Foundation MP4 / streaming GIF
 crates/app       tray, hotkeys, overlay, editor, pin, history, settings, OCR/QR, recording UI
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 JRankin Tech
