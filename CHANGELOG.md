@@ -6,6 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-25
 ### Added
 - **Starting Snap It opens Settings** (from the Start menu, a shortcut or the installer), and
   starting it again while it runs brings Settings to the front. Started at sign-in it stays in
@@ -118,7 +119,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.1...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.2...dev
+[0.3.2]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.1.0...v0.2.0
