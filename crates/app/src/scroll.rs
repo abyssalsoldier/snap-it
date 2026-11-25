@@ -11,7 +11,9 @@ use snapit_gfx::tiny_skia::{IntSize, Pixmap};
 use snapit_gfx::Rect;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT};
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, PostMessageW, SetCursorPos, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetCursorPos, PostMessageW, SetCursorPos, WindowFromPoint, GA_ROOT, WM_APP,
+};
 
 use crate::actions::Action;
 use crate::app::{self, Capture, Command};
@@ -78,8 +80,9 @@ pub fn on_done(d: Done) {
                      Over Remote Desktop, the remote cursor can follow your local mouse, so keep that still too.",
                 ),
                 Stop::End if steps == 0 => explain(
-                    "The selected area did not move when scrolled, so only one screen was captured.\n\n\
-                     Select an area inside the part that scrolls, and make sure that window accepts mouse-wheel scrolling.",
+                    "The selected area did not move when scrolled (Snap It tried several spots in it), so only one screen \
+                     was captured.\n\nSelect an area inside the part that scrolls, and make sure that window accepts \
+                     mouse-wheel scrolling.",
                 ),
                 _ => {}
             }
@@ -106,11 +109,56 @@ fn cursor() -> POINT {
     p
 }
 
+/// Most points tried when a scroll moves nothing (the pointer may be over a toolbar, a
+/// fixed sidebar or another window rather than the part that scrolls).
+const MAX_POINTS: usize = 6;
+
+/// Points to park the pointer at, best first. A hand-drawn selection may also cover a
+/// browser's tabs and address bar, a sidebar or other windows, so its centre is not always
+/// over the content that scrolls: prefer points over the window that covers most of the
+/// selection, nearest the centre first.
+fn scroll_points(r: Rect) -> Vec<(i32, i32)> {
+    let pts: Vec<(i32, i32)> =
+        (0..5).flat_map(|j| (0..5).map(move |i| (r.x + r.w * (1 + 2 * i) / 10, r.y + r.h * (1 + 2 * j) / 10))).collect();
+    let roots: Vec<isize> = pts
+        .iter()
+        .map(|&(x, y)| unsafe {
+            let h = WindowFromPoint(POINT { x, y });
+            if h.is_invalid() {
+                0
+            } else {
+                GetAncestor(h, GA_ROOT).0 as isize
+            }
+        })
+        .collect();
+    order_points(&pts, &roots, r.center())
+}
+
+/// Orders sample points: those over the most common top-level window first, then the rest,
+/// each group nearest `center` first. The exact centre always leads its group.
+fn order_points(pts: &[(i32, i32)], roots: &[isize], center: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut counts: Vec<(isize, usize)> = Vec::new();
+    for &w in roots.iter().filter(|&&w| w != 0) {
+        match counts.iter_mut().find(|(x, _)| *x == w) {
+            Some(c) => c.1 += 1,
+            None => counts.push((w, 1)),
+        }
+    }
+    let main = counts.iter().max_by_key(|(_, n)| *n).map(|(w, _)| *w);
+    let dist = |&(x, y): &(i32, i32)| (x - center.0).pow(2) + (y - center.1).pow(2);
+    let mut idx: Vec<usize> = (0..pts.len()).collect();
+    idx.sort_by_key(|&i| (Some(roots[i]) != main, dist(&pts[i])));
+    let mut out: Vec<(i32, i32)> = idx.into_iter().map(|i| pts[i]).collect();
+    out.dedup();
+    out
+}
+
 /// Returns the stitched image, why it stopped and how many scrolls were stitched.
 fn run(r: Rect) -> Result<(Pixmap, Stop, usize), String> {
     let original = cursor();
-    let (cx, cy) = r.center();
     std::thread::sleep(Duration::from_millis(250)); // let the overlay disappear
+    let mut points = scroll_points(r).into_iter().take(MAX_POINTS);
+    let (mut cx, mut cy) = points.next().unwrap_or(r.center());
     unsafe {
         let _ = SetCursorPos(cx, cy);
     }
@@ -135,6 +183,22 @@ fn run(r: Rect) -> Result<(Pixmap, Stop, usize), String> {
             let frame = snapit_capture::capture_rect(r, false)?;
             match st.push(&frame) {
                 Push::Added => break,
+                Push::NoMovement if retried && steps == 0 => {
+                    // Nothing has scrolled yet: the pointer is probably not over the part
+                    // that scrolls. Try the next point, starting over from a fresh frame
+                    // (moving the pointer can change hover effects on the page).
+                    let Some((x, y)) = points.next() else {
+                        stop = Stop::End;
+                        break 'outer;
+                    };
+                    (cx, cy) = (x, y);
+                    unsafe {
+                        let _ = SetCursorPos(cx, cy);
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                    st = Stitcher::new(snapit_capture::capture_rect(r, false)?);
+                    continue 'outer;
+                }
                 failed if retried => {
                     stop = if failed == Push::NoMovement { Stop::End } else { Stop::Lost };
                     break 'outer;
@@ -175,6 +239,16 @@ pub struct Stitcher {
     /// Rows of the result so far (BGRA), ending with the latest static footer.
     rows: Vec<u8>,
     prev: Vec<Cells>,
+    /// Rows just above the footer that came from the bottom edge of the latest frame. That
+    /// edge is where floating overlays sit (a browser's link-preview bubble, a chat button),
+    /// so the next frame, where those page rows have scrolled up and out from under the
+    /// overlay, replaces them. Only the last frame's are kept.
+    provisional: usize,
+}
+
+/// Minimum rows held back at the bottom of each frame (see [`Stitcher::provisional`]).
+fn default_hold(h: usize) -> usize {
+    (h / 12).clamp(24, 96).min(h / 3)
 }
 
 /// Each row is hashed in this many vertical strips, so one strip that changes on its own
@@ -229,7 +303,7 @@ fn differing(a: &Cells, b: &Cells) -> usize {
 impl Stitcher {
     pub fn new(first: Pixmap) -> Stitcher {
         let (w, h) = (first.width() as usize, first.height() as usize);
-        Stitcher { w, h, rows: first.data().to_vec(), prev: cell_hashes(&first) }
+        Stitcher { w, h, rows: first.data().to_vec(), prev: cell_hashes(&first), provisional: default_hold(h) }
     }
 
     pub fn height(&self) -> usize {
@@ -285,14 +359,22 @@ impl Stitcher {
             return Push::NoMatch;
         }
         let dy = best.1;
-        // Drop the previous frame's static footer rows, then add the newly revealed rows.
         let row = self.w * 4;
-        let keep = self.height() - bottom;
-        self.rows.truncate(keep * row);
         let start = top + mid - dy;
-        self.rows.extend_from_slice(&next.data()[start * row..(top + mid) * row]);
+        // The previous frame's provisional rows are now `retake` rows above the newly
+        // revealed ones in this frame, clear of anything floating at the bottom edge.
+        let retake = self.provisional.min(start - top).min(self.height().saturating_sub(bottom));
+        // Drop the static footer and the provisional rows, then add them back from this frame
+        // together with the newly revealed rows.
+        let keep = self.height() - bottom - retake;
+        self.rows.truncate(keep * row);
+        self.rows.extend_from_slice(&next.data()[(start - retake) * row..(top + mid) * row]);
         // Re-append the static footer from the latest frame.
         self.rows.extend_from_slice(&next.data()[(h - bottom) * row..h * row]);
+        // Hold back this frame's bottom edge in turn: at least the default band, more when
+        // part of each row there stays put on screen while the page scrolls (an overlay).
+        let pinned = (top..top + mid).rev().take_while(|&y| strips.iter().any(|&s| a[y][s] == b[y][s])).count();
+        self.provisional = default_hold(h).max(pinned + 4).min(mid / 2);
         self.prev = b;
         Push::Added
     }
@@ -393,6 +475,60 @@ mod tests {
             let px = &out.data()[(y * w + 20) * 4..(y * w + 20) * 4 + 4];
             assert_eq!(px, &[p[y][0], p[y][1].wrapping_add(20), p[y][2], 255], "row {y}");
         }
+    }
+
+    /// A viewport with a floating box in the bottom-left corner (like a browser's link
+    /// preview), drawn on top of the page. `tag` changes the box's text from frame to frame.
+    fn overlay_view(p: &[[u8; 4]], offset: usize, w: usize, h: usize, tag: u8) -> Pixmap {
+        let (bw, bh) = (w / 4, 14);
+        let mut data = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let c = if y >= h - bh && x < bw {
+                    [250, 250, tag.wrapping_add(x as u8), 255]
+                } else {
+                    let r = p[offset + y];
+                    [r[0], r[1].wrapping_add(x as u8), r[2], 255]
+                };
+                data.extend_from_slice(&c);
+            }
+        }
+        Pixmap::from_vec(data, IntSize::from_wh(w as u32, h as u32).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_floating_overlay_at_the_bottom_is_not_repeated() {
+        let p = page(2000);
+        let (w, h, last) = (64, 200, 400);
+        for changing in [false, true] {
+            let tag = |i: u8| if changing { i * 40 } else { 0 };
+            let mut st = Stitcher::new(overlay_view(&p, 0, w, h, tag(0)));
+            for (i, off) in [80, 160, 240, 320, last].into_iter().enumerate() {
+                assert_eq!(st.push(&overlay_view(&p, off, w, h, tag(i as u8 + 1))), Push::Added, "offset {off}");
+            }
+            let out = st.finish().unwrap();
+            assert_eq!(out.height() as usize, last + h);
+            // Every row is the page itself under the box, except the last frame's own box.
+            for y in 0..last + h - 14 {
+                let px = &out.data()[y * w * 4..y * w * 4 + 4];
+                assert_eq!(px, &p[y], "row {y} (box text changing: {changing})");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_points_prefer_the_window_covering_most_of_the_selection() {
+        // A 3-wide row of samples: the centre is over window 7 (say, a browser toolbar's
+        // own window or another app), the other four are over window 9.
+        let pts = [(0, 0), (10, 0), (20, 0), (30, 0), (40, 0)];
+        let roots = [9, 9, 7, 9, 9];
+        let out = order_points(&pts, &roots, (20, 0));
+        assert_eq!(&out[..2], &[(10, 0), (30, 0)], "nearest points over the main window first");
+        assert_eq!(out.last(), Some(&(20, 0)), "the off-window centre is tried last");
+        // All over one window: the centre leads.
+        assert_eq!(order_points(&pts, &[5; 5], (20, 0))[0], (20, 0));
+        // Points over no window (0) never decide which window is "main".
+        assert_eq!(order_points(&pts, &[0, 0, 0, 4, 0], (20, 0))[0], (30, 0));
     }
 
     #[test]

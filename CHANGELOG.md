@@ -5,6 +5,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- **Scrolling capture no longer repeats floating overlays.** Something that floats at the
+  bottom of the window while the page scrolls, such as a browser's link preview (the URL shown
+  in the corner when the pointer rests on a link) or a chat button, used to be stitched in
+  again on every screen. Snap It now takes those rows from the next screen, after they have
+  scrolled clear; only the final screen can still show it.
+- **Scrolling capture works with hand-drawn selections.** It used to scroll at the exact centre
+  of the selection, so a rectangle that also covered a browser's tabs, a sidebar or another
+  window could scroll nothing and stop after one screen. It now scrolls over the window that
+  covers most of the selection, and if nothing moves it tries a few other spots first.
 
 ## [0.5.0] - 2026-11-25
 ### Added
