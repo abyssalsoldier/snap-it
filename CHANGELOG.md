@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-25
+### Added
+- **Freehand arrows:** the arrow tool's new Path option (Straight / Freehand) draws a smoothed
+  freehand line with heads at the end, the start or both ends. Each head points along the
+  last stretch of the path, so a wobble on release does not swing it around. Switching Path
+  on a selected arrow converts it, keeping its ends.
+
+### Fixed
+- Quick edit's tool-options strip could be missing when the selection was near the bottom
+  of the screen: it was placed off-screen or behind the taskbar. The toolbar now leaves
+  room for the strip and both are kept inside the monitor's work area.
+
 ## [0.3.2] - 2026-11-25
 ### Added
 - **Starting Snap It opens Settings** (from the Start menu, a shortcut or the installer), and
@@ -119,7 +131,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.2...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.3...dev
+[0.3.3]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.2.0...v0.3.0
