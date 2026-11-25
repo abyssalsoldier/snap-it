@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-11-25
 ### Added
 - **First-launch setup.** The first time Snap It starts (usually from the installer's
   "Launch Snap It"), a short wizard walks through the key features, lets you choose hotkeys
@@ -168,7 +170,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.6...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.4.0...dev
+[0.4.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.3...v0.3.4
