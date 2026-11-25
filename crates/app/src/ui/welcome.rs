@@ -17,10 +17,11 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, LoadCursorW, SetCursor, SetForegroundWindow, ShowWindow, HTCLIENT, IDC_ARROW,
     IDC_HAND, SW_SHOW, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU, WINDOW_EX_STYLE,
 };
 
+use super::a11y::{vk::*, Access, Action as AxAction, Node, Role};
 use super::chrome::Chrome;
 use super::icons::{self, Icon};
 use super::theme::{self, Theme};
@@ -127,7 +128,43 @@ struct WelcomeWin {
     prtsc_offer: bool,
     /// The user opted in to turning that Windows setting off (applied on Finish).
     prtsc_take: bool,
+
+    /// Keyboard focus, Tab order and the UI Automation tree.
+    ax: Access,
 }
+
+/// Stable accessibility / keyboard-focus key of a control.
+fn key(h: Hit) -> u32 {
+    match h {
+        Hit::Next => 1,
+        Hit::Back => 2,
+        Hit::Skip => 3,
+        Hit::CheckKeys => 4,
+        Hit::KeyboardSettings => 5,
+        Hit::Hotkey(i) => 0x100 + i as u32,
+        Hit::Toggle(id) => 0x200 + id as u32,
+    }
+}
+
+fn decode(k: u32) -> Option<Hit> {
+    Some(match k {
+        1 => Hit::Next,
+        2 => Hit::Back,
+        3 => Hit::Skip,
+        4 => Hit::CheckKeys,
+        5 => Hit::KeyboardSettings,
+        0x100..=0x1FF => Hit::Hotkey((k - 0x100) as usize),
+        0x200..=0x2FF => Hit::Toggle((k - 0x200) as u16),
+        _ => return None,
+    })
+}
+
+/// Keys of read-only text nodes (headings, descriptions) start here.
+const TEXT_KEY: u32 = 0x400;
+/// The step heading: announced whenever the step changes.
+const HEADING_KEY: u32 = 0x3FF;
+/// The "Check hotkeys" result: announced when it changes.
+const STATUS_KEY: u32 = 0x3FE;
 
 /// True when Snap It has never saved settings for this user (or portable folder).
 pub fn is_first_run() -> bool {
@@ -209,6 +246,7 @@ pub fn open() {
         try_now: false,
         prtsc_offer: print_screen_offer(),
         prtsc_take: false,
+        ax: Access::default(),
         orig: s,
         theme: theme::current(),
         scale: sc,
@@ -289,6 +327,90 @@ fn unavailable(chords: &[Chord]) -> Vec<Chord> {
 }
 
 impl WelcomeWin {
+    /// Records a control drawn in `r` for clicks, the Tab order and screen readers.
+    fn add(&mut self, r: Rect, h: Hit, name: &str, help: &str) {
+        self.hits.push((r, h));
+        let k = key(h);
+        let n = match h {
+            Hit::Hotkey(i) => {
+                let v = if self.hotkeys[i].trim().is_empty() { "Not set".to_string() } else { self.hotkeys[i].clone() };
+                Node::new(k, r, Role::Hotkey, name).value(v)
+            }
+            Hit::Toggle(id) => Node::new(k, r, Role::CheckBox, name).checked(self.toggle_field(id).is_some_and(|b| *b)),
+            Hit::Back => Node::new(k, r, Role::Button, name).enabled(self.page > 0),
+            _ => Node::new(k, r, Role::Button, name),
+        };
+        self.ax.push(n.help(help));
+    }
+
+    /// Text a screen reader reads (not focusable).
+    fn add_text(&mut self, r: Rect, s: &str) {
+        let k = TEXT_KEY + self.ax.nodes.len() as u32;
+        self.ax.push(Node::new(k, r, Role::Text, s));
+    }
+
+    fn toggle_field(&mut self, id: u16) -> Option<&mut bool> {
+        Some(match id {
+            TOG_SCROLLING => &mut self.scrolling_capture,
+            TOG_UPDATE => &mut self.update_check,
+            TOG_STARTUP => &mut self.start_with_windows,
+            TOG_CTXMENU => &mut self.context_menu,
+            TOG_QUICK => &mut self.quick_annotate,
+            TOG_PRTSC => &mut self.prtsc_take,
+            TOG_T_COPY => &mut self.t_copy,
+            TOG_T_SAVE => &mut self.t_save,
+            TOG_T_EDITOR => &mut self.t_editor,
+            TOG_T_NOTIFY => &mut self.t_notify,
+            TOG_T_SOUND => &mut self.t_sound,
+            TOG_TRY_NOW => &mut self.try_now,
+            _ => return None,
+        })
+    }
+
+    /// Moves keyboard focus; a hotkey box also starts recording.
+    fn focus(&mut self, k: Option<u32>, ring: bool) {
+        self.ax.focus = k;
+        self.ax.ring = ring;
+        match k.and_then(decode) {
+            Some(Hit::Hotkey(i)) => self.set_hk_focus(Some(i)),
+            _ => self.set_hk_focus(None),
+        }
+    }
+
+    /// What clicking `hit` does (also Space / Enter and a screen reader's Invoke / Toggle).
+    fn activate(&mut self, w: &mut Win, hit: Hit) {
+        match hit {
+            Hit::Next => self.next(w),
+            Hit::Back => {
+                if self.page > 0 {
+                    self.set_hk_focus(None);
+                    self.page -= 1;
+                }
+            }
+            Hit::Skip => w.close(),
+            Hit::CheckKeys => {
+                self.set_hk_focus(None);
+                if let Err(e) = apply_hotkeys(&self.orig.workflows, &self.chosen_hotkeys()) {
+                    self.key_status = Some((false, e));
+                } else {
+                    self.check_keys();
+                }
+            }
+            Hit::KeyboardSettings => crate::shell::open_keyboard_settings(),
+            Hit::Hotkey(i) => self.set_hk_focus(Some(i)),
+            Hit::Toggle(id) => {
+                if let Some(b) = self.toggle_field(id) {
+                    *b = !*b;
+                }
+                if id == TOG_PRTSC {
+                    // A previous "in use" result may no longer apply.
+                    self.key_status = None;
+                }
+            }
+        }
+        w.invalidate();
+    }
+
     fn set_hk_focus(&mut self, idx: Option<usize>) {
         let was = self.focused_hk.is_some();
         let now = idx.is_some();
@@ -447,6 +569,7 @@ impl WelcomeWin {
         Backbuffer::ensure(&mut self.bb, self.client.0 as u32, self.client.1 as u32);
         let Some(mut bb) = self.bb.take() else { return };
         self.hits.clear();
+        self.ax.begin();
         {
             let mut pm = bb.pixmap();
             let t = self.theme;
@@ -479,6 +602,8 @@ impl WelcomeWin {
 
             // Step headline.
             text::draw(&mut pm, STEPS[self.page], pad, y, 22.0 * s, true, t.text, None);
+            let heading = format!("{} (step {} of {})", STEPS[self.page], self.page + 1, STEPS.len());
+            self.ax.push(Node::new(HEADING_KEY, Rect::new(pad as i32, y as i32, cw as i32, (28.0 * s) as i32), Role::Text, heading).live());
             y += 34.0 * s;
 
             match self.page {
@@ -520,13 +645,20 @@ impl WelcomeWin {
                 false,
                 s,
             );
-            self.hits.push((skip_r, Hit::Skip));
+            self.add(skip_r, Hit::Skip, "Skip setup", "Close setup and keep the current settings (Esc)");
             if self.page > 0 {
-                self.hits.push((back_r, Hit::Back));
+                self.add(back_r, Hit::Back, "Back", "");
             }
-            self.hits.push((next_r, Hit::Next));
+            self.add(next_r, Hit::Next, if last { "Finish" } else { "Next" }, "Enter");
+
+            let chrome_nodes = self.chrome.a11y_nodes(hwnd, self.client.0, s);
+            self.ax.nodes.extend(chrome_nodes);
+            if let Some(r) = self.ax.ring_rect() {
+                widgets::draw_focus_ring(&mut pm, &t, r, 8.0, s);
+            }
         }
         self.bb = Some(bb);
+        self.ax.publish(hwnd);
     }
 
     fn draw_step_welcome(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
@@ -552,6 +684,7 @@ impl WelcomeWin {
             "A quick tour of Snap It's main settings. Your current settings are filled in and stay unchanged unless edited."
         };
         widgets::draw_wrapped(pm, intro, pad + 82.0 * s, y + 18.0 * s, cw - 98.0 * s, 13.0 * s, false, t.text);
+        self.add_text(Rect::new(pad as i32, y as i32, cw as i32, hero_h as i32), intro);
         y += hero_h + 16.0 * s;
 
         // 2x3 feature highlight grid.
@@ -579,6 +712,7 @@ impl WelcomeWin {
             icons::draw(pm, *ic, cx + 19.0 * s, cy + (card_h - 20.0 * s) / 2.0, 20.0 * s, t.accent);
             text::draw(pm, title, cx + 56.0 * s, cy + 14.0 * s, 13.0 * s, true, t.text, None);
             text::draw(pm, desc, cx + 56.0 * s, cy + 34.0 * s, 11.5 * s, false, t.subtext, None);
+            self.add_text(Rect::new(cx as i32, cy as i32, card_w as i32, card_h as i32), &format!("{title}: {desc}"));
         }
         y += 3.0 * (card_h + gap) + 6.0 * s;
 
@@ -586,6 +720,7 @@ impl WelcomeWin {
         let note = "Runs quietly in the system tray next to the clock · Nothing is uploaded · No account needed";
         let nl = text::layout(note, 11.5 * s, false);
         text::draw(pm, note, pad + (cw - nl.width) / 2.0, y, 11.5 * s, false, t.subtext, None);
+        self.add_text(Rect::new(pad as i32, y as i32, cw as i32, nl.height as i32), note);
     }
 
     fn draw_step_hotkeys(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
@@ -593,7 +728,9 @@ impl WelcomeWin {
         let s = self.scale;
         let seen = self.orig.setup_version;
 
-        text::draw(pm, "Click a box and press your keys. Backspace clears it. More actions are in Settings > Hotkeys.", pad, y, 12.5 * s, false, t.subtext, None);
+        let intro = "Click a box and press your keys. Backspace clears it. More actions are in Settings > Hotkeys.";
+        text::draw(pm, intro, pad, y, 12.5 * s, false, t.subtext, None);
+        self.add_text(Rect::new(pad as i32, y as i32, cw as i32, (18.0 * s) as i32), intro);
         y += 24.0 * s;
 
         let row_h = 34.0 * s;
@@ -611,37 +748,34 @@ impl WelcomeWin {
             let fw = (220.0 * s) as i32;
             let fr = Rect::new((ix + iw - fw as f32) as i32, (cy + 2.0 * s) as i32, fw, (28.0 * s) as i32);
             widgets::draw_hotkey_field(pm, &t, fr, &self.hotkeys[i], self.focused_hk == Some(i), self.hover == Some(Hit::Hotkey(i)), s);
-            self.hits.push((fr, Hit::Hotkey(i)));
+            self.add(fr, Hit::Hotkey(i), &format!("{lbl} hotkey"), "Press a key combination to set it. Backspace or Delete clears it.");
             cy += row_h;
         }
         y += card_h + 12.0 * s;
 
         let chk_r = Rect::new(pad as i32, y as i32, (132.0 * s) as i32, (32.0 * s) as i32);
         widgets::draw_button(pm, &t, chk_r, "Check hotkeys", None, BtnStyle::Secondary, self.hover == Some(Hit::CheckKeys), false, s);
-        self.hits.push((chk_r, Hit::CheckKeys));
+        self.add(chk_r, Hit::CheckKeys, "Check hotkeys", "Checks whether another app already uses these keys");
 
         let kbd_w = (224.0 * s) as i32;
         let kbd_r = Rect::new((pad + cw) as i32 - kbd_w, y as i32, kbd_w, (32.0 * s) as i32);
         widgets::draw_button(pm, &t, kbd_r, "Windows keyboard settings", None, BtnStyle::Ghost, self.hover == Some(Hit::KeyboardSettings), false, s);
-        self.hits.push((kbd_r, Hit::KeyboardSettings));
+        self.add(kbd_r, Hit::KeyboardSettings, "Open Windows keyboard settings", "");
 
         if let Some((ok, ref msg)) = self.key_status {
             let c = if ok { t.success } else { t.danger };
             let clipped = widgets::ellipsize(msg, 12.0 * s, false, (kbd_r.x - chk_r.right()) as f32 - 16.0 * s);
             text::draw(pm, &clipped, chk_r.right() as f32 + 12.0 * s, y + 8.0 * s, 12.0 * s, false, c, None);
         }
+        // Announced when a check finishes (the full message, even if the line is shortened).
+        let status = self.key_status.as_ref().map(|(_, m)| m.clone()).unwrap_or_default();
+        let sr = Rect::new(chk_r.right() + (12.0 * s) as i32, y as i32, (kbd_r.x - chk_r.right()).max(1), (32.0 * s) as i32);
+        self.ax.push(Node::new(STATUS_KEY, sr, Role::Text, status).live());
         y += 42.0 * s;
         if !self.prtsc_offer {
-            widgets::draw_wrapped(
-                pm,
-                "Tip: Windows 11 may reserve Print Screen for Snipping Tool. If taken, disable \"Use the Print Screen key to open screen capture\" in Windows settings.",
-                pad,
-                y,
-                cw,
-                11.0 * s,
-                false,
-                t.subtext,
-            );
+            let tip = "Tip: Windows 11 may reserve Print Screen for Snipping Tool. If taken, disable \"Use the Print Screen key to open screen capture\" in Windows settings.";
+            let th = widgets::draw_wrapped(pm, tip, pad, y, cw, 11.0 * s, false, t.subtext);
+            self.add_text(Rect::new(pad as i32, y as i32, cw as i32, th as i32), tip);
             return;
         }
 
@@ -660,7 +794,7 @@ impl WelcomeWin {
         text::draw(pm, &help, pad + 16.0 * s, y + 32.0 * s, 11.5 * s, false, t.subtext, None);
         let tr = Rect::new((pad + cw - 56.0 * s) as i32, (y + (ch - 24.0 * s) / 2.0) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
         widgets::draw_toggle(pm, &t, tr, self.prtsc_take, self.hover == Some(Hit::Toggle(TOG_PRTSC)), s);
-        self.hits.push((cr, Hit::Toggle(TOG_PRTSC)));
+        self.add(cr, Hit::Toggle(TOG_PRTSC), title, "Turns off Windows' Print Screen shortcut to Snipping Tool. Win+Shift+S still opens it.");
     }
 
     fn draw_step_features(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
@@ -668,7 +802,9 @@ impl WelcomeWin {
         let s = self.scale;
         let seen = self.orig.setup_version;
 
-        text::draw(pm, "These optional features are off by default. Turn on the ones you want.", pad, y, 12.5 * s, false, t.subtext, None);
+        let intro = "These optional features are off by default. Turn on the ones you want.";
+        text::draw(pm, intro, pad, y, 12.5 * s, false, t.subtext, None);
+        self.add_text(Rect::new(pad as i32, y as i32, cw as i32, (18.0 * s) as i32), intro);
         y += 24.0 * s;
 
         let items = [
@@ -691,7 +827,7 @@ impl WelcomeWin {
             text::draw(pm, help, pad + 16.0 * s, y + 36.0 * s, 11.5 * s, false, t.subtext, None);
             let tr = Rect::new((pad + cw - 56.0 * s) as i32, (y + (ch - 24.0 * s) / 2.0) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
             widgets::draw_toggle(pm, &t, tr, on, self.hover == Some(Hit::Toggle(id)), s);
-            self.hits.push((cr, Hit::Toggle(id)));
+            self.add(cr, Hit::Toggle(id), title, help);
             y += ch + 10.0 * s;
         }
     }
@@ -701,7 +837,9 @@ impl WelcomeWin {
         let s = self.scale;
         let seen = self.orig.setup_version;
 
-        text::draw(pm, "Choose what happens automatically when you finish a capture:", pad, y, 12.5 * s, false, t.subtext, None);
+        let intro = "Choose what happens automatically when you finish a capture:";
+        text::draw(pm, intro, pad, y, 12.5 * s, false, t.subtext, None);
+        self.add_text(Rect::new(pad as i32, y as i32, cw as i32, (18.0 * s) as i32), intro);
         y += 26.0 * s;
 
         let card_h = 200.0 * s;
@@ -726,15 +864,19 @@ impl WelcomeWin {
             text::draw(pm, &lbl, ix, cy + 2.0 * s, 13.0 * s, false, t.text, None);
             let tr = Rect::new((ix + iw - 42.0 * s) as i32, cy as i32, (42.0 * s) as i32, (24.0 * s) as i32);
             widgets::draw_toggle(pm, &t, tr, on, self.hover == Some(Hit::Toggle(id)), s);
-            self.hits.push((Rect::new(ix as i32, (cy - 4.0 * s) as i32, iw as i32, (34.0 * s) as i32), Hit::Toggle(id)));
+            self.add(Rect::new(ix as i32, (cy - 4.0 * s) as i32, iw as i32, (34.0 * s) as i32), Hit::Toggle(id), title, "");
             cy += 36.0 * s;
         }
         y += card_h + 16.0 * s;
 
         let save_card_h = 68.0 * s;
         widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, save_card_h as i32), 10.0, s);
-        text::draw(pm, &format!("Save folder: {}", self.orig.save_dir().display()), pad + 16.0 * s, y + 14.0 * s, 12.0 * s, true, t.text, None);
-        text::draw(pm, "The quick-annotate toolbar also has Copy, Save, Pin and Edit buttons for one-off choices.", pad + 16.0 * s, y + 38.0 * s, 11.5 * s, false, t.subtext, None);
+        let folder = format!("Save folder: {}", self.orig.save_dir().display());
+        let tip = "The quick-annotate toolbar also has Copy, Save, Pin and Edit buttons for one-off choices.";
+        text::draw(pm, &folder, pad + 16.0 * s, y + 14.0 * s, 12.0 * s, true, t.text, None);
+        text::draw(pm, tip, pad + 16.0 * s, y + 38.0 * s, 11.5 * s, false, t.subtext, None);
+        let card = Rect::new(pad as i32, y as i32, cw as i32, save_card_h as i32);
+        self.add_text(card, &format!("{folder}. {tip}"));
     }
 
     fn draw_step_done(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
@@ -746,6 +888,7 @@ impl WelcomeWin {
         let mut cy = y + 20.0 * s;
         for line in self.summary_lines() {
             let lh = widgets::draw_wrapped(pm, &line, pad + 20.0 * s, cy, cw - 40.0 * s, 13.0 * s, false, t.text);
+            self.add_text(Rect::new((pad + 20.0 * s) as i32, cy as i32, (cw - 40.0 * s) as i32, lh as i32), &line);
             cy += lh + 14.0 * s;
         }
         y += card_h + 18.0 * s;
@@ -755,13 +898,25 @@ impl WelcomeWin {
         text::draw(pm, "Take a screenshot when I click Finish", pad + 16.0 * s, y + 19.0 * s, 13.5 * s, true, t.text, None);
         let tr = Rect::new((pad + cw - 58.0 * s) as i32, (y + 16.0 * s) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
         widgets::draw_toggle(pm, &t, tr, self.try_now, self.hover == Some(Hit::Toggle(TOG_TRY_NOW)), s);
-        self.hits.push((tr_card, Hit::Toggle(TOG_TRY_NOW)));
+        self.add(tr_card, Hit::Toggle(TOG_TRY_NOW), "Take a screenshot when I click Finish", "");
     }
 }
 
 impl Handler for WelcomeWin {
     fn snapshot(&self) -> Option<Pixmap> {
         self.bb.as_ref()?.to_pixmap()
+    }
+
+    fn a11y_action(&mut self, w: &mut Win, k: u32, action: AxAction) {
+        if Chrome::a11y_invoke(w.hwnd, k) {
+            return;
+        }
+        let Some(hit) = decode(k) else { return };
+        self.focus(Some(k), true);
+        if matches!(action, AxAction::Invoke | AxAction::Toggle | AxAction::Select) {
+            self.activate(w, hit);
+        }
+        w.invalidate();
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -838,54 +993,35 @@ impl Handler for WelcomeWin {
                     return Some(LRESULT(0));
                 }
                 let hit = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
-                match hit {
-                    Some(Hit::Next) => self.next(w),
-                    Some(Hit::Back) if self.page > 0 => {
-                        self.set_hk_focus(None);
-                        self.page -= 1;
-                    }
-                    Some(Hit::Skip) => w.close(),
-                    Some(Hit::CheckKeys) => {
-                        self.set_hk_focus(None);
-                        if let Err(e) = apply_hotkeys(&self.orig.workflows, &self.chosen_hotkeys()) {
-                            self.key_status = Some((false, e));
-                        } else {
-                            self.check_keys();
-                        }
-                    }
-                    Some(Hit::KeyboardSettings) => crate::shell::open_keyboard_settings(),
-                    Some(Hit::Hotkey(i)) => self.set_hk_focus(Some(i)),
-                    Some(Hit::Toggle(id)) => {
-                        self.set_hk_focus(None);
-                        match id {
-                            TOG_SCROLLING => self.scrolling_capture = !self.scrolling_capture,
-                            TOG_UPDATE => self.update_check = !self.update_check,
-                            TOG_STARTUP => self.start_with_windows = !self.start_with_windows,
-                            TOG_CTXMENU => self.context_menu = !self.context_menu,
-                            TOG_QUICK => self.quick_annotate = !self.quick_annotate,
-                            TOG_PRTSC => {
-                                self.prtsc_take = !self.prtsc_take;
-                                // A previous "in use" result may no longer apply.
-                                self.key_status = None;
-                            }
-                            TOG_T_COPY => self.t_copy = !self.t_copy,
-                            TOG_T_SAVE => self.t_save = !self.t_save,
-                            TOG_T_EDITOR => self.t_editor = !self.t_editor,
-                            TOG_T_NOTIFY => self.t_notify = !self.t_notify,
-                            TOG_T_SOUND => self.t_sound = !self.t_sound,
-                            TOG_TRY_NOW => self.try_now = !self.try_now,
-                            _ => {}
-                        }
-                    }
-                    _ => self.set_hk_focus(None),
+                self.focus(hit.map(key), false);
+                if let Some(h) = hit {
+                    self.activate(w, h);
                 }
                 w.invalidate();
                 Some(LRESULT(0))
             }
+            WM_SETFOCUS => {
+                // Coming back to a hotkey box that lost the keyboard: record again.
+                if let (None, Some(Hit::Hotkey(i))) = (self.focused_hk, self.ax.focus.and_then(decode)) {
+                    self.set_hk_focus(Some(i));
+                    w.invalidate();
+                }
+                None
+            }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wp.0 as u32;
+                let (ctrl, shift, alt) = (super::ctrl(), super::shift(), msg == WM_SYSKEYDOWN);
+                let win = super::key_down(0x5B) || super::key_down(0x5C);
+                // Tab / Shift+Tab always move focus; a hotkey box records Tab only with
+                // Ctrl, Alt or Win held.
+                if vk == VK_TAB && !ctrl && !alt && !win {
+                    let next = self.ax.next(shift);
+                    self.focus(next, true);
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
                 if let Some(i) = self.focused_hk {
-                    if vk == 0x1B {
+                    if vk == VK_ESCAPE {
                         self.set_hk_focus(None);
                         w.invalidate();
                         return Some(LRESULT(0));
@@ -896,14 +1032,25 @@ impl Handler for WelcomeWin {
                     }
                     return Some(LRESULT(0));
                 }
-                if msg == WM_SYSKEYDOWN {
+                if alt {
                     // Let DefWindowProc handle Alt+F4, Alt+Space, F10, etc.
                     return None;
                 }
-                if vk == 0x1B {
-                    w.close();
-                    return Some(LRESULT(0));
+                let hit = self.ax.focus.and_then(decode);
+                match (vk, hit) {
+                    (VK_ESCAPE, _) => w.close(),
+                    // Back into a hotkey box left with Esc.
+                    (VK_SPACE | VK_RETURN, Some(h @ Hit::Hotkey(_))) => self.focus(Some(key(h)), true),
+                    (VK_SPACE, Some(h)) => {
+                        self.ax.ring = true;
+                        self.activate(w, h);
+                    }
+                    (VK_RETURN, Some(h @ (Hit::Back | Hit::Skip | Hit::CheckKeys | Hit::KeyboardSettings))) => self.activate(w, h),
+                    // Enter: Next / Finish (the default button).
+                    (VK_RETURN, _) => self.activate(w, Hit::Next),
+                    _ => {}
                 }
+                w.invalidate();
                 Some(LRESULT(0))
             }
             WM_KEYUP | WM_SYSKEYUP => {

@@ -121,6 +121,52 @@ fn pump(ms: u64) {
     }
 }
 
+/// Reads `hwnd`'s children through the UI Automation client API (as a screen reader would)
+/// and selects the "Recording" page via its SelectionItem pattern. Runs on its own thread:
+/// UIA sends `WM_GETOBJECT` to the window, so this thread keeps pumping meanwhile.
+fn uia_probe(hwnd: HWND) -> Result<(Vec<String>, bool), String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationSelectionItemPattern, TreeScope_Children, UIA_SelectionItemPatternId,
+        UIA_TabItemControlTypeId,
+    };
+    let h = hwnd.0 as isize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = (|| -> windows::core::Result<(Vec<String>, bool)> {
+            unsafe {
+                CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+                let ua: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+                let root = ua.ElementFromHandle(HWND(h as *mut _))?;
+                let all = root.FindAll(TreeScope_Children, &ua.CreateTrueCondition()?)?;
+                let mut names = Vec::new();
+                let mut selected = false;
+                for i in 0..all.Length()? {
+                    let e = all.GetElement(i)?;
+                    let name = e.CurrentName()?.to_string();
+                    if name == "Recording" && e.CurrentControlType()? == UIA_TabItemControlTypeId {
+                        let p: IUIAutomationSelectionItemPattern = e.GetCurrentPatternAs(UIA_SelectionItemPatternId)?;
+                        p.Select()?;
+                        selected = true;
+                    }
+                    names.push(name);
+                }
+                Ok((names, selected))
+            }
+        })();
+        unsafe { CoUninitialize() };
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    });
+    let end = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < end {
+        pump(20);
+        if let Ok(r) = rx.try_recv() {
+            return r;
+        }
+    }
+    Err("timed out".into())
+}
+
 fn pump_until(ms: u64, mut done: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < end {
@@ -463,6 +509,44 @@ pub fn run(dir: &Path) -> i32 {
         r.check("settings window closes on Save", find("SnapItSettings").is_none(), "");
     } else {
         r.check("settings opens", false, "");
+    }
+
+    // --- Accessibility: keyboard focus and UI Automation (what Narrator uses) ---
+    crate::ui::settings_window::open();
+    if let Some(sw) = find("SnapItSettings") {
+        use crate::ui::a11y::published;
+        send(sw, WM_SHOWWINDOW, 1, 0);
+        send(sw, WM_PAINT, 0, 0);
+        let (nodes, _) = published(sw);
+        let named = nodes.iter().filter(|n| !n.name.trim().is_empty()).count();
+        r.check("settings publishes named controls", named >= 15 && named == nodes.len(), &format!("{named} of {}", nodes.len()));
+        send(sw, WM_KEYDOWN, 0x09, 0); // Tab
+        send(sw, WM_PAINT, 0, 0);
+        let f1 = published(sw).1;
+        send(sw, WM_KEYDOWN, 0x09, 0);
+        send(sw, WM_PAINT, 0, 0);
+        let f2 = published(sw).1;
+        r.dump(sw, "10b_settings_keyboard_focus");
+        r.check("Tab moves keyboard focus between controls", f1.is_some() && f2.is_some() && f1 != f2, &format!("{f1:?} -> {f2:?}"));
+        match uia_probe(sw) {
+            Ok((names, selected)) => {
+                let has = |n: &str| names.iter().any(|x| x == n);
+                r.check(
+                    "UI Automation lists the controls",
+                    has("General") && has("Save") && has("Save screenshots to") && has("Follow Windows"),
+                    &format!("{} children: {}", names.len(), names.iter().take(8).cloned().collect::<Vec<_>>().join(", ")),
+                );
+                // Headless windows are never shown, so they get no WM_PAINT: render explicitly.
+                let switched = pump_until(2000, || {
+                    send(sw, WM_PAINT, 0, 0);
+                    published(sw).0.iter().any(|n| n.name == "Recording" && n.checked == Some(true))
+                });
+                r.check("UI Automation can operate controls (select a page)", selected && switched, &format!("selected: {selected}, switched: {switched}"));
+            }
+            Err(e) => r.check("UI Automation reaches the window", false, &e),
+        }
+        send(sw, WM_CLOSE, 0, 0);
+        pump(50);
     }
 
     let n = std::fs::read_dir(dir.join("Screenshots")).map(|d| d.count()).unwrap_or(0);

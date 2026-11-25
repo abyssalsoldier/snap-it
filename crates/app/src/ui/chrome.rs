@@ -38,6 +38,10 @@ use super::widgets;
 /// Logical (unscaled) height of the custom integrated titlebar.
 pub const TITLEBAR_H: f32 = 42.0;
 
+/// Accessibility node keys of the window buttons (`CHROME_KEY + WinBtn as u32`); windows
+/// keep their own keys below this.
+pub const CHROME_KEY: u32 = 0xF000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WinBtn {
     Min,
@@ -333,6 +337,37 @@ impl Chrome {
         if self.button_at(client_w, scale, x, y) == Some(pressed) {
             Self::act(hwnd, pressed);
         }
+        true
+    }
+
+    /// The window buttons for UI Automation (not Tab stops: Alt+F4 / Win+arrows cover the
+    /// keyboard). Windows include these in their published node list.
+    pub fn a11y_nodes(&self, hwnd: HWND, client_w: i32, scale: f32) -> Vec<super::a11y::Node> {
+        use super::a11y::{Node, Role};
+        let zoomed = unsafe { IsZoomed(hwnd).as_bool() };
+        self.buttons(client_w, scale)
+            .into_iter()
+            .map(|(b, r)| {
+                let name = match b {
+                    WinBtn::Min => "Minimize",
+                    WinBtn::Max if zoomed => "Restore",
+                    WinBtn::Max => "Maximize",
+                    WinBtn::Close => "Close",
+                };
+                Node::new(CHROME_KEY + b as u32, r, Role::Button, name).no_tab()
+            })
+            .collect()
+    }
+
+    /// Runs a window button a screen reader invoked; `false` if `key` isn't one.
+    pub fn a11y_invoke(hwnd: HWND, key: u32) -> bool {
+        let btn = match key.checked_sub(CHROME_KEY) {
+            Some(0) => WinBtn::Min,
+            Some(1) => WinBtn::Max,
+            Some(2) => WinBtn::Close,
+            _ => return false,
+        };
+        Self::act(hwnd, btn);
         true
     }
 

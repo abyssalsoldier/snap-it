@@ -1,4 +1,8 @@
 //! "Make QR code" studio dialog: type text, see the live QR code, then copy, save or pin it.
+//!
+//! Keyboard: Tab / Shift+Tab move between the text box and the buttons, Space or Enter press
+//! a button, Ctrl+Enter copies from anywhere, Esc closes. Screen readers see the text box and
+//! the buttons through `a11y`.
 
 use std::cell::Cell;
 
@@ -7,15 +11,18 @@ use snapit_gfx::tiny_skia::{FillRule, FilterQuality, Pixmap, PixmapPaint, Stroke
 use snapit_gfx::{text, Rect, Rgba};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, LoadCursorW, SetCursor, SetForegroundWindow, HTCLIENT, IDC_ARROW, IDC_HAND,
-    IDC_IBEAM, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WS_CAPTION,
-    WS_MINIMIZEBOX, WS_SYSMENU, WINDOW_EX_STYLE,
+    GetClientRect, LoadCursorW, SetCursor, SetForegroundWindow, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM, WM_CHAR,
+    WM_DESTROY, WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WM_SYSKEYDOWN, WINDOW_EX_STYLE, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU,
 };
 
+use super::a11y::{vk::*, Access, Action as AxAction, Node, Role};
 use super::chrome::Chrome;
 use super::icons::Icon;
+use super::text_input::place_ime;
 use super::theme::{self, Theme};
 use super::widgets::{self, BtnStyle, TextInput};
 use super::{backbuffer, Backbuffer, Handler, Win};
@@ -32,17 +39,29 @@ enum QrBtn {
     Pin,
 }
 
+/// Accessibility / focus keys.
+const K_INPUT: u32 = 1;
+const K_HINT: u32 = 2;
+
+fn btn_key(b: QrBtn) -> u32 {
+    10 + b as u32
+}
+
+fn btn_of(k: u32) -> Option<QrBtn> {
+    [QrBtn::Copy, QrBtn::Save, QrBtn::Pin].into_iter().find(|b| btn_key(*b) == k)
+}
+
 struct QrDialog {
     theme: Theme,
     scale: f32,
     chrome: Chrome,
     input: TextInput,
-    focused: bool,
     code: Option<Pixmap>,
     bb: Option<Backbuffer>,
     client: (i32, i32),
     hover_btn: Option<QrBtn>,
     hover_input: bool,
+    ax: Access,
 }
 
 pub fn open() {
@@ -61,17 +80,20 @@ pub fn open() {
 
     let clip = if super::headless() { None } else { crate::clipboard::get_text() };
     let initial = clip.filter(|t| !t.is_empty() && t.len() < 2000).unwrap_or_else(|| "https://".into());
+    let mut input = TextInput::new(initial, "Enter a URL or text to encode…", false, true);
+    // Typing replaces the suggestion; arrow keys keep it.
+    input.select_all();
     let mut d = QrDialog {
         theme: theme::current(),
         scale: sc,
         chrome: Chrome::new(false, true, false),
-        input: TextInput::new(initial, "Enter a URL or text to encode…", false, true),
-        focused: true,
+        input,
         code: None,
         bb: None,
         client: (w, h),
         hover_btn: None,
         hover_input: false,
+        ax: Access { focus: Some(K_INPUT), ..Access::default() },
     };
     d.regenerate();
 
@@ -91,6 +113,10 @@ pub fn open() {
 }
 
 impl QrDialog {
+    fn input_focused(&self) -> bool {
+        self.ax.focus == Some(K_INPUT)
+    }
+
     fn input_rect(&self) -> Rect {
         let s = self.scale;
         let pad = (20.0 * s) as i32;
@@ -126,6 +152,7 @@ impl QrDialog {
         self.scale = super::dpi_scale(hwnd);
         Backbuffer::ensure(&mut self.bb, self.client.0 as u32, self.client.1 as u32);
         let Some(mut bb) = self.bb.take() else { return };
+        self.ax.begin();
         {
             let mut pm = bb.pixmap();
             let t = self.theme;
@@ -145,7 +172,11 @@ impl QrDialog {
 
             // Text input.
             let ir = self.input_rect();
-            self.input.draw(&mut pm, &t, ir, self.focused, self.hover_input, s);
+            let focused = self.input_focused();
+            self.input.draw(&mut pm, &t, ir, focused, self.hover_input, s);
+            self.ax.push(
+                Node::new(K_INPUT, ir, Role::Edit, "Content to encode").value(self.input.value.clone()).help("The QR code updates as you type."),
+            );
 
             // QR preview card.
             let btns = self.buttons();
@@ -194,14 +225,30 @@ impl QrDialog {
                     );
                 }
             }
+            let status = if self.code.is_some() { "QR code ready" } else { "No QR code: the content is empty" };
+            self.ax.push(Node::new(K_HINT, card, Role::Text, status).live());
 
             // Footer buttons.
             let disabled = self.code.is_none();
             for (b, r, lbl, ic, st) in btns {
                 widgets::draw_button(&mut pm, &t, r, lbl, Some(ic), st, self.hover_btn == Some(b), disabled, s);
+                let name = match b {
+                    QrBtn::Copy => "Copy QR code",
+                    QrBtn::Save => "Save QR code",
+                    QrBtn::Pin => "Pin QR code",
+                };
+                let help = if b == QrBtn::Copy { "Ctrl+Enter" } else { "" };
+                self.ax.push(Node::new(btn_key(b), r, Role::Button, name).enabled(!disabled).help(help));
+            }
+
+            let chrome_nodes = self.chrome.a11y_nodes(hwnd, self.client.0, s);
+            self.ax.nodes.extend(chrome_nodes);
+            if let Some(r) = self.ax.ring_rect() {
+                widgets::draw_focus_ring(&mut pm, &t, r, 8.0, s);
             }
         }
         self.bb = Some(bb);
+        self.ax.publish(hwnd);
     }
 
     fn run_action(&self, hwnd: HWND, btn: QrBtn) {
@@ -228,6 +275,29 @@ impl QrDialog {
 impl Handler for QrDialog {
     fn snapshot(&self) -> Option<Pixmap> {
         self.bb.as_ref()?.to_pixmap()
+    }
+
+    fn a11y_action(&mut self, w: &mut Win, k: u32, action: AxAction) {
+        if Chrome::a11y_invoke(w.hwnd, k) {
+            return;
+        }
+        match (k, action) {
+            (K_INPUT, AxAction::SetValue(v)) => {
+                self.ax.focus = Some(K_INPUT);
+                self.input.set(v);
+                self.regenerate();
+            }
+            (K_INPUT, AxAction::Focus) => self.ax.focus = Some(K_INPUT),
+            (k, AxAction::Focus) if btn_of(k).is_some() => self.ax.focus = Some(k),
+            (k, AxAction::Invoke) => {
+                if let Some(b) = btn_of(k) {
+                    self.ax.focus = Some(k);
+                    self.run_action(w.hwnd, b);
+                }
+            }
+            _ => {}
+        }
+        w.invalidate();
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -281,6 +351,7 @@ impl Handler for QrDialog {
             WM_MOUSEMOVE => {
                 let (x, y) = super::lparam_xy(lp);
                 let mut dirty = self.chrome.set_hover(w.hwnd, self.client.0, self.scale, x, y);
+                dirty |= self.input.mouse_move(x, y).handled();
                 let hi = self.input_rect().contains(x, y);
                 if hi != self.hover_input {
                     self.hover_input = hi;
@@ -296,49 +367,94 @@ impl Handler for QrDialog {
                 }
                 Some(LRESULT(0))
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let (x, y) = super::lparam_xy(lp);
-                self.chrome.press(self.client.0, self.scale, x, y);
-                let f = self.input_rect().contains(x, y);
-                if f != self.focused {
-                    self.focused = f;
-                    w.invalidate();
+                if self.chrome.press(self.client.0, self.scale, x, y) {
+                    return Some(LRESULT(0));
                 }
+                if self.input_rect().contains(x, y) {
+                    self.ax.set_focus(Some(K_INPUT));
+                    self.input.mouse_down(x, y, super::shift(), msg == WM_LBUTTONDBLCLK);
+                    unsafe {
+                        SetCapture(w.hwnd);
+                    }
+                }
+                w.invalidate();
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
                 let (x, y) = super::lparam_xy(lp);
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if self.input.dragging() {
+                    self.input.mouse_up();
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
                 if self.chrome.release(w.hwnd, self.client.0, self.scale, x, y) {
                     w.invalidate();
                     return Some(LRESULT(0));
                 }
                 if let Some((b, _, _, _, _)) = self.buttons().into_iter().find(|(_, r, _, _, _)| r.contains(x, y)) {
+                    self.ax.set_focus(Some(btn_key(b)));
                     self.run_action(w.hwnd, b);
                 }
+                w.invalidate();
                 Some(LRESULT(0))
             }
             WM_KEYDOWN => {
                 let vk = wp.0 as u32;
-                if vk == 0x1B {
+                let (ctrl, shift) = (super::ctrl(), super::shift());
+                if vk == VK_ESCAPE {
                     w.close();
                     return Some(LRESULT(0));
                 }
-                if self.focused && self.input.on_key(vk, super::ctrl()) {
-                    self.regenerate();
+                if vk == VK_TAB && !ctrl {
+                    self.ax.focus = self.ax.next(shift);
+                    self.ax.ring = true;
+                    if self.ax.focus == Some(K_INPUT) {
+                        self.input.select_all();
+                    }
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
+                if vk == VK_RETURN && ctrl {
+                    self.run_action(w.hwnd, QrBtn::Copy);
+                    return Some(LRESULT(0));
+                }
+                if self.input_focused() {
+                    let c = self.input.on_key(vk, ctrl, shift);
+                    if c.edited() {
+                        self.regenerate();
+                    }
+                    if c.handled() {
+                        w.invalidate();
+                    }
+                } else if let (VK_SPACE | VK_RETURN, Some(b)) = (vk, self.ax.focus.and_then(btn_of)) {
+                    self.ax.ring = true;
+                    self.run_action(w.hwnd, b);
                     w.invalidate();
                 }
                 Some(LRESULT(0))
             }
+            WM_SYSKEYDOWN => None,
             WM_CHAR => {
-                if self.focused {
-                    if let Some(ch) = char::from_u32(wp.0 as u32) {
-                        if self.input.on_char(ch) {
-                            self.regenerate();
-                            w.invalidate();
-                        }
+                // (AltGr arrives as Ctrl+Alt, so don't filter on Ctrl: on_char ignores the
+                // control characters Ctrl+letter produces.)
+                if self.input_focused() {
+                    if self.input.on_char(wp.0 as u16).edited() {
+                        self.regenerate();
                     }
+                    w.invalidate();
                 }
                 Some(LRESULT(0))
+            }
+            WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+                if let Some(p) = self.input_focused().then(|| self.input.caret_point()).flatten() {
+                    place_ime(w.hwnd, p);
+                }
+                None
             }
             WM_DESTROY => {
                 OPEN.with(|o| o.set(0));

@@ -17,11 +17,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR, MF_STRING,
     SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
+    WM_CONTEXTMENU, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
     WS_OVERLAPPEDWINDOW,
 };
 
+use super::a11y::{vk::*, Access, Action as AxAction, Node, Role};
 use super::chrome::Chrome;
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use super::icons::Icon;
 use super::theme::{self, Theme};
 use super::widgets::{self, BtnStyle};
@@ -30,6 +32,20 @@ use crate::app::{self, Command};
 use crate::history::{self as hist, Entry};
 
 const WM_THUMB: u32 = WM_APP + 30;
+
+/// Accessibility / focus keys: the Open folder button, and capture `i` at `ENTRY_KEY + i`
+/// (above the title-bar buttons' keys, so any history length fits).
+const K_FOLDER: u32 = 1;
+const ENTRY_KEY: u32 = 0x1_0000;
+const VK_APPS: u32 = 0x5D;
+
+fn entry_key(i: usize) -> u32 {
+    ENTRY_KEY + i as u32
+}
+
+fn entry_of(k: u32) -> Option<usize> {
+    k.checked_sub(ENTRY_KEY).map(|i| i as usize)
+}
 
 thread_local! {
     static OPEN: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
@@ -58,6 +74,8 @@ struct History {
     hover_folder: bool,
     folder_pressed: bool,
     folder_btn: Rect,
+    /// Keyboard focus, Tab order and the UI Automation tree.
+    ax: Access,
 }
 
 pub fn open() {
@@ -89,6 +107,7 @@ pub fn open() {
         hover_folder: false,
         folder_pressed: false,
         folder_btn: Rect::default(),
+        ax: Access::default(),
     };
     let mons = snapit_capture::monitors();
     let m = mons.iter().find(|m| m.primary).or(mons.first());
@@ -188,8 +207,91 @@ impl History {
         {
             let mut pm = bb.pixmap();
             self.draw(&mut pm, hwnd);
+            self.build_nodes(hwnd);
+            if let Some(r) = self.ax.ring_rect() {
+                widgets::draw_focus_ring(&mut pm, &self.theme, r, 10.0, self.scale);
+            }
         }
         self.bb = Some(bb);
+        self.ax.publish(hwnd);
+    }
+
+    /// The accessible tree: the Open folder button, then the captures as list items. Only
+    /// captures near the visible area (and the selected one) are listed, so a long history
+    /// stays fast; arrow keys scroll the rest into view.
+    fn build_nodes(&mut self, hwnd: HWND) {
+        self.ax.begin();
+        self.ax.push(Node::new(K_FOLDER, self.folder_btn, Role::Button, "Open screenshots folder"));
+        let hh = self.header_h() as i32;
+        let near = self.cell().1 as i32 * 2;
+        // The grid is one Tab stop: the selected capture, else the first one shown.
+        let mut tab_stop = self.selected;
+        for i in 0..self.entries.len() {
+            let r = self.cell_rect(i).inflate(-(6.0 * self.scale) as i32);
+            let visible = r.bottom() > hh && r.y < self.client.1;
+            if !(visible || r.bottom() > hh - near && r.y < self.client.1 + near || self.selected == Some(i)) {
+                continue;
+            }
+            if tab_stop.is_none() && visible {
+                tab_stop = Some(i);
+            }
+            let e = &self.entries[i];
+            let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let kind = e.kind.strip_prefix("capture_").unwrap_or(&e.kind).replace('_', " ");
+            let mut n = Node::new(entry_key(i), r, Role::ListItem, name)
+                .help(format!("{} × {}, {kind}. Enter opens it in the editor; Delete removes it from history.", e.width, e.height))
+                .checked(self.selected == Some(i));
+            n.offscreen = !visible;
+            n.tab_stop = tab_stop == Some(i);
+            self.ax.push(n);
+        }
+        let chrome_nodes = self.chrome.a11y_nodes(hwnd, self.client.0, self.scale);
+        self.ax.nodes.extend(chrome_nodes);
+    }
+
+    /// Selects capture `i` with keyboard focus and scrolls it into view.
+    fn select(&mut self, hwnd: HWND, i: usize, ring: bool) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let i = i.min(self.entries.len() - 1);
+        self.selected = Some(i);
+        self.ax.focus = Some(entry_key(i));
+        self.ax.ring = ring;
+        let r = self.cell_rect(i);
+        let top = self.header_h() as i32;
+        if r.y < top {
+            self.scroll -= (top - r.y) as f32;
+        } else if r.bottom() > self.client.1 {
+            self.scroll += (r.bottom() - self.client.1) as f32;
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.request_visible(hwnd);
+    }
+
+    /// Arrow / paging keys in the grid. Returns `true` if used.
+    fn grid_key(&mut self, hwnd: HWND, vk: u32) -> bool {
+        let n = self.entries.len();
+        if n == 0 {
+            return false;
+        }
+        let cols = self.cols();
+        let page = (((self.client.1 as f32 - self.header_h()) / self.cell().1).floor() as usize).max(1) * cols;
+        let cur = self.selected.unwrap_or(0);
+        let next = match vk {
+            VK_LEFT => cur.saturating_sub(1),
+            VK_RIGHT => (cur + 1).min(n - 1),
+            VK_UP => cur.saturating_sub(cols),
+            VK_DOWN => (cur + cols).min(n - 1),
+            VK_PRIOR => cur.saturating_sub(page),
+            VK_NEXT => (cur + page).min(n - 1),
+            VK_HOME => 0,
+            VK_END => n - 1,
+            _ => return false,
+        };
+        // The first arrow press just selects the capture that has focus.
+        self.select(hwnd, if self.selected.is_none() { cur } else { next }, true);
+        true
     }
 
     fn draw(&mut self, pm: &mut snapit_gfx::tiny_skia::PixmapMut, hwnd: HWND) {
@@ -300,7 +402,9 @@ impl History {
         let _ = hist::rewrite(&crate::paths::history_file(), &self.entries);
     }
 
-    fn context_menu(&mut self, hwnd: HWND, i: usize) {
+    /// Shows the right-click menu for capture `i` at `at` (screen coordinates), or at the
+    /// mouse pointer.
+    fn context_menu(&mut self, hwnd: HWND, i: usize, at: Option<POINT>) {
         const OPEN: usize = 1;
         const COPY: usize = 2;
         const PIN: usize = 3;
@@ -321,8 +425,11 @@ impl History {
             let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
             add(FORGET, "Remove from history");
             add(DELETE, "Delete file…");
-            let mut p = POINT::default();
-            let _ = GetCursorPos(&mut p);
+            let p = at.unwrap_or_else(|| {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                p
+            });
             let r = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
             let _ = DestroyMenu(m);
             r.0 as usize
@@ -372,9 +479,42 @@ fn ellipsize(s: &str, size: f32, max_w: f32) -> String {
     s.chars().take(4).collect()
 }
 
+impl History {
+    /// Context menu for the selected capture, opened from the keyboard (at the capture).
+    fn keyboard_menu(&mut self, w: &mut Win) {
+        let Some(i) = self.selected.filter(|&i| i < self.entries.len()) else { return };
+        let r = self.cell_rect(i);
+        let mut p = POINT { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+        unsafe {
+            let _ = ClientToScreen(w.hwnd, &mut p);
+        }
+        self.context_menu(w.hwnd, i, Some(p));
+        self.request_visible(w.hwnd);
+        w.invalidate();
+    }
+}
+
 impl Handler for History {
     fn snapshot(&self) -> Option<Pixmap> {
         self.bb.as_ref()?.to_pixmap()
+    }
+
+    fn a11y_action(&mut self, w: &mut Win, k: u32, action: AxAction) {
+        if Chrome::a11y_invoke(w.hwnd, k) {
+            return;
+        }
+        if k == K_FOLDER {
+            self.ax.focus = Some(K_FOLDER);
+            if action == AxAction::Invoke {
+                crate::shell::open_folder(&app::settings().save_dir());
+            }
+        } else if let Some(i) = entry_of(k).filter(|&i| i < self.entries.len()) {
+            self.select(w.hwnd, i, true);
+            if action == AxAction::Invoke {
+                self.open_entry(i);
+            }
+        }
+        w.invalidate();
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -455,8 +595,12 @@ impl Handler for History {
                 let (x, y) = super::lparam_xy(lp);
                 self.chrome.press(self.client.0, self.scale, x, y);
                 self.folder_pressed = self.folder_btn.contains(x, y);
+                if self.folder_pressed {
+                    self.ax.set_focus(Some(K_FOLDER));
+                }
                 if (y as f32) >= self.header_h() {
                     self.selected = self.index_at(x, y);
+                    self.ax.set_focus(self.selected.map(entry_key));
                     w.invalidate();
                 }
                 Some(LRESULT(0))
@@ -491,27 +635,52 @@ impl Handler for History {
                 let (x, y) = super::lparam_xy(lp);
                 if let Some(i) = self.index_at(x, y) {
                     self.selected = Some(i);
+                    self.ax.set_focus(Some(entry_key(i)));
                     w.invalidate();
-                    self.context_menu(w.hwnd, i);
+                    self.context_menu(w.hwnd, i, None);
                     self.request_visible(w.hwnd);
                     w.invalidate();
                 }
                 Some(LRESULT(0))
             }
+            // Shift+F10 (DefWindowProc turns it into this with lParam -1): menu for the selection.
+            WM_CONTEXTMENU if lp.0 as i32 == -1 => {
+                self.keyboard_menu(w);
+                Some(LRESULT(0))
+            }
             WM_KEYDOWN => {
-                match wp.0 as u16 {
-                    0x0D => {
+                let vk = wp.0 as u32;
+                let shift = super::shift();
+                let on_folder = self.ax.focus == Some(K_FOLDER);
+                match vk {
+                    VK_TAB => {
+                        self.ax.focus = self.ax.next(shift);
+                        self.ax.ring = true;
+                        if let Some(i) = self.ax.focus.and_then(entry_of) {
+                            self.select(w.hwnd, i, true);
+                        }
+                    }
+                    VK_ESCAPE => w.close(),
+                    VK_RETURN | VK_SPACE if on_folder => crate::shell::open_folder(&app::settings().save_dir()),
+                    VK_RETURN => {
                         if let Some(i) = self.selected {
                             self.open_entry(i);
                         }
                     }
-                    0x2E => {
+                    VK_DELETE => {
                         if let Some(i) = self.selected {
                             self.remove(i);
+                            // Keep going from the same place.
+                            if !self.entries.is_empty() {
+                                self.select(w.hwnd, i, true);
+                            }
                             self.request_visible(w.hwnd);
                         }
                     }
-                    0x1B => w.close(),
+                    VK_APPS => self.keyboard_menu(w),
+                    _ if !on_folder => {
+                        self.grid_key(w.hwnd, vk);
+                    }
                     _ => {}
                 }
                 w.invalidate();

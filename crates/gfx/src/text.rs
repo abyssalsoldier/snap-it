@@ -106,6 +106,36 @@ pub fn layout(text: &str, size: f32, bold: bool) -> TextLayout {
     }
 }
 
+/// X offset of every char boundary in a single line of text: `chars + 1` values, starting
+/// at 0. Uses the same font fallback, kerning and advances as [`layout`], without building
+/// outlines, so it is cheap enough for caret placement and hit testing.
+pub fn caret_positions(line: &str, size: f32, bold: bool) -> Vec<f32> {
+    let set = if bold { &fonts().bold } else { &fonts().regular };
+    let mut out = Vec::with_capacity(line.chars().count() + 1);
+    out.push(0.0);
+    let Some(primary) = set.first() else {
+        out.extend(line.chars().map(|_| 0.0));
+        return out;
+    };
+    let upem = primary.units_per_em().unwrap_or(2048.0);
+    let mut x = 0.0f32;
+    let mut prev: Option<(&FontVec, GlyphId)> = None;
+    for c in line.chars() {
+        if let Some((font, id)) = pick(set, c).or_else(|| Some((primary, primary.glyph_id(c)))) {
+            let fs = size / font.units_per_em().unwrap_or(upem);
+            if let Some((pf, pid)) = prev {
+                if std::ptr::eq(pf, font) {
+                    x += font.kern_unscaled(pid, id) * fs;
+                }
+            }
+            x += font.h_advance_unscaled(id) * fs;
+            prev = Some((font, id));
+        }
+        out.push(x);
+    }
+    out
+}
+
 fn append_outline(pb: &mut PathBuilder, curves: &[OutlineCurve], ox: f32, baseline: f32, s: f32) {
     let tx = |p: ab_glyph::Point| (ox + p.x * s, baseline - p.y * s);
     let mut last: Option<ab_glyph::Point> = None;
@@ -181,5 +211,18 @@ mod tests {
         let mut pm = tiny_skia::Pixmap::new(80, 30).unwrap();
         draw(&mut pm.as_mut(), "Hi", 2.0, 2.0, 20.0, true, Rgba::BLACK, Some((Rgba::WHITE, 3.0)));
         assert!(pm.data().as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+    }
+
+    #[test]
+    fn caret_positions_match_layout() {
+        if !available() {
+            return;
+        }
+        let s = "Wave, Ally 😀";
+        let pos = caret_positions(s, 18.0, false);
+        assert_eq!(pos.len(), s.chars().count() + 1);
+        assert!(pos.windows(2).all(|w| w[1] >= w[0]), "monotonic");
+        assert!((pos.last().unwrap() - layout(s, 18.0, false).width).abs() < 0.01);
+        assert!((pos[4] - layout("Wave", 18.0, false).width).abs() < 0.01);
     }
 }

@@ -14,16 +14,20 @@ use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, IsIconic, LoadCursorW, SetCursor, SetForegroundWindow, ShowWindow, HTCLIENT,
     IDC_ARROW, IDC_HAND, IDC_IBEAM, SW_RESTORE, SW_SHOW, WM_CHAR, WM_COMMAND, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE,
+    WM_ERASEBKGND, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_SETFOCUS,
     WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU, WINDOW_EX_STYLE,
 };
 
+use super::a11y::{Access, Action as AxAction, Node, Role};
 use super::chrome::Chrome;
 use super::icons::{self, Icon};
+use super::text_input::place_ime;
 use super::theme::{self, Theme as UiTheme};
 use super::widgets::{self, BtnStyle, TextInput};
+use super::a11y::vk::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use super::{backbuffer, Backbuffer, Handler, Win};
 use crate::actions::Action;
 use crate::app::{self, Command};
@@ -93,6 +97,51 @@ enum Hit {
     Btn(u16),
 }
 
+/// Text fields in key order (see [`key`]).
+const FIELDS: [Field; 11] = [
+    Field::SaveDir,
+    Field::Pattern,
+    Field::JpegQ,
+    Field::History,
+    Field::Delay,
+    Field::Dim,
+    Field::Mp4Fps,
+    Field::Mp4Kbps,
+    Field::GifFps,
+    Field::GifMax,
+    Field::Repo,
+];
+
+/// Stable accessibility / keyboard-focus key of a control.
+fn key(h: Hit) -> u32 {
+    match h {
+        Hit::Nav(i) => 0x100 + i as u32,
+        Hit::Toggle(id) => 0x200 + id as u32,
+        Hit::Seg(g, i) => 0x300 + g as u32 * 16 + i as u32,
+        Hit::Text(f) => 0x400 + FIELDS.iter().position(|x| *x == f).unwrap_or(0) as u32,
+        Hit::Hotkey(i) => 0x500 + i as u32,
+        Hit::Btn(id) => 0x600 + id as u32,
+    }
+}
+
+fn decode(k: u32) -> Option<Hit> {
+    let v = (k & 0xFF) as usize;
+    Some(match k >> 8 {
+        1 => Hit::Nav(v),
+        2 => Hit::Toggle(v as u16),
+        3 => Hit::Seg((v / 16) as u16, v % 16),
+        4 => Hit::Text(*FIELDS.get(v)?),
+        5 => Hit::Hotkey(v),
+        6 => Hit::Btn(v as u16),
+        _ => return None,
+    })
+}
+
+const SEG_COUNT: usize = 3;
+const THEME_OPTS: [&str; SEG_COUNT] = ["Follow Windows", "Light", "Dark"];
+const FORMAT_OPTS: [&str; SEG_COUNT] = ["PNG", "JPEG", "WebP (lossless)"];
+const PATTERN_HELP: &str = "%y %mo %d %h %mi %s %ms  date/time · %width %height · %title · %rnd";
+
 // Logical IDs for toggles, segmented controls, and action buttons.
 const BTN_SAVE: u16 = 1;
 const BTN_CANCEL: u16 = 2;
@@ -138,6 +187,8 @@ struct SettingsWin {
     focused: Option<Field>,
     hover: Option<Hit>,
     hits: Vec<(Rect, Hit)>,
+    /// Keyboard focus, Tab order and the UI Automation tree.
+    ax: Access,
 
     // Editable state mirrors every Settings field cleanly.
     save_dir: TextInput,
@@ -257,6 +308,7 @@ pub fn open() {
         focused: None,
         hover: None,
         hits: Vec::new(),
+        ax: Access::default(),
     };
 
     let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -453,6 +505,7 @@ impl SettingsWin {
         Backbuffer::ensure(&mut self.bb, self.client.0 as u32, self.client.1 as u32);
         let Some(mut bb) = self.bb.take() else { return };
         self.hits.clear();
+        self.ax.begin();
         {
             let mut pm = bb.pixmap();
             let t = self.theme;
@@ -475,6 +528,7 @@ impl SettingsWin {
                 pm.fill_rect(div, &t.border_subtle.paint(), id, None);
             }
             let mut ny = ty as f32 + 14.0 * s;
+            let mut nav_nodes = Vec::new();
             for (i, (name, icon)) in TABS.iter().enumerate() {
                 let nr = Rect::new((12.0 * s) as i32, ny as i32, sw - (24.0 * s) as i32, (36.0 * s) as i32);
                 let active = self.tab == i;
@@ -497,13 +551,15 @@ impl SettingsWin {
                 let l = text::layout(name, 13.0 * s, active);
                 text::draw(&mut pm, name, nr.x as f32 + 36.0 * s, nr.y as f32 + (nr.h as f32 - l.height) / 2.0, 13.0 * s, active, fg, None);
                 self.hits.push((nr, Hit::Nav(i)));
+                nav_nodes.push(self.describe(Hit::Nav(i), nr, name));
                 ny += 42.0 * s;
             }
+            // Tab order: the page list first, then the page, then the footer.
+            self.ax.nodes.splice(0..0, nav_nodes);
 
             // Bottom sidebar action: Run setup wizard.
             let wiz_r = Rect::new((12.0 * s) as i32, self.client.1 - (46.0 * s) as i32, sw - (24.0 * s) as i32, (34.0 * s) as i32);
             widgets::draw_button(&mut pm, &t, wiz_r, "Setup wizard…", None, BtnStyle::Ghost, self.hover == Some(Hit::Btn(BTN_WELCOME)), false, s);
-            self.hits.push((wiz_r, Hit::Btn(BTN_WELCOME)));
 
             // 3. Sticky footer bar on the content side.
             let fh = self.footer_h();
@@ -520,14 +576,23 @@ impl SettingsWin {
             let cancel_r = Rect::new(save_r.x - (10.0 * s) as i32 - bw, by, bw, bh);
             widgets::draw_button(&mut pm, &t, cancel_r, "Cancel", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_CANCEL)), false, s);
             widgets::draw_button(&mut pm, &t, save_r, "Save", None, BtnStyle::Primary, self.hover == Some(Hit::Btn(BTN_SAVE)), false, s);
-            self.hits.push((cancel_r, Hit::Btn(BTN_CANCEL)));
-            self.hits.push((save_r, Hit::Btn(BTN_SAVE)));
+            let whole = Rect::new(0, 0, self.client.0, self.client.1);
+            self.add(whole, cancel_r, Hit::Btn(BTN_CANCEL), "Cancel", "Close without saving (Esc)");
+            self.add(whole, save_r, Hit::Btn(BTN_SAVE), "Save", "Save and close (Enter)");
+            self.add(whole, wiz_r, Hit::Btn(BTN_WELCOME), "Setup wizard", "Run the first-launch setup again");
 
             // 4. Integrated custom titlebar (drawn last so scrolled content stays underneath).
             let ver = concat!("v", env!("CARGO_PKG_VERSION"));
             self.chrome.draw(&mut pm, &t, hwnd, self.client.0, s, "Snap It Settings", Some(ver), None);
+            let chrome_nodes = self.chrome.a11y_nodes(hwnd, self.client.0, s);
+            self.ax.nodes.extend(chrome_nodes);
+
+            if let Some(r) = self.ax.ring_rect() {
+                widgets::draw_focus_ring(&mut pm, &t, r, 8.0, s);
+            }
         }
         self.bb = Some(bb);
+        self.ax.publish(hwnd);
     }
 
     fn draw_content(&mut self, pm: &mut PixmapMut, cr: Rect) {
@@ -558,10 +623,104 @@ impl SettingsWin {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
-    fn push_hit_clipped(&mut self, cr: Rect, r: Rect, h: Hit) {
-        if let Some(vis) = r.intersect(cr) {
-            self.hits.push((vis, h));
+    /// Records a control drawn in `r`: its clickable part inside `cr` (the visible area), and
+    /// an accessible node (Tab order, screen readers) even when it is scrolled out of view.
+    fn add(&mut self, cr: Rect, r: Rect, h: Hit, name: &str, help: &str) {
+        let vis = r.intersect(cr);
+        if let Some(v) = vis {
+            self.hits.push((v, h));
         }
+        let mut n = self.describe(h, r, name).help(help);
+        n.offscreen = vis.is_none_or(|v| v.h < r.h / 2);
+        self.ax.push(n);
+    }
+
+    fn describe(&mut self, h: Hit, r: Rect, name: &str) -> Node {
+        let k = key(h);
+        // A page list or a group of choices is one Tab stop (the current one); arrow keys
+        // move within it, as in Windows' own tab strips and radio groups.
+        let single_stop = |n: Node, on: bool| if on { n } else { n.no_tab() };
+        match h {
+            Hit::Nav(i) => single_stop(Node::new(k, r, Role::TabItem, name).checked(self.tab == i), self.tab == i),
+            Hit::Toggle(id) => Node::new(k, r, Role::CheckBox, name).checked(self.toggle_field(id).is_some_and(|b| *b)),
+            Hit::Seg(g, i) => {
+                let sel = if g == SEG_THEME { self.theme_pref } else { self.format };
+                single_stop(Node::new(k, r, Role::RadioButton, name).checked(sel == i), sel == i)
+            }
+            Hit::Text(f) => {
+                let v = self.text_input_mut(f).map(|t| t.value.clone()).unwrap_or_default();
+                Node::new(k, r, Role::Edit, name).value(v)
+            }
+            Hit::Hotkey(i) => {
+                let v = if self.hotkeys[i].trim().is_empty() { "Not set".to_string() } else { self.hotkeys[i].clone() };
+                Node::new(k, r, Role::Hotkey, name).value(v)
+            }
+            Hit::Btn(id) => Node::new(k, r, Role::Button, name).enabled(!(id == BTN_CLEAR_CUSTOM && self.custom_region.is_none())),
+        }
+    }
+
+    fn toggle_field(&mut self, id: u16) -> Option<&mut bool> {
+        Some(match id {
+            TOG_CURSOR => &mut self.capture_cursor,
+            TOG_QUICK => &mut self.quick_annotate,
+            TOG_DETECT_WIN => &mut self.detect_windows,
+            TOG_DETECT_CTL => &mut self.detect_controls,
+            TOG_UIA => &mut self.uia_controls,
+            TOG_MAGNIFIER => &mut self.magnifier,
+            TOG_CROSSHAIR => &mut self.crosshair,
+            TOG_SCROLLING => &mut self.scrolling_capture,
+            TOG_T_COPY => &mut self.t_copy,
+            TOG_T_SAVE => &mut self.t_save,
+            TOG_T_EDITOR => &mut self.t_editor,
+            TOG_T_PIN => &mut self.t_pin,
+            TOG_T_NOTIFY => &mut self.t_notify,
+            TOG_T_SOUND => &mut self.t_sound,
+            TOG_REC_CURSOR => &mut self.rec_cursor,
+            TOG_STARTUP => &mut self.start_with_windows,
+            TOG_CTXMENU => &mut self.context_menu,
+            TOG_UPDATE => &mut self.update_check,
+            _ => return None,
+        })
+    }
+
+    /// Moves keyboard focus to `k`. A text or hotkey box gets the typing focus too (with its
+    /// text selected when reached from the keyboard, like a Windows edit box). `ring` shows
+    /// the focus outline and scrolls the control into view.
+    fn focus(&mut self, k: Option<u32>, ring: bool) {
+        self.ax.focus = k;
+        self.ax.ring = ring;
+        let field = match k.and_then(decode) {
+            Some(Hit::Text(f)) => Some(f),
+            Some(Hit::Hotkey(i)) => Some(Field::Hotkey(i)),
+            _ => None,
+        };
+        if field != self.focused {
+            self.set_focus(field);
+            if ring {
+                if let Some(ti) = field.and_then(|f| self.text_input_mut(f)) {
+                    ti.select_all();
+                }
+            }
+        }
+        if ring {
+            self.scroll_into_view(k);
+        }
+    }
+
+    fn scroll_into_view(&mut self, k: Option<u32>) {
+        let Some(r) = k.and_then(|k| self.ax.get(k)).map(|n| n.rect) else { return };
+        // Only the content pane scrolls (not the sidebar or the footer buttons).
+        if matches!(k.and_then(decode), Some(Hit::Nav(_) | Hit::Btn(BTN_SAVE | BTN_CANCEL | BTN_WELCOME))) {
+            return;
+        }
+        let cr = self.content_rect();
+        let margin = 16.0 * self.scale;
+        if r.y < cr.y {
+            self.scroll -= (cr.y - r.y) as f32 + margin;
+        } else if r.bottom() > cr.bottom() {
+            self.scroll += (r.bottom() - cr.bottom()) as f32 + margin;
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
     fn draw_toggle_row(&mut self, pm: &mut PixmapMut, cr: Rect, x: f32, w: f32, y: &mut f32, id: u16, label: &str, desc: Option<&str>, on: bool) {
@@ -579,7 +738,7 @@ impl SettingsWin {
             30.0 * s
         };
         let click_r = Rect::new(x as i32, (*y - 4.0 * s) as i32, w as i32, row_h as i32);
-        self.push_hit_clipped(cr, click_r, Hit::Toggle(id));
+        self.add(cr, click_r, Hit::Toggle(id), label, desc.unwrap_or(""));
         *y += row_h;
     }
 
@@ -596,9 +755,9 @@ impl SettingsWin {
         text::draw(pm, "Appearance", ix, *y + 12.0 * s, 12.0 * s, true, t.subtext, None);
         let seg_r = Rect::new(ix as i32, (*y + 32.0 * s) as i32, iw as i32, (32.0 * s) as i32);
         let hov_t = match self.hover { Some(Hit::Seg(SEG_THEME, i)) => Some(i), _ => None };
-        widgets::draw_segmented(pm, &t, seg_r, &["Follow Windows", "Light", "Dark"], self.theme_pref, hov_t, s);
+        widgets::draw_segmented(pm, &t, seg_r, &THEME_OPTS, self.theme_pref, hov_t, s);
         for (i, sr) in widgets::segmented_rects(seg_r, 3, s).into_iter().enumerate() {
-            self.push_hit_clipped(cr, sr, Hit::Seg(SEG_THEME, i));
+            self.add(cr, sr, Hit::Seg(SEG_THEME, i), THEME_OPTS[i], "Appearance");
         }
         *y += c1_h + 14.0 * s;
 
@@ -613,10 +772,10 @@ impl SettingsWin {
         let browse_r = Rect::new(dir_r.right() + (8.0 * s) as i32, cy as i32, browse_w, (32.0 * s) as i32);
         self.save_dir.draw(pm, &t, dir_r, self.focused == Some(Field::SaveDir), self.hover == Some(Hit::Text(Field::SaveDir)), s);
         widgets::draw_button(pm, &t, browse_r, "Browse…", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_BROWSE)), false, s);
-        self.push_hit_clipped(cr, dir_r, Hit::Text(Field::SaveDir));
-        self.push_hit_clipped(cr, browse_r, Hit::Btn(BTN_BROWSE));
-        cy += 38.0 * s;
         let def_hint = format!("Empty = {}", crate::paths::default_save_dir().display());
+        self.add(cr, dir_r, Hit::Text(Field::SaveDir), "Save screenshots to", &def_hint);
+        self.add(cr, browse_r, Hit::Btn(BTN_BROWSE), "Browse for the screenshots folder", "");
+        cy += 38.0 * s;
         text::draw(pm, &widgets::ellipsize(&def_hint, 11.5 * s, false, iw), ix, cy, 11.5 * s, false, t.subtext, None);
         cy += 24.0 * s;
 
@@ -624,9 +783,9 @@ impl SettingsWin {
         cy += 20.0 * s;
         let pat_r = Rect::new(ix as i32, cy as i32, iw as i32, (32.0 * s) as i32);
         self.pattern.draw(pm, &t, pat_r, self.focused == Some(Field::Pattern), self.hover == Some(Hit::Text(Field::Pattern)), s);
-        self.push_hit_clipped(cr, pat_r, Hit::Text(Field::Pattern));
+        self.add(cr, pat_r, Hit::Text(Field::Pattern), "File name pattern", PATTERN_HELP);
         cy += 38.0 * s;
-        text::draw(pm, "%y %mo %d %h %mi %s %ms  date/time · %width %height · %title · %rnd", ix, cy, 11.0 * s, false, t.subtext, None);
+        text::draw(pm, PATTERN_HELP, ix, cy, 11.0 * s, false, t.subtext, None);
         *y += c2_h + 14.0 * s;
 
         // Card 3: Format & History
@@ -637,22 +796,22 @@ impl SettingsWin {
         cy += 20.0 * s;
         let fmt_r = Rect::new(ix as i32, cy as i32, iw as i32, (32.0 * s) as i32);
         let hov_f = match self.hover { Some(Hit::Seg(SEG_FORMAT, i)) => Some(i), _ => None };
-        widgets::draw_segmented(pm, &t, fmt_r, &["PNG", "JPEG", "WebP (lossless)"], self.format, hov_f, s);
+        widgets::draw_segmented(pm, &t, fmt_r, &FORMAT_OPTS, self.format, hov_f, s);
         for (i, sr) in widgets::segmented_rects(fmt_r, 3, s).into_iter().enumerate() {
-            self.push_hit_clipped(cr, sr, Hit::Seg(SEG_FORMAT, i));
+            self.add(cr, sr, Hit::Seg(SEG_FORMAT, i), FORMAT_OPTS[i], "Image format");
         }
         cy += 46.0 * s;
         let half = (iw - 16.0 * s) / 2.0;
         text::draw(pm, "JPEG quality (1–100)", ix, cy, 12.5 * s, false, t.text, None);
         let jq_r = Rect::new((ix + half - 76.0 * s) as i32, (cy - 5.0 * s) as i32, (76.0 * s) as i32, (30.0 * s) as i32);
         self.jpeg_q.draw(pm, &t, jq_r, self.focused == Some(Field::JpegQ), self.hover == Some(Hit::Text(Field::JpegQ)), s);
-        self.push_hit_clipped(cr, jq_r, Hit::Text(Field::JpegQ));
+        self.add(cr, jq_r, Hit::Text(Field::JpegQ), "JPEG quality (1 to 100)", "");
 
         let rx = ix + half + 16.0 * s;
         text::draw(pm, "History entries", rx, cy, 12.5 * s, false, t.text, None);
         let hl_r = Rect::new((ix + iw - 86.0 * s) as i32, (cy - 5.0 * s) as i32, (86.0 * s) as i32, (30.0 * s) as i32);
         self.history_limit.draw(pm, &t, hl_r, self.focused == Some(Field::History), self.hover == Some(Hit::Text(Field::History)), s);
-        self.push_hit_clipped(cr, hl_r, Hit::Text(Field::History));
+        self.add(cr, hl_r, Hit::Text(Field::History), "History entries", "");
         *y += c3_h + 14.0 * s;
 
         let mode = if crate::paths::portable() {
@@ -680,7 +839,7 @@ impl SettingsWin {
         text::draw(pm, "Delay before capture (ms)", ix, cy, 13.0 * s, false, t.text, None);
         let dr = Rect::new((ix + iw - 90.0 * s) as i32, (cy - 5.0 * s) as i32, (90.0 * s) as i32, (30.0 * s) as i32);
         self.delay.draw(pm, &t, dr, self.focused == Some(Field::Delay), self.hover == Some(Hit::Text(Field::Delay)), s);
-        self.push_hit_clipped(cr, dr, Hit::Text(Field::Delay));
+        self.add(cr, dr, Hit::Text(Field::Delay), "Delay before capture, in milliseconds", "Applies to fullscreen, monitor, window, last and custom region.");
         text::draw(pm, "Applies to fullscreen, monitor, window, last and custom region.", ix, cy + 22.0 * s, 11.0 * s, false, t.subtext, None);
         *y += c1_h + 14.0 * s;
 
@@ -700,7 +859,7 @@ impl SettingsWin {
         text::draw(pm, "Backdrop dim opacity (0–230)", ix, cy, 13.0 * s, false, t.text, None);
         let dim_r = Rect::new((ix + iw - 90.0 * s) as i32, (cy - 5.0 * s) as i32, (90.0 * s) as i32, (30.0 * s) as i32);
         self.dim.draw(pm, &t, dim_r, self.focused == Some(Field::Dim), self.hover == Some(Hit::Text(Field::Dim)), s);
-        self.push_hit_clipped(cr, dim_r, Hit::Text(Field::Dim));
+        self.add(cr, dim_r, Hit::Text(Field::Dim), "Backdrop dim opacity (0 to 230)", "");
         *y += c2_h + 14.0 * s;
 
         // Card 3: Scrolling & Custom region
@@ -727,7 +886,7 @@ impl SettingsWin {
         text::draw(pm, &custom, ix, cy + 4.0 * s, 12.5 * s, false, t.subtext, None);
         let clr_r = Rect::new((ix + iw - 78.0 * s) as i32, (cy - 2.0 * s) as i32, (78.0 * s) as i32, (28.0 * s) as i32);
         widgets::draw_button(pm, &t, clr_r, "Clear", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_CLEAR_CUSTOM)), self.custom_region.is_none(), s);
-        self.push_hit_clipped(cr, clr_r, Hit::Btn(BTN_CLEAR_CUSTOM));
+        self.add(cr, clr_r, Hit::Btn(BTN_CLEAR_CUSTOM), "Clear custom region", &custom);
         *y += c3_h + 14.0 * s;
     }
 
@@ -810,7 +969,7 @@ impl SettingsWin {
                 self.hover == Some(Hit::Hotkey(i)),
                 s,
             );
-            self.push_hit_clipped(cr, fr, Hit::Hotkey(i));
+            self.add(cr, fr, Hit::Hotkey(i), &format!("{label} hotkey"), "Press a key combination to set it. Backspace or Delete clears it.");
             cy += row_h;
         }
         *y += card_h + 14.0 * s;
@@ -843,7 +1002,7 @@ impl SettingsWin {
                 Field::GifMax => self.gif_max.draw(pm, &t, fr, focused, hovered, s),
                 _ => {}
             }
-            self.push_hit_clipped(cr, fr, Hit::Text(field));
+            self.add(cr, fr, Hit::Text(field), lbl, "");
             cy += 40.0 * s;
         }
         widgets::draw_divider(pm, &t, ix, ix + iw, cy);
@@ -911,14 +1070,59 @@ impl SettingsWin {
         let chk_r = Rect::new(rr.right() + (8.0 * s) as i32, cy as i32, chk_w, (32.0 * s) as i32);
         self.repo.draw(pm, &t, rr, self.focused == Some(Field::Repo), self.hover == Some(Hit::Text(Field::Repo)), s);
         widgets::draw_button(pm, &t, chk_r, "Check now", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_CHECK_NOW)), false, s);
-        self.push_hit_clipped(cr, rr, Hit::Text(Field::Repo));
-        self.push_hit_clipped(cr, chk_r, Hit::Btn(BTN_CHECK_NOW));
+        self.add(cr, rr, Hit::Text(Field::Repo), "Release repository (owner/repo)", "");
+        self.add(cr, chk_r, Hit::Btn(BTN_CHECK_NOW), "Check for updates now", "");
         *y += c2_h + 14.0 * s;
 
         let open_r = Rect::new(x0 as i32, *y as i32, (190.0 * s) as i32, (34.0 * s) as i32);
         widgets::draw_button(pm, &t, open_r, "Open settings folder", Some(Icon::Folder), BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_OPEN_CONFIG)), false, s);
-        self.push_hit_clipped(cr, open_r, Hit::Btn(BTN_OPEN_CONFIG));
+        self.add(cr, open_r, Hit::Btn(BTN_OPEN_CONFIG), "Open settings folder", "");
         *y += 46.0 * s;
+    }
+
+    /// What clicking `hit` does (also Space / Enter on the focused control and a screen
+    /// reader's Invoke / Toggle / Select).
+    fn activate(&mut self, w: &mut Win, hit: Hit) {
+        match hit {
+            Hit::Nav(i) => {
+                if self.tab != i {
+                    self.tab = i;
+                    self.scroll = 0.0;
+                }
+            }
+            Hit::Text(_) | Hit::Hotkey(_) => {}
+            Hit::Seg(SEG_FORMAT, i) => self.format = i.min(SEG_COUNT - 1),
+            Hit::Seg(SEG_THEME, i) => self.theme_pref = i.min(SEG_COUNT - 1),
+            Hit::Seg(..) => {}
+            Hit::Toggle(id) => {
+                if let Some(b) = self.toggle_field(id) {
+                    *b = !*b;
+                }
+            }
+            Hit::Btn(id) => match id {
+                BTN_SAVE => self.save(w),
+                BTN_CANCEL => w.close(),
+                BTN_BROWSE => self.browse(w.hwnd),
+                BTN_CLEAR_CUSTOM => {
+                    if self.custom_region.is_some() {
+                        self.custom_region = None;
+                        super::dialogs::info(Some(w.hwnd), "Snap It", "The custom region will be cleared when you save.");
+                    }
+                }
+                BTN_CHECK_NOW => {
+                    let repo = self.repo.value.trim().to_string();
+                    app::update_settings(|s| s.integration.update_repo = repo);
+                    crate::integration::check_for_updates(true);
+                }
+                BTN_WELCOME => {
+                    app::post(Command::OpenWelcome);
+                    w.close();
+                }
+                BTN_OPEN_CONFIG => crate::shell::open_folder(&crate::paths::config_dir()),
+                _ => {}
+            },
+        }
+        w.invalidate();
     }
 
     fn on_click(&mut self, w: &mut Win, x: i32, y: i32) {
@@ -927,80 +1131,78 @@ impl SettingsWin {
             return;
         }
         let hit = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
-        match hit {
-            Some(Hit::Nav(i)) => {
-                self.tab = i;
-                self.scroll = 0.0;
-                self.set_focus(None);
-            }
-            Some(Hit::Text(f)) => self.set_focus(Some(f)),
-            Some(Hit::Hotkey(i)) => self.set_focus(Some(Field::Hotkey(i))),
-            Some(Hit::Seg(SEG_FORMAT, i)) => {
-                self.format = i;
-                self.set_focus(None);
-            }
-            Some(Hit::Seg(SEG_THEME, i)) => {
-                self.theme_pref = i;
-                self.set_focus(None);
-            }
-            Some(Hit::Toggle(id)) => {
-                self.set_focus(None);
-                match id {
-                    TOG_CURSOR => self.capture_cursor = !self.capture_cursor,
-                    TOG_QUICK => self.quick_annotate = !self.quick_annotate,
-                    TOG_DETECT_WIN => self.detect_windows = !self.detect_windows,
-                    TOG_DETECT_CTL => self.detect_controls = !self.detect_controls,
-                    TOG_UIA => self.uia_controls = !self.uia_controls,
-                    TOG_MAGNIFIER => self.magnifier = !self.magnifier,
-                    TOG_CROSSHAIR => self.crosshair = !self.crosshair,
-                    TOG_SCROLLING => self.scrolling_capture = !self.scrolling_capture,
-                    TOG_T_COPY => self.t_copy = !self.t_copy,
-                    TOG_T_SAVE => self.t_save = !self.t_save,
-                    TOG_T_EDITOR => self.t_editor = !self.t_editor,
-                    TOG_T_PIN => self.t_pin = !self.t_pin,
-                    TOG_T_NOTIFY => self.t_notify = !self.t_notify,
-                    TOG_T_SOUND => self.t_sound = !self.t_sound,
-                    TOG_REC_CURSOR => self.rec_cursor = !self.rec_cursor,
-                    TOG_STARTUP => self.start_with_windows = !self.start_with_windows,
-                    TOG_CTXMENU => self.context_menu = !self.context_menu,
-                    TOG_UPDATE => self.update_check = !self.update_check,
-                    _ => {}
-                }
-            }
-            Some(Hit::Btn(id)) => {
-                self.set_focus(None);
-                match id {
-                    BTN_SAVE => self.save(w),
-                    BTN_CANCEL => w.close(),
-                    BTN_BROWSE => self.browse(w.hwnd),
-                    BTN_CLEAR_CUSTOM => {
-                        if self.custom_region.is_some() {
-                            self.custom_region = None;
-                            super::dialogs::info(Some(w.hwnd), "Snap It", "The custom region will be cleared when you save.");
-                        }
-                    }
-                    BTN_CHECK_NOW => {
-                        let repo = self.repo.value.trim().to_string();
-                        app::update_settings(|s| s.integration.update_repo = repo);
-                        crate::integration::check_for_updates(true);
-                    }
-                    BTN_WELCOME => {
-                        app::post(Command::OpenWelcome);
-                        w.close();
-                    }
-                    BTN_OPEN_CONFIG => crate::shell::open_folder(&crate::paths::config_dir()),
-                    _ => {}
-                }
-            }
-            _ => self.set_focus(None),
+        self.focus(hit.map(key), false);
+        if let Some(h) = hit {
+            self.activate(w, h);
         }
         w.invalidate();
+    }
+
+    /// Keys for the focused control when no text box is taking them. Returns `true` if used.
+    fn control_key(&mut self, w: &mut Win, vk: u32) -> bool {
+        let hit = self.ax.focus.and_then(decode);
+        let step = |i: usize, n: usize, back: bool| if back { (i + n - 1) % n } else { (i + 1) % n };
+        match (vk, hit) {
+            // Back into a text / hotkey box left with Esc.
+            (VK_SPACE | VK_RETURN, Some(h @ (Hit::Text(_) | Hit::Hotkey(_)))) if self.focused.is_none() => {
+                self.focus(Some(key(h)), true);
+            }
+            (VK_SPACE, Some(h)) => {
+                self.ax.ring = true;
+                self.activate(w, h);
+            }
+            (VK_RETURN, Some(h @ Hit::Btn(_))) => self.activate(w, h),
+            (VK_RETURN, _) => self.save(w),
+            (VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN, Some(Hit::Seg(g, i))) => {
+                let h = Hit::Seg(g, step(i, SEG_COUNT, matches!(vk, VK_LEFT | VK_UP)));
+                self.focus(Some(key(h)), true);
+                self.activate(w, h);
+            }
+            (VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN, Some(Hit::Nav(i))) => {
+                let h = Hit::Nav(step(i, TABS.len(), matches!(vk, VK_LEFT | VK_UP)));
+                self.focus(Some(key(h)), true);
+                self.activate(w, h);
+            }
+            (VK_PRIOR | VK_NEXT | VK_HOME | VK_END, _) => {
+                let page = self.content_rect().h as f32 * 0.85;
+                self.scroll = match vk {
+                    VK_PRIOR => self.scroll - page,
+                    VK_NEXT => self.scroll + page,
+                    VK_HOME => 0.0,
+                    _ => self.max_scroll(),
+                }
+                .clamp(0.0, self.max_scroll());
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
 impl Handler for SettingsWin {
     fn snapshot(&self) -> Option<Pixmap> {
         self.bb.as_ref()?.to_pixmap()
+    }
+
+    fn a11y_action(&mut self, w: &mut Win, k: u32, action: AxAction) {
+        if Chrome::a11y_invoke(w.hwnd, k) {
+            return;
+        }
+        let Some(hit) = decode(k) else { return };
+        self.focus(Some(k), true);
+        match action {
+            AxAction::Focus => {}
+            AxAction::SetValue(v) => {
+                if let Some(ti) = match hit {
+                    Hit::Text(f) => self.text_input_mut(f),
+                    _ => None,
+                } {
+                    ti.set(v);
+                }
+            }
+            AxAction::Invoke | AxAction::Toggle | AxAction::Select => self.activate(w, hit),
+        }
+        w.invalidate();
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -1060,6 +1262,10 @@ impl Handler for SettingsWin {
             WM_MOUSEMOVE => {
                 let (x, y) = super::lparam_xy(lp);
                 let mut dirty = self.chrome.set_hover(w.hwnd, self.client.0, self.scale, x, y);
+                // Drag-selecting in a text box.
+                if let Some(ti) = self.focused.and_then(|f| self.text_input_mut(f)) {
+                    dirty |= ti.mouse_move(x, y).handled();
+                }
                 let h = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
                 if h != self.hover {
                     self.hover = h;
@@ -1070,15 +1276,54 @@ impl Handler for SettingsWin {
                 }
                 Some(LRESULT(0))
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let (x, y) = super::lparam_xy(lp);
-                self.chrome.press(self.client.0, self.scale, x, y);
+                if self.chrome.press(self.client.0, self.scale, x, y) {
+                    return Some(LRESULT(0));
+                }
+                // Text boxes act on press (caret, drag-select, double-click word); everything
+                // else on release.
+                if let Some((_, Hit::Text(f))) = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).copied() {
+                    self.focus(Some(key(Hit::Text(f))), false);
+                    let shift = super::shift();
+                    if let Some(ti) = self.text_input_mut(f) {
+                        ti.mouse_down(x, y, shift, msg == WM_LBUTTONDBLCLK);
+                    }
+                    unsafe {
+                        SetCapture(w.hwnd);
+                    }
+                    w.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
                 let (x, y) = super::lparam_xy(lp);
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if let Some(ti) = self.focused.and_then(|f| self.text_input_mut(f)) {
+                    if ti.dragging() {
+                        ti.mouse_up();
+                        w.invalidate();
+                        return Some(LRESULT(0));
+                    }
+                }
                 self.on_click(w, x, y);
                 Some(LRESULT(0))
+            }
+            WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+                if let Some(p) = self.focused.and_then(|f| self.text_input_mut(f)).and_then(|ti| ti.caret_point()) {
+                    place_ime(w.hwnd, p);
+                }
+                None
+            }
+            WM_SETFOCUS => {
+                // Coming back to a hotkey box that lost the keyboard: record again.
+                if let (None, Some(Hit::Hotkey(i))) = (self.focused, self.ax.focus.and_then(decode)) {
+                    self.set_focus(Some(Field::Hotkey(i)));
+                    w.invalidate();
+                }
+                None
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) as u16 as i16) as f32;
@@ -1091,8 +1336,18 @@ impl Handler for SettingsWin {
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = wp.0 as u32;
+                let (ctrl, shift, alt) = (super::ctrl(), super::shift(), msg == WM_SYSKEYDOWN);
+                let win = super::key_down(0x5B) || super::key_down(0x5C);
+                // Tab / Shift+Tab always move focus; a hotkey box records Tab only with
+                // Ctrl, Alt or Win held.
+                if vk == VK_TAB && !ctrl && !alt && !win {
+                    let next = self.ax.next(shift);
+                    self.focus(next, true);
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
                 if let Some(Field::Hotkey(i)) = self.focused {
-                    if vk == 0x1B {
+                    if vk == VK_ESCAPE {
                         self.set_focus(None);
                         w.invalidate();
                         return Some(LRESULT(0));
@@ -1103,11 +1358,25 @@ impl Handler for SettingsWin {
                     }
                     return Some(LRESULT(0));
                 }
-                if msg == WM_SYSKEYDOWN {
+                if alt {
                     // Let DefWindowProc handle Alt+F4, Alt+Space, F10, etc.
                     return None;
                 }
-                if vk == 0x1B {
+                if vk == VK_TAB && ctrl {
+                    // Ctrl+Tab / Ctrl+Shift+Tab: next / previous page.
+                    let n = TABS.len();
+                    let h = Hit::Nav(if shift { (self.tab + n - 1) % n } else { (self.tab + 1) % n });
+                    self.focus(Some(key(h)), true);
+                    self.activate(w, h);
+                    return Some(LRESULT(0));
+                }
+                if let Some(ti) = self.focused.and_then(|f| self.text_input_mut(f)) {
+                    if ti.on_key(vk, ctrl, shift).handled() {
+                        w.invalidate();
+                        return Some(LRESULT(0));
+                    }
+                }
+                if vk == VK_ESCAPE {
                     if self.focused.is_some() {
                         self.set_focus(None);
                         w.invalidate();
@@ -1116,12 +1385,8 @@ impl Handler for SettingsWin {
                     }
                     return Some(LRESULT(0));
                 }
-                if let Some(f) = self.focused {
-                    if let Some(ti) = self.text_input_mut(f) {
-                        if ti.on_key(vk, super::ctrl()) {
-                            w.invalidate();
-                        }
-                    }
+                if self.control_key(w, vk) {
+                    w.invalidate();
                 }
                 Some(LRESULT(0))
             }
@@ -1137,15 +1402,9 @@ impl Handler for SettingsWin {
                 None
             }
             WM_CHAR => {
-                if let Some(f) = self.focused {
-                    if !matches!(f, Field::Hotkey(_)) {
-                        if let Some(ch) = char::from_u32(wp.0 as u32) {
-                            if let Some(ti) = self.text_input_mut(f) {
-                                if ti.on_char(ch) {
-                                    w.invalidate();
-                                }
-                            }
-                        }
+                if let Some(ti) = self.focused.and_then(|f| self.text_input_mut(f)) {
+                    if ti.on_char(wp.0 as u16).handled() {
+                        w.invalidate();
                     }
                 }
                 Some(LRESULT(0))

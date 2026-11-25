@@ -6,6 +6,7 @@
 //! back to `DefWindowProc` instead of aliasing `&mut`. Handlers ask to close
 //! via [`Win::close`]; the window is destroyed only after the handler returns.
 
+pub mod a11y;
 pub mod backbuffer;
 pub mod chrome;
 pub mod dialogs;
@@ -16,6 +17,7 @@ pub mod overlay;
 pub mod pin;
 pub mod qr_dialog;
 pub mod settings_window;
+pub mod text_input;
 pub mod theme;
 pub mod tool_options;
 pub mod toolbar;
@@ -33,8 +35,10 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, GetWindowTextW, LoadCursorW,
     RegisterClassExW, SetWindowLongPtrW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, IDC_ARROW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
+    GWLP_USERDATA, IDC_ARROW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_GETOBJECT, WM_NCCREATE, WM_NCDESTROY,
+    WNDCLASSEXW,
 };
+use windows::Win32::UI::Accessibility::UiaRootObjectId;
 
 pub use backbuffer::Backbuffer;
 
@@ -62,6 +66,9 @@ pub trait Handler {
     fn snapshot(&self) -> Option<snapit_gfx::tiny_skia::Pixmap> {
         None
     }
+    /// A screen reader (UI Automation) asked to operate the node `key` this window published
+    /// with [`a11y::Access::publish`]. Delivered as a posted message, never re-entrantly.
+    fn a11y_action(&mut self, _w: &mut Win, _key: u32, _action: a11y::Action) {}
 }
 
 /// Self-test: `lparam` is a `Box<PathBuf>`; the window saves its last frame there.
@@ -201,17 +208,30 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     if msg == WM_SNAPIT_THEME {
         theme::apply_titlebar(hwnd, &theme::current());
     }
+    if msg == WM_GETOBJECT && lp.0 as i32 == UiaRootObjectId && a11y::registered(hwnd) {
+        return a11y::root_response(hwnd, wp, lp);
+    }
+    // A screen reader's request: always freed here, dropped if the handler is busy (a modal
+    // dialog it opened is running).
+    let a11y_action = (msg == a11y::WM_SNAPIT_A11Y).then(|| *Box::from_raw(lp.0 as *mut a11y::Action));
     let mut want_close = false;
     let result = match (*ptr).try_borrow_mut() {
         Ok(mut h) => {
             let mut w = Win { hwnd, close: false };
-            let r = h.message(&mut w, msg, wp, lp);
+            let r = match a11y_action {
+                Some(a) => {
+                    h.a11y_action(&mut w, wp.0 as u32, a);
+                    Some(LRESULT(0))
+                }
+                None => h.message(&mut w, msg, wp, lp),
+            };
             want_close = w.close;
             r
         }
         Err(_) => None,
     };
     if msg == WM_NCDESTROY {
+        a11y::forget(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         if (*ptr).try_borrow_mut().is_ok() {
             drop(Box::from_raw(ptr));
