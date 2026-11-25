@@ -161,6 +161,19 @@ impl TextCaret {
                 self.insert(it, "\n");
             }
             0x0A => return Typed::Commit,
+            // Ctrl+Backspace (sent as DEL): delete the word before the caret, as in Windows.
+            0x7F => {
+                if !self.deletes_something(it, false) {
+                    return Typed::Ignored;
+                }
+                u.begin(it, *self, Kind::Other, None);
+                if self.caret == self.anchor {
+                    self.anchor = word_start_before(it.text().unwrap_or_default(), self.caret);
+                }
+                self.delete(it, false);
+            }
+            // Other control characters (C1 range) never belong in the text.
+            0x80..=0x9F => return Typed::Ignored,
             c if c >= 0x20 => {
                 let Some(ch) = char::from_u32(c) else { return Typed::Ignored };
                 let kind = if self.caret == self.anchor { Kind::Type } else { Kind::Other };
@@ -229,6 +242,36 @@ impl TextCaret {
         };
         u.end(*self);
         changed
+    }
+}
+
+/// Where Ctrl+Backspace at byte index `i` deletes back to: over any spaces, then over one
+/// word (or run of punctuation). Right after a line break it removes just the break.
+fn word_start_before(t: &str, i: usize) -> usize {
+    let i = i.min(t.len());
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = i;
+    let mut chars = t[..i].char_indices().rev().peekable();
+    while let Some(&(b, c)) = chars.peek() {
+        if c == '\n' || !c.is_whitespace() {
+            break;
+        }
+        start = b;
+        chars.next();
+    }
+    match chars.peek() {
+        Some(&(b, '\n')) if start == i => b,
+        Some(&(_, c0)) if c0 != '\n' => {
+            let k = word(c0);
+            for (b, c) in chars {
+                if c.is_whitespace() || word(c) != k {
+                    break;
+                }
+                start = b;
+            }
+            start
+        }
+        _ => start,
     }
 }
 
@@ -303,6 +346,30 @@ mod tests {
         u.undo(&mut it, &mut c);
         type_str(&mut c, &mut it, &mut u, "!");
         assert!(!u.redo(&mut it, &mut c));
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_the_word_before_the_caret() {
+        let mut it = item("Ship it, now  \nnext");
+        let mut u = TextUndo::default();
+        let len = it.text().unwrap().len();
+        let mut c = TextCaret::at(len);
+        let steps = ["Ship it, now  \n", "Ship it, now  ", "Ship it, ", "Ship it", "Ship ", ""];
+        for want in steps {
+            assert_eq!(c.char_input(&mut it, &mut u, 0x7F), Typed::Edited);
+            assert_eq!((it.text().unwrap(), c), (want, TextCaret::at(want.len())));
+        }
+        assert_eq!(c.char_input(&mut it, &mut u, 0x7F), Typed::Ignored);
+        assert!(u.undo(&mut it, &mut c));
+        assert_eq!(it.text().unwrap(), "Ship ");
+        // Never inserts the DEL character, nor C1 control characters.
+        assert_eq!(c.char_input(&mut it, &mut u, 0x85), Typed::Ignored);
+        assert_eq!(it.text().unwrap(), "Ship ");
+        // With a selection it deletes just the selection.
+        let mut it = item("Hello world");
+        let mut c = TextCaret { caret: 2, anchor: 4 };
+        c.char_input(&mut it, &mut u, 0x7F);
+        assert_eq!(it.text().unwrap(), "Heo world");
     }
 
     #[test]

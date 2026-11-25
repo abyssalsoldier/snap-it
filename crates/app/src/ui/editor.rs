@@ -488,19 +488,32 @@ impl Editor {
     }
 
     fn commit_text(&mut self) {
-        let Some(i) = self.editing.take() else { return };
+        self.finish_text();
+    }
+
+    /// Finishes the text being typed. An empty text item is dropped; any change from
+    /// before editing (including dropping a re-opened item) becomes one undo step.
+    /// True when a new, still-empty item was dropped without adding a step, so that
+    /// dropping it was the whole of an undo.
+    fn finish_text(&mut self) -> bool {
+        let Some(i) = self.editing.take() else { return false };
         self.text_undo = TextUndo::default();
         let before = self.edit_before.take();
+        let mut dropped = false;
         if i < self.items.len() {
             let empty = self.items[i].text_mut().is_some_and(|t| t.trim().is_empty());
             if empty && matches!(self.items[i].shape, Shape::Text { .. }) {
                 self.items.remove(i);
-            } else if let Some(b) = before.filter(|b| *b != self.items) {
-                self.push_items(b);
-                self.dirty = true;
+                dropped = true;
             }
         }
         self.comp_dirty = true;
+        if let Some(b) = before.filter(|b| *b != self.items) {
+            self.push_items(b);
+            self.dirty = true;
+            return false;
+        }
+        dropped
     }
 
     /// Reopens an existing text or balloon item for typing (double-click with the pointer),
@@ -540,7 +553,10 @@ impl Editor {
         if self.text_step(false) {
             return;
         }
-        self.commit_text();
+        // Closing a new, empty text box is this undo; don't also undo the step before it.
+        if self.finish_text() {
+            return;
+        }
         if let Some((b, i)) = self.history.undo(self.undo_state()) {
             self.base = b;
             self.items = i;

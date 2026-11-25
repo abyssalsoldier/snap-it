@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Text boxes you can edit like a Windows text box.** Double-click a text or balloon annotation
+  with the pointer to edit it, with the caret where you clicked (editor and quick edit). Click to
+  move the caret, drag or Shift+click to select, double-click a word, and use the arrow keys,
+  Home/End, Delete, Ctrl+Backspace (delete a word) and Ctrl+A/C/X/V. Enter adds a new line;
+  Ctrl+Enter or Esc finishes the text.
+- **Undo inside a text box.** While typing, Ctrl+Z / Ctrl+Y step through the text word by word,
+  then fall back to the window's undo.
+- **Live theme preview.** Choosing Follow Windows, Light or Dark in Settings re-themes every Snap It
+  window straight away; Save keeps it, closing Settings without saving puts it back.
+
+### Changed
+- Double-clicking empty space in the capture no longer finishes it.
 
 ## [0.6.1] - 2026-11-25
 ### Added
