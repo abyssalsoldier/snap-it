@@ -91,7 +91,12 @@ Linked DLLs are all OS components: user32, gdi32, d3d11, mfplat, mfreadwrite, wi
 **Already mitigated:**
 - Off by default; it must be enabled in Settings > Capture, and the UI says why.
 - It only sends `MOUSEEVENTF_WHEEL`, never keystrokes.
-- It runs only after the user selects an area, and stops when the user moves the mouse.
+- It runs only after the user selects an area, and stops when the user presses Esc (registered with
+  `RegisterHotKey` only while the capture runs; no keyboard polling or hooks) or right-clicks
+  (Raw Input for the mouse only, registered only while it runs; nothing is blocked or changed).
+- Failsafes: it stops if another window comes to the front, and after 3 minutes regardless.
+- If the wheel moves nothing, it can instead ask the app to scroll through UI Automation's Scroll
+  pattern (the accessibility interface), under the same opt-in.
 
 **Optional further step:** offer a "send scroll messages" mode that posts `WM_MOUSEWHEEL` to the target window instead of using `SendInput`. Some applications ignore posted wheel messages, so keep `SendInput` as the fallback.
 

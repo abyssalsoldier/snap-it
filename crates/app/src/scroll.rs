@@ -1,22 +1,44 @@
 //! Scrolling capture (opt-in; off by default).
 //!
-//! The cursor is parked over the selected area and mouse-wheel notches are sent
-//! with `SendInput`. After each scroll the area is captured and stitched onto the
-//! result. It stops when the content stops moving, a size limit is reached, or
-//! the user moves the mouse. That needs no keyboard polling and no hooks.
+//! The cursor is parked over the selected area (and put back there before every
+//! scroll, so a nudged mouse doesn't matter) and mouse-wheel notches are sent with
+//! `SendInput`. After each scroll the area is captured and stitched onto the
+//! result. It stops when the content stops moving, a size limit is reached, or the
+//! user presses Esc: Esc is registered with `RegisterHotKey` on the capture thread
+//! only while it runs (no keyboard polling, no hooks). If another app holds Esc, a
+//! large deliberate mouse move stops it instead.
+//!
+//! If nothing moves, it tries scrolling up (chats open at the newest message), then
+//! UI Automation's Scroll pattern on the element under the pointer (apps that ignore
+//! injected wheel input), then other spots in the selection.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use snapit_gfx::tiny_skia::{IntSize, Pixmap};
 use snapit_gfx::Rect;
+use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationScrollPattern, ScrollAmount_NoAmount,
+    ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement, UIA_ScrollPatternId, UIA_ScrollPatternNoScroll,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_MOUSE, MOD_NOREPEAT, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    VK_ESCAPE,
+};
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK,
+    RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, PostMessageW, SetCursorPos, WindowFromPoint, GA_ROOT, WM_APP,
+    GetAncestor, GetCursorPos, GetForegroundWindow, PeekMessageW, PostMessageW, SetCursorPos, WindowFromPoint, GA_ROOT,
+    MSG, PM_REMOVE, RI_MOUSE_RIGHT_BUTTON_DOWN, WM_APP, WM_HOTKEY,
 };
 
 use crate::actions::Action;
-use crate::app::{self, Capture, Command};
+use crate::app::{self, Capture};
 
 pub const WM_SCROLL_DONE: u32 = WM_APP + 6;
 const MAX_STEPS: usize = 80;
@@ -27,8 +49,11 @@ const MAX_HEIGHT: usize = 30_000;
 enum Stop {
     /// The content stopped moving: the end was reached.
     End,
-    /// The mouse moved (the way to stop early).
+    /// The user pressed Esc or right-clicked (or, without Esc, moved the mouse well away).
     User,
+    /// Another window came to the front (Alt+Tab, a pop-up, the app closed): scrolling on
+    /// would scroll whatever is under the pointer now.
+    Interrupted,
     /// A scroll could not be lined up with the previous frame.
     Lost,
     /// The step or height limit was reached.
@@ -43,10 +68,19 @@ pub fn start(r: Rect) {
     if !app::settings().scrolling_capture {
         return;
     }
-    app::post(Command::Notify { title: "Scrolling capture…".into(), body: "Move the mouse to stop early.".into() });
+    // No "starting" notification: a toast slides in over the bottom-right of the screen,
+    // inside many selections, and would be stitched into the capture. If it ends early, the
+    // dialog afterwards explains why.
     let main = app::main_hwnd().0 as isize;
+    STOP_REQUESTED.store(false, Ordering::Relaxed);
+    watch_right_click(app::main_hwnd(), true);
     std::thread::spawn(move || {
+        // UI Automation scrolling needs COM on this thread (the process keeps the MTA alive).
+        let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
         let result = run(r);
+        if com {
+            unsafe { CoUninitialize() };
+        }
         let raw = Box::into_raw(Box::new(Done { result: result.map(|(p, stop, steps)| (p, r, stop, steps)) }));
         unsafe {
             if PostMessageW(Some(HWND(main as *mut _)), WM_SCROLL_DONE, WPARAM(0), LPARAM(raw as isize)).is_err() {
@@ -56,7 +90,22 @@ pub fn start(r: Rect) {
     });
 }
 
+/// Debug builds: runs a scrolling capture of screen rect `r` straight away (no overlay, no
+/// tasks), logging every attempt and frame comparison, and saves the result to `out`.
+#[cfg(debug_assertions)]
+pub fn diagnose(r: Rect, out: &std::path::Path) -> Result<String, String> {
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let res = run(r);
+    if com {
+        unsafe { CoUninitialize() };
+    }
+    let (image, stop, steps) = res?;
+    snapit_gfx::io::save(&image, out, snapit_gfx::io::Format::Png, 100)?;
+    Ok(format!("stopped: {stop:?} after {steps} scroll(s); {} x {} saved to {}", image.width(), image.height(), out.display()))
+}
+
 pub fn on_done(d: Done) {
+    watch_right_click(app::main_hwnd(), false);
     // These go in a dialog, not a tray balloon: Windows often hides balloons, and without
     // them a capture that ended early looks like the feature did nothing.
     let explain = |body: &str| crate::ui::dialogs::info(None, "Snap It: scrolling capture", body);
@@ -75,19 +124,99 @@ pub fn on_done(d: Done) {
                     "Scrolling capture stopped after {steps} scroll(s): the content changed in a way that could not be \
                      lined up with the previous part (an animation, a video, or a page that jumped).\n\nWhat was captured up to there was kept."
                 )),
-                Stop::User if steps == 0 => explain(
-                    "Scrolling capture stopped because the mouse moved. Keep the mouse still while it scrolls; move it to stop early.\n\n\
-                     Over Remote Desktop, the remote cursor can follow your local mouse, so keep that still too.",
-                ),
+                Stop::Interrupted => explain(&format!(
+                    "Scrolling capture stopped after {steps} scroll(s) because another window came to the front.\n\n\
+                     What was captured up to there was kept."
+                )),
                 Stop::End if steps == 0 => explain(
-                    "The selected area did not move when scrolled (Snap It tried several spots in it), so only one screen \
-                     was captured.\n\nSelect an area inside the part that scrolls, and make sure that window accepts \
-                     mouse-wheel scrolling.",
+                    "The selected area did not move when scrolled down or up (Snap It tried several spots in it), so only \
+                     one screen was captured.\n\nSelect an area inside the part that scrolls, and make sure that window \
+                     accepts mouse-wheel scrolling.",
                 ),
                 _ => {}
             }
         }
         Err(e) => explain(&format!("Scrolling capture failed: {e}")),
+    }
+}
+
+/// Set when the user asks a running scrolling capture to stop with a right-click.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Watches for a right-click anywhere while a scrolling capture runs, via Raw Input (mouse
+/// only, registered for the main window just for the capture's duration: no hooks, no
+/// polling, nothing blocked or changed). The clicks arrive as `WM_INPUT` on the main window,
+/// which hands them to [`on_raw_input`].
+fn watch_right_click(main: HWND, on: bool) {
+    let dev = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // generic desktop
+        usUsage: 0x02,     // mouse
+        dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+        hwndTarget: if on { main } else { HWND::default() },
+    };
+    if let Err(e) = unsafe { RegisterRawInputDevices(&[dev], std::mem::size_of::<RAWINPUTDEVICE>() as u32) } {
+        crate::log(&format!("scroll: right-click watch {}: {e}", if on { "unavailable" } else { "removal failed" }));
+    }
+}
+
+/// `WM_INPUT` on the main window: a right-click stops a running scrolling capture.
+pub fn on_raw_input(lp: LPARAM) {
+    let mut ri = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let n = unsafe {
+        GetRawInputData(
+            HRAWINPUT(lp.0 as *mut _),
+            RID_INPUT,
+            Some(&mut ri as *mut RAWINPUT as *mut _),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if n == 0 || n == u32::MAX || ri.header.dwType != RIM_TYPEMOUSE.0 {
+        return;
+    }
+    let flags = unsafe { ri.data.mouse.Anonymous.Anonymous.usButtonFlags } as u32;
+    if flags & RI_MOUSE_RIGHT_BUTTON_DOWN != 0 {
+        STOP_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A scrolling capture stops after this long whatever happens (a failsafe).
+const MAX_DURATION: Duration = Duration::from_secs(180);
+
+/// Hotkey id for Esc while a scrolling capture runs (registered on the capture thread).
+const ESC_HOTKEY: i32 = 0x5C01;
+/// Without Esc (another app holds it), moving the mouse this far from its spot stops instead.
+const STOP_DISTANCE: i32 = 200;
+
+/// Esc as a stop key for as long as this lives. `RegisterHotKey` with no window posts
+/// `WM_HOTKEY` to this thread's queue, which [`EscKey::pressed`] checks between scrolls.
+struct EscKey {
+    registered: bool,
+}
+
+impl EscKey {
+    fn register() -> EscKey {
+        let registered = unsafe { RegisterHotKey(None, ESC_HOTKEY, MOD_NOREPEAT, VK_ESCAPE.0 as u32) }.is_ok();
+        if !registered {
+            crate::log("scroll: Esc is taken by another app; a large mouse move stops instead");
+        }
+        EscKey { registered }
+    }
+
+    fn pressed(&self) -> bool {
+        let mut msg = MSG::default();
+        self.registered && unsafe { PeekMessageW(&mut msg, None, WM_HOTKEY, WM_HOTKEY, PM_REMOVE) }.as_bool()
+    }
+}
+
+impl Drop for EscKey {
+    fn drop(&mut self) {
+        if self.registered {
+            unsafe {
+                let _ = UnregisterHotKey(None, ESC_HOTKEY);
+            }
+        }
     }
 }
 
@@ -153,50 +282,188 @@ fn order_points(pts: &[(i32, i32)], roots: &[isize], center: (i32, i32)) -> Vec<
     out
 }
 
+/// How a scrolling capture moves the content.
+enum Scroller {
+    /// Mouse-wheel notches with `SendInput` (most apps).
+    Wheel,
+    /// UI Automation's Scroll pattern, for apps that ignore injected wheel input (some WinUI /
+    /// packaged apps, such as WhatsApp). The same opt-in setting covers both.
+    Uia(UiaScroller),
+}
+
+struct UiaScroller {
+    pattern: IUIAutomationScrollPattern,
+}
+
+/// Milliseconds UI Automation may wait on an app before giving up (a hung app must not stall
+/// the capture).
+const UIA_TIMEOUT_MS: u32 = 1500;
+
+impl UiaScroller {
+    /// The vertically scrollable element under `(x, y)`, or its nearest scrollable ancestor.
+    fn at(x: i32, y: i32) -> Option<UiaScroller> {
+        unsafe {
+            let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            if let Ok(u2) = uia.cast::<IUIAutomation2>() {
+                let _ = u2.SetConnectionTimeout(UIA_TIMEOUT_MS);
+                let _ = u2.SetTransactionTimeout(UIA_TIMEOUT_MS);
+            }
+            let walker = uia.ControlViewWalker().ok()?;
+            let mut el = uia.ElementFromPoint(POINT { x, y }).ok()?;
+            for _ in 0..30 {
+                if let Ok(p) = el.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId) {
+                    if p.CurrentVerticallyScrollable().is_ok_and(|b| b.as_bool()) {
+                        return Some(UiaScroller { pattern: p });
+                    }
+                }
+                el = walker.GetParentElement(&el).ok()?;
+            }
+            None
+        }
+    }
+
+    /// Scrolls about half the visible height down (or up).
+    fn step(&self, up: bool) {
+        unsafe {
+            let p = &self.pattern;
+            let cur = p.CurrentVerticalScrollPercent().unwrap_or(UIA_ScrollPatternNoScroll);
+            let view = p.CurrentVerticalViewSize().unwrap_or(0.0);
+            crate::log(&format!("scroll: UI Automation at {cur:.2}% (view {view:.2}%), scrolling {}", if up { "up" } else { "down" }));
+            if cur >= 0.0 && view > 0.0 && view < 100.0 {
+                // ScrollPercent spans the scrollable range (content minus view); ViewSize is
+                // the view as a share of the content. Half a view, in ScrollPercent units:
+                let d = 50.0 * view / (100.0 - view);
+                let target = (cur + if up { -d } else { d }).clamp(0.0, 100.0);
+                let _ = p.SetScrollPercent(UIA_ScrollPatternNoScroll, target);
+            } else {
+                let amount = if up { ScrollAmount_SmallDecrement } else { ScrollAmount_SmallIncrement };
+                for _ in 0..3 {
+                    let _ = p.Scroll(ScrollAmount_NoAmount, amount);
+                }
+            }
+        }
+    }
+}
+
+/// One way to try scrolling: a spot to park the pointer at, a method and a direction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Attempt {
+    at: (i32, i32),
+    uia: bool,
+    up: bool,
+}
+
+/// The order to try things in until something moves: at each spot the wheel down, then up
+/// (a chat opens at its newest message); at the best spot also UI Automation down and up.
+fn attempts(points: &[(i32, i32)]) -> Vec<Attempt> {
+    let mut out = Vec::new();
+    for (i, &at) in points.iter().enumerate() {
+        out.push(Attempt { at, uia: false, up: false });
+        out.push(Attempt { at, uia: false, up: true });
+        if i == 0 {
+            out.push(Attempt { at, uia: true, up: false });
+            out.push(Attempt { at, uia: true, up: true });
+        }
+    }
+    out
+}
+
+/// Switches to the next attempt from `plan[*next..]` (`None` when all have been tried),
+/// parking the pointer there. An attempt whose spot has nothing UI Automation can scroll
+/// is skipped.
+fn begin(plan: &[Attempt], next: &mut usize, cur: Option<Attempt>) -> Option<(Attempt, Scroller)> {
+    while let Some(&a) = plan.get(*next) {
+        *next += 1;
+        if cur.is_none_or(|c| c.at != a.at) {
+            unsafe {
+                let _ = SetCursorPos(a.at.0, a.at.1);
+            }
+            // Moving the pointer can change hover effects; let them settle before the first frame.
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        if !a.uia {
+            return Some((a, Scroller::Wheel));
+        }
+        if let Some(s) = UiaScroller::at(a.at.0, a.at.1) {
+            return Some((a, Scroller::Uia(s)));
+        }
+        crate::log(&format!("scroll: nothing scrollable through UI Automation at {:?}", a.at));
+    }
+    None
+}
+
 /// Returns the stitched image, why it stopped and how many scrolls were stitched.
 fn run(r: Rect) -> Result<(Pixmap, Stop, usize), String> {
     let original = cursor();
+    let esc = EscKey::register();
+    let started = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(250)); // let the overlay disappear
-    let mut points = scroll_points(r).into_iter().take(MAX_POINTS);
-    let (mut cx, mut cy) = points.next().unwrap_or(r.center());
-    unsafe {
-        let _ = SetCursorPos(cx, cy);
-    }
+    // The window in front once the overlay has gone: if another one comes to the front, stop.
+    let front = unsafe { GetForegroundWindow() };
+    let points: Vec<(i32, i32)> = scroll_points(r).into_iter().take(MAX_POINTS).collect();
+    let plan = attempts(if points.is_empty() { &[(0, 0)] } else { &points });
+    let mut next_attempt = 0;
     // One wheel notch is roughly 50-150 px depending on the app and DPI. Scroll less in small
     // areas so consecutive frames still overlap enough to be lined up.
     let notches = (r.h / 300).clamp(1, 3);
-    let mut st = Stitcher::new(snapit_capture::capture_rect(r, false)?);
+    // Scrolling up: frames are flipped upside down, so the stitcher sees ordinary downward
+    // scrolling; the result is flipped back.
+    let grab = |up: bool| snapit_capture::capture_rect(r, false).map(|f| if up { flip(&f) } else { f });
+
+    let (mut attempt, mut scroller) = begin(&plan, &mut next_attempt, None).ok_or("nothing to scroll")?;
+    crate::log(&format!("scroll: attempt {attempt:?} ({})", if matches!(scroller, Scroller::Uia(_)) { "UI Automation" } else { "wheel" }));
+    let mut st = Stitcher::new(grab(attempt.up)?);
     let mut steps = 0;
     let mut stop = Stop::Limit;
     'outer: for _ in 0..MAX_STEPS {
+        // Esc stops. Mouse movement doesn't (unless Esc is unavailable and the move is large):
+        // the pointer is put back on its spot so the wheel keeps reaching the right place.
         let p = cursor();
-        if (p.x - cx).abs() > 3 || (p.y - cy).abs() > 3 {
+        let far = (p.x - attempt.at.0).abs() > STOP_DISTANCE || (p.y - attempt.at.1).abs() > STOP_DISTANCE;
+        if esc.pressed() || STOP_REQUESTED.load(Ordering::Relaxed) || (!esc.registered && far) {
             stop = Stop::User;
             break;
         }
-        wheel(notches);
+        // Failsafes: never keep scrolling something else, never run forever.
+        if !front.is_invalid() && unsafe { GetForegroundWindow() } != front {
+            stop = Stop::Interrupted;
+            break;
+        }
+        if started.elapsed() > MAX_DURATION {
+            break;
+        }
+        unsafe {
+            let _ = SetCursorPos(attempt.at.0, attempt.at.1);
+        }
+        match &scroller {
+            Scroller::Wheel => wheel(if attempt.up { -notches } else { notches }),
+            Scroller::Uia(u) => u.step(attempt.up),
+        }
         std::thread::sleep(Duration::from_millis(350)); // smooth-scroll animations
         // A frame caught mid-animation or mid-repaint may not line up (or may not have moved
         // yet), so look again once before deciding.
         let mut retried = false;
         loop {
-            let frame = snapit_capture::capture_rect(r, false)?;
-            match st.push(&frame) {
+            let frame = grab(attempt.up)?;
+            // A right-click during the wait also opened the app's context menu: don't keep
+            // a frame that may show it.
+            if STOP_REQUESTED.load(Ordering::Relaxed) || esc.pressed() {
+                stop = Stop::User;
+                break 'outer;
+            }
+            let pushed = st.push(&frame);
+            crate::log(&format!("scroll: step {steps}{}: {pushed:?}", if retried { " (second look)" } else { "" }));
+            match pushed {
                 Push::Added => break,
                 Push::NoMovement if retried && steps == 0 => {
-                    // Nothing has scrolled yet: the pointer is probably not over the part
-                    // that scrolls. Try the next point, starting over from a fresh frame
-                    // (moving the pointer can change hover effects on the page).
-                    let Some((x, y)) = points.next() else {
+                    // Nothing has scrolled yet: try the next spot / method / direction.
+                    let Some((a, s)) = begin(&plan, &mut next_attempt, Some(attempt)) else {
                         stop = Stop::End;
                         break 'outer;
                     };
-                    (cx, cy) = (x, y);
-                    unsafe {
-                        let _ = SetCursorPos(cx, cy);
-                    }
-                    std::thread::sleep(Duration::from_millis(150));
-                    st = Stitcher::new(snapit_capture::capture_rect(r, false)?);
+                    (attempt, scroller) = (a, s);
+                    crate::log(&format!("scroll: attempt {attempt:?} ({})", if matches!(scroller, Scroller::Uia(_)) { "UI Automation" } else { "wheel" }));
+                    st = Stitcher::new(grab(attempt.up)?);
                     continue 'outer;
                 }
                 failed if retried => {
@@ -214,13 +481,21 @@ fn run(r: Rect) -> Result<(Pixmap, Stop, usize), String> {
             break;
         }
     }
-    if stop != Stop::User {
-        unsafe {
-            let _ = SetCursorPos(original.x, original.y);
-        }
+    unsafe {
+        let _ = SetCursorPos(original.x, original.y);
     }
     let image = st.finish().ok_or_else(|| "nothing was captured".to_string())?;
-    Ok((image, stop, steps))
+    Ok((if attempt.up { flip(&image) } else { image }, stop, steps))
+}
+
+/// The image upside down (rows reversed).
+fn flip(p: &Pixmap) -> Pixmap {
+    let row = p.width() as usize * 4;
+    let mut data = Vec::with_capacity(p.data().len());
+    for r in p.data().chunks_exact(row).rev() {
+        data.extend_from_slice(r);
+    }
+    Pixmap::from_vec(data, IntSize::from_wh(p.width(), p.height()).expect("same size")).expect("same size")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +514,8 @@ pub struct Stitcher {
     /// Rows of the result so far (BGRA), ending with the latest static footer.
     rows: Vec<u8>,
     prev: Vec<Cells>,
+    /// The previous frame's pixels, for [`tolerant_shift`].
+    prev_px: Vec<u8>,
     /// Rows just above the footer that came from the bottom edge of the latest frame. That
     /// edge is where floating overlays sit (a browser's link-preview bubble, a chat button),
     /// so the next frame, where those page rows have scrolled up and out from under the
@@ -300,10 +577,122 @@ fn differing(a: &Cells, b: &Cells) -> usize {
     a.iter().zip(b).filter(|(x, y)| x != y).count()
 }
 
+/// Brightness of a BGRA pixel (0..=255).
+fn luma(px: &[u8]) -> i32 {
+    (px[0] as i32 * 29 + px[1] as i32 * 150 + px[2] as i32 * 77) >> 8
+}
+
+/// Width of the horizontal runs [`tolerant_shift`] averages.
+const RUN: usize = 8;
+
+/// Average brightness of `RUN`-pixel horizontal runs in rows `y0..y1` of a BGRA frame `w` px
+/// wide, as (runs, runs per row). Rows stay separate, so shifts are exact to the pixel.
+fn run_luma(px: &[u8], w: usize, y0: usize, y1: usize) -> (Vec<i32>, usize) {
+    let rw = w / RUN;
+    let mut out = Vec::with_capacity(rw * (y1 - y0));
+    for y in y0..y1 {
+        let row = &px[y * w * 4..(y + 1) * w * 4];
+        for rx in 0..rw {
+            let sum: i32 = (0..RUN).map(|dx| luma(&row[(rx * RUN + dx) * 4..(rx * RUN + dx) * 4 + 3])).sum();
+            out.push(sum / RUN as i32);
+        }
+    }
+    (out, rw)
+}
+
+/// Brightness difference (of run averages) treated as "the same". A chat wallpaper's faint
+/// doodles differ from each other by less; text against its bubble by far more.
+const RUN_TOL: i32 = 18;
+
+/// The shift `dy` at which `next` rows `top..top + mid` line up with `prev` rows moved up by
+/// `dy`, comparing brightness with a tolerance instead of exact strips, so content moving
+/// over a fixed, low-contrast background (a chat wallpaper) can still be lined up. `None`
+/// unless one shift is clearly best: blank or repetitive content (where many shifts fit) is
+/// never guessed.
+fn tolerant_shift(prev: &[u8], next: &[u8], w: usize, top: usize, mid: usize, min_overlap: usize) -> Option<usize> {
+    let (a, rw) = run_luma(prev, w, top, top + mid);
+    let (b, _) = run_luma(next, w, top, top + mid);
+    if rw == 0 || mid < 8 {
+        return None;
+    }
+    // Columns that stay put (a chat list or sidebar inside the selection) say nothing about
+    // the shift and would only add mismatches: compare the moving columns only.
+    let cols: Vec<usize> = (0..rw)
+        .filter(|&c| (0..mid).filter(|&y| (a[y * rw + c] - b[y * rw + c]).abs() <= RUN_TOL).count() * 100 < mid * 98)
+        .collect();
+    if cols.is_empty() {
+        return None;
+    }
+    /// How one shift compares: moving parts that line up (`good`) and that don't (`bad`).
+    struct Fit {
+        dy: usize,
+        good: usize,
+        bad: usize,
+    }
+    impl Fit {
+        fn rate(&self) -> f32 {
+            self.bad as f32 / (self.good + self.bad).max(1) as f32
+        }
+    }
+    let mut fits: Vec<Fit> = Vec::new();
+    for dy in 1..mid {
+        let n = mid - dy;
+        if n < min_overlap {
+            break;
+        }
+        // Every 2nd row of `next` is plenty and halves the work. Parts unchanged at the same
+        // place on screen (a notification popping up over the window, a badge in a side list,
+        // the fixed wallpaper between messages) say nothing about the shift: skip them.
+        let mut fit = Fit { dy, good: 0, bad: 0 };
+        for y in (0..n).step_by(2) {
+            let (rn, rp) = (&b[y * rw..(y + 1) * rw], &a[(y + dy) * rw..(y + dy + 1) * rw]);
+            // ...on either side of the comparison: where the overlay sat in the previous frame,
+            // the new frame shows what it was hiding.
+            let (prev_here, next_there) = (&a[y * rw..(y + 1) * rw], &b[(y + dy) * rw..(y + dy + 1) * rw]);
+            for &c in &cols {
+                if (rn[c] - prev_here[c]).abs() <= RUN_TOL || (rp[c] - next_there[c]).abs() <= RUN_TOL {
+                    continue;
+                }
+                if (rn[c] - rp[c]).abs() > RUN_TOL {
+                    fit.bad += 1;
+                } else {
+                    fit.good += 1;
+                }
+            }
+        }
+        fits.push(fit);
+    }
+    // The true shift lines up the most moving content. (A wrong shift can look clean when
+    // hardly anything is left to compare, so the share alone is not enough.) A few percent may
+    // differ even there: hover buttons that follow the parked pointer, an animated image.
+    let plausible = |f: &&Fit| f.rate() <= 0.15;
+    let best = fits.iter().filter(|f| f.rate() <= 0.08).max_by_key(|f| f.good)?;
+    // The best plausible shift elsewhere (not just a row or two off): repetitive content can
+    // line up at two different shifts, and then neither is trusted.
+    let rival = fits.iter().filter(plausible).filter(|f| f.dy.abs_diff(best.dy) > 8).map(|f| f.good).max().unwrap_or(0);
+    // Enough evidence: at least 2% of the compared area moved and lined up.
+    let evidence = best.good * 50 >= (mid / 2).max(1) * cols.len();
+    crate::log(&format!(
+        "scroll: tolerant match: best dy {} ({} parts agree, {:.1}% differ), runner-up {} parts",
+        best.dy,
+        best.good,
+        best.rate() * 100.0,
+        rival
+    ));
+    (evidence && (rival as f32) <= best.good as f32 * 0.6).then_some(best.dy)
+}
+
 impl Stitcher {
     pub fn new(first: Pixmap) -> Stitcher {
         let (w, h) = (first.width() as usize, first.height() as usize);
-        Stitcher { w, h, rows: first.data().to_vec(), prev: cell_hashes(&first), provisional: default_hold(h) }
+        Stitcher {
+            w,
+            h,
+            rows: first.data().to_vec(),
+            prev: cell_hashes(&first),
+            prev_px: first.data().to_vec(),
+            provisional: default_hold(h),
+        }
     }
 
     pub fn height(&self) -> usize {
@@ -353,17 +742,32 @@ impl Stitcher {
                 }
             }
         }
-        if best.0 < MATCH {
-            // No overlap found: the page jumped or is animating. Stop rather than produce a
-            // broken image.
-            return Push::NoMatch;
-        }
-        let dy = best.1;
+        crate::log(&format!("scroll: frame: static top {top}, bottom {bottom}, moving {mid}, {} of {STRIPS} strips move, best exact match dy {} ({:.1}%)", strips.len(), best.1, best.0 * 100.0));
+        let dy = if best.0 >= MATCH {
+            best.1
+        } else {
+            // The exact strips disagree everywhere. That happens when the content moves over a
+            // background that stays put (a chat wallpaper): try a brightness comparison that
+            // tolerates the faint background. If that finds nothing clear either, the page
+            // jumped or is animating: stop rather than produce a broken image.
+            match tolerant_shift(&self.prev_px, next.data(), self.w, top, mid, min_overlap) {
+                Some(dy) => dy,
+                None => {
+                    // If only a small part of the frame changed, nothing scrolled: something in
+                    // view is animating (a GIF, a hover button over a message) while the content
+                    // is at its end. Saying so lets the caller try the other direction.
+                    let changed: usize = (0..h).map(|y| differing(&a[y], &b[y])).sum();
+                    return if changed * 100 < h * STRIPS * 10 { Push::NoMovement } else { Push::NoMatch };
+                }
+            }
+        };
         let row = self.w * 4;
         let start = top + mid - dy;
         // The previous frame's provisional rows are now `retake` rows above the newly
         // revealed ones in this frame, clear of anything floating at the bottom edge.
-        let retake = self.provisional.min(start - top).min(self.height().saturating_sub(bottom));
+        // (At least almost a whole step: the first frame's hold was a guess made before the
+        // step size was known. Any rows this frame still shows can be taken from it.)
+        let retake = self.provisional.max(dy.saturating_sub(8)).min(start - top).min(self.height().saturating_sub(bottom));
         // Drop the static footer and the provisional rows, then add them back from this frame
         // together with the newly revealed rows.
         let keep = self.height() - bottom - retake;
@@ -374,8 +778,13 @@ impl Stitcher {
         // Hold back this frame's bottom edge in turn: at least the default band, more when
         // part of each row there stays put on screen while the page scrolls (an overlay).
         let pinned = (top..top + mid).rev().take_while(|&y| strips.iter().any(|&s| a[y][s] == b[y][s])).count();
-        self.provisional = default_hold(h).max(pinned + 4).min(mid / 2);
+        // Holding back almost a whole step costs nothing (those rows come back from the next
+        // frame) and clears anything floating at the bottom that is shorter than one step,
+        // such as a notification that pops up over the window.
+        self.provisional = default_hold(h).max(pinned + 4).max(dy.saturating_sub(8)).min(mid / 2);
         self.prev = b;
+        self.prev_px.clear();
+        self.prev_px.extend_from_slice(next.data());
         Push::Added
     }
 
@@ -509,11 +918,224 @@ mod tests {
             let out = st.finish().unwrap();
             assert_eq!(out.height() as usize, last + h);
             // Every row is the page itself under the box, except the last frame's own box.
-            for y in 0..last + h - 14 {
+            for (y, want) in p.iter().enumerate().take(last + h - 14) {
                 let px = &out.data()[y * w * 4..y * w * 4 + 4];
-                assert_eq!(px, &p[y], "row {y} (box text changing: {changing})");
+                assert_eq!(px, want, "row {y} (box text changing: {changing})");
             }
         }
+    }
+
+    #[test]
+    fn scrolling_up_stitches_through_flipped_frames() {
+        // A chat that opens at its newest message (offset 600) and is scrolled up.
+        let p = page(1000);
+        let (w, h, hd, ft) = (6, 100, 10, 8);
+        let mut st = Stitcher::new(flip(&view(&p, 600, w, h, hd, ft)));
+        for off in [570, 540, 510] {
+            assert_eq!(st.push(&flip(&view(&p, off, w, h, hd, ft))), Push::Added, "offset {off}");
+        }
+        let out = flip(&st.finish().unwrap());
+        let oh = out.height() as usize;
+        // header + content rows (510+hd)..(600+h-ft) + footer, in page order.
+        assert_eq!(oh, hd + (600 + h - ft) - (510 + hd) + ft);
+        let row = |y: usize| &out.data()[y * w * 4..y * w * 4 + 4];
+        assert_eq!(row(0), &[200, 10, 10, 255], "header stays on top");
+        assert_eq!(row(hd), &p[510 + hd], "oldest content first");
+        assert_eq!(row(oh - ft - 1), &p[600 + h - ft - 1], "newest content last");
+        assert_eq!(row(oh - 1), &[10, 200, 10, 255], "footer stays at the bottom");
+    }
+
+    /// A chat: message bubbles (dark, with bright "text") on alternating sides scroll over a
+    /// fixed wallpaper with a faint pattern that depends only on the screen position.
+    fn bubble(py: usize, x: usize) -> Option<u8> {
+        let side_left = (py / 40).is_multiple_of(2);
+        let inside = py % 40 < 28 && if side_left { (4..36).contains(&x) } else { (28..60).contains(&x) };
+        inside.then(|| if (x * 7 + py * 13) % 11 < 4 { 230 } else { 60 })
+    }
+
+    fn chat_view(offset: usize, w: usize, h: usize) -> Pixmap {
+        chat_with_list(offset, w, h, 0)
+    }
+
+    /// `chat_view` with a fixed, high-contrast list `list` px wide on the left (like the chat
+    /// list beside a WhatsApp conversation) that doesn't scroll with the messages.
+    fn chat_with_list(offset: usize, w: usize, h: usize, list: usize) -> Pixmap {
+        let mut data = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < list {
+                    if (x + y * 3) % 7 < 2 { 240 } else { 40 }
+                } else {
+                    let cx = x - list;
+                    bubble(offset + y, cx).unwrap_or(20 + ((x * 31 + y * 17) % 9) as u8)
+                };
+                data.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        Pixmap::from_vec(data, IntSize::from_wh(w as u32, h as u32).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_fixed_side_list_does_not_spoil_the_wallpaper_match() {
+        let (list, w, h) = (16, 80, 160);
+        let mut st = Stitcher::new(chat_with_list(0, w, h, list));
+        for off in [50, 100, 150] {
+            assert_eq!(st.push(&chat_with_list(off, w, h, list)), Push::Added, "offset {off}");
+        }
+        let out = st.finish().unwrap();
+        for y in 0..150 + h {
+            for x in list..w {
+                if let Some(v) = bubble(y, x - list) {
+                    assert_eq!(out.data()[(y * w + x) * 4], v, "row {y}, column {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn messages_over_a_fixed_wallpaper_line_up() {
+        let (w, h) = (64, 160);
+        let mut st = Stitcher::new(chat_view(0, w, h));
+        for off in [50, 100, 150, 200] {
+            assert_eq!(st.push(&chat_view(off, w, h)), Push::Added, "offset {off}");
+        }
+        let out = st.finish().unwrap();
+        assert_eq!(out.height() as usize, 200 + h);
+        // Every message pixel is where it belongs in the conversation.
+        for y in 0..200 + h {
+            for x in 0..w {
+                if let Some(v) = bubble(y, x) {
+                    let i = (y * w + x) * 4;
+                    assert_eq!(out.data()[i], v, "row {y}, column {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_notification_over_the_chat_is_neither_matched_nor_repeated() {
+        let (w, h) = (64, 160);
+        let toast = |x: usize, y: usize| (40..64).contains(&x) && (h - 36..h - 4).contains(&y);
+        let framed = |off: usize| {
+            let mut p = chat_view(off, w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    if toast(x, y) {
+                        let i = (y * w + x) * 4;
+                        let v = if (x + y) % 5 < 2 { 250 } else { 120 };
+                        p.data_mut()[i..i + 3].copy_from_slice(&[v, 40, 40]);
+                    }
+                }
+            }
+            p
+        };
+        let mut st = Stitcher::new(framed(0));
+        for off in [50, 100, 150] {
+            assert_eq!(st.push(&framed(off)), Push::Added, "offset {off}");
+        }
+        let out = st.finish().unwrap();
+        let oh = out.height() as usize;
+        assert_eq!(oh, 150 + h);
+        // Above the last screen: only the conversation, no notification remnants.
+        for y in 0..oh - h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if let Some(v) = bubble(y, x) {
+                    assert_eq!(out.data()[i], v, "row {y}, column {x}");
+                }
+                assert_ne!(out.data()[i + 1..i + 3], [40, 40], "notification stitched in at row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_animation_at_the_end_counts_as_no_movement() {
+        // The chat is at its end (nothing scrolls) but a small image in view animates: that
+        // must read as "no movement" (so the other direction is tried), not as a failure.
+        let (w, h) = (64, 160);
+        let base = chat_view(400, w, h);
+        let mut animated = base.clone();
+        for y in 60..90 {
+            for x in 6..16 {
+                let i = (y * w + x) * 4;
+                animated.data_mut()[i..i + 3].copy_from_slice(&[(x * 37 + y * 11) as u8, 90, 200]);
+            }
+        }
+        let mut st = Stitcher::new(base);
+        assert_eq!(st.push(&animated), Push::NoMovement);
+    }
+
+    #[test]
+    fn tolerant_matching_refuses_repeating_content() {
+        // Identical message blocks every 40 rows: shifts of 40, 80… fit equally well.
+        let (w, h) = (64, 160);
+        let frame = |off: usize| {
+            let mut data = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let py = (off + y) % 40;
+                    let v = if (4..60).contains(&x) && py < 28 && (x * 7 + py * 13) % 11 < 4 { 230 } else { 30 };
+                    data.extend_from_slice(&[v, v, v, 255]);
+                }
+            }
+            data
+        };
+        // Moved by 50, which lines up at 10, 50 and 90 alike: refuse to guess.
+        assert_eq!(tolerant_shift(&frame(0), &frame(50), w, 0, h, 26), None);
+    }
+
+    #[test]
+    fn the_shorter_last_scroll_at_the_end_of_a_chat_lines_up() {
+        // The last scroll hits the end of the conversation and moves only 30 rows.
+        let (w, h) = (64, 160);
+        let mut st = Stitcher::new(chat_view(0, w, h));
+        for off in [50, 100, 130] {
+            assert_eq!(st.push(&chat_view(off, w, h)), Push::Added, "offset {off}");
+        }
+        assert_eq!(st.push(&chat_view(130, w, h)), Push::NoMovement, "the end");
+        let out = st.finish().unwrap();
+        assert_eq!(out.height() as usize, 130 + h);
+        for y in 0..130 + h {
+            for x in 0..w {
+                if let Some(v) = bubble(y, x) {
+                    assert_eq!(out.data()[(y * w + x) * 4], v, "row {y}, column {x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tolerant_matching_refuses_featureless_content() {
+        // A plain area with only the faint wallpaper: any shift "fits", so none is chosen.
+        let (w, h) = (64, 160);
+        let flat = |_: usize| {
+            let mut data = Vec::with_capacity(w * h * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    let v = 20 + ((x * 31 + y * 17) % 9) as u8;
+                    data.extend_from_slice(&[v, v, v, 255]);
+                }
+            }
+            data
+        };
+        assert_eq!(tolerant_shift(&flat(0), &flat(1), w, 0, h, 26), None);
+    }
+
+    #[test]
+    fn attempts_try_wheel_both_ways_then_ui_automation_then_other_spots() {
+        let plan = attempts(&[(1, 1), (2, 2)]);
+        let a = |at, uia, up| Attempt { at, uia, up };
+        assert_eq!(
+            plan,
+            vec![
+                a((1, 1), false, false),
+                a((1, 1), false, true),
+                a((1, 1), true, false),
+                a((1, 1), true, true),
+                a((2, 2), false, false),
+                a((2, 2), false, true),
+            ]
+        );
     }
 
     #[test]

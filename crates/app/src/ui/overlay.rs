@@ -58,7 +58,7 @@ impl Mode {
             Mode::Region => "Drag to select · Click a window or control · Scroll to widen or narrow · Esc to cancel",
             Mode::Window => "Click a window to capture it · Esc to cancel",
             Mode::SetCustomRegion => "Drag to set your custom region · Esc to cancel",
-            Mode::Scrolling => "Select the scrolling area · Esc to cancel",
+            Mode::Scrolling => "Select the scrolling area · Esc cancels · once it scrolls, Esc or a right-click stops it",
             Mode::Record(_) => "Select the area to record · Esc to cancel",
             Mode::Ocr => "Select text to read · Esc to cancel",
             Mode::ScanQr => "Select the QR code · Esc to cancel",

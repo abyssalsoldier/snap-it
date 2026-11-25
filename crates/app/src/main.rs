@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
     KillTimer, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
     TranslateMessage, CW_USEDEFAULT, HICON, MSG, WINDOW_EX_STYLE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_QUERYENDSESSION,
+    WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_INPUT, WM_LBUTTONDBLCLK, WM_QUERYENDSESSION,
     WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
@@ -214,6 +214,24 @@ fn main() -> Result<()> {
         std::process::exit(selftest::run(&dir));
     }
 
+    // Debug builds: `--scroll-diag x y w h out.png` runs a logged scrolling capture of that
+    // screen rectangle (for diagnosing apps where it fails).
+    #[cfg(debug_assertions)]
+    if args.first().map(String::as_str) == Some("--scroll-diag") {
+        let n: Vec<i32> = args.iter().skip(1).take(4).filter_map(|a| a.parse().ok()).collect();
+        let out = args.get(5).map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("snapit-scroll-diag.png"));
+        if n.len() != 4 {
+            eprintln!("usage: snapit --scroll-diag x y w h [out.png]");
+            std::process::exit(2);
+        }
+        snapit_record::ensure_mta();
+        match scroll::diagnose(snapit_gfx::Rect::new(n[0], n[1], n[2], n[3]), &out) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed: {e}"),
+        }
+        return Ok(());
+    }
+
     // `--quit` (used by the installers): signal a running copy, never start one.
     if args.iter().any(|a| a == "--quit") {
         instance::signal_quit();
@@ -374,6 +392,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 app::post(Command::RunNow(a));
             }
             LRESULT(0)
+        }
+        // Raw mouse input, registered only while a scrolling capture runs (right-click stops it).
+        // DefWindowProc must still see it to release the input data.
+        WM_INPUT => {
+            scroll::on_raw_input(lparam);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         scroll::WM_SCROLL_DONE => {
             let r = unsafe { Box::from_raw(lparam.0 as *mut scroll::Done) };

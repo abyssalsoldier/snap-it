@@ -108,7 +108,9 @@ not change it back.
 | GDI capture loops for video | Windows.Graphics.Capture, which shows the system capture border |
 
 Scrolling capture is the one feature that sends synthetic input (mouse-wheel `SendInput` to the
-area you select). That is why it is off by default and must be enabled in **Settings > Capture**.
+area you select). For apps that ignore that, such as WhatsApp, it asks the app to scroll through
+UI Automation's Scroll pattern instead (the accessibility interface screen readers use). That is
+why it is off by default and must be enabled in **Settings > Capture**.
 
 ## Building
 

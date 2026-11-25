@@ -5,6 +5,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Keyboard and screen-reader support in Settings, setup, History and the QR maker.** Tab and
+  Shift+Tab move between controls with a visible focus ring; Space toggles a switch or presses a
+  button; arrow keys move between pages and choices; Enter saves Settings or goes to the next
+  setup step; Ctrl+Tab switches Settings pages. In History, arrow keys, Home/End and Page Up/Down
+  move through captures, Enter opens one, Delete removes it and Shift+F10 opens its menu.
+  Narrator and other screen readers (UI Automation) can now read every control's name, state and
+  value, and operate them; setup announces each step.
+
+### Fixed
+- **Scrolling capture works in more apps, and upwards (chats).** When scrolling down moves
+  nothing, it now scrolls up from the same spot (chats open at the newest message) and stitches
+  the older messages above, in reading order. For apps that ignore simulated mouse-wheel input,
+  such as WhatsApp, it then asks the app to scroll through UI Automation (the accessibility
+  interface screen readers use). It still only runs when scrolling capture is turned on.
+- **Scrolling capture lines up chats with a wallpaper.** Messages scrolling over a background
+  that stays still (WhatsApp's doodle wallpaper) could not be lined up, so the capture stopped
+  after the first scroll. Snap It now falls back to a brightness comparison that tolerates the
+  faint background and ignores parts that don't scroll (the chat list beside a conversation),
+  and only accepts a match that clearly beats every other. A small animation in view (a GIF, a
+  hover button) at the end of a chat no longer stops the capture; it scrolls the other way. A
+  notification that pops up over the window while it scrolls no longer stops the capture or
+  gets stitched in again and again (only the last screen can still show it).
+- **Moving the mouse no longer stops a scrolling capture; Esc or a right-click does.** The
+  slightest nudge used to end it. Now the pointer is put back on its spot before each scroll, and
+  Esc or a right-click stops the capture (both watched only while it runs). If another app
+  already uses Esc, a large deliberate mouse move stops it too. Failsafes: it also stops if
+  another window comes to the front (so it never scrolls something else), and after 3 minutes.
+- **No more "Scrolling capture…" notification in the capture.** The toast slid in over the
+  bottom-right of the screen and was stitched into captures there; it is no longer shown.
+- **Text boxes behave like Windows ones.** The caret is drawn where it really is (also in long
+  text and multi-line boxes); select with Shift+arrows, mouse drag, double-click or Ctrl+A;
+  Ctrl+C/X/V work on the selection (Ctrl+X no longer clears a box with nothing selected); undo and
+  redo (Ctrl+Z/Y); Ctrl+arrows and Ctrl+Backspace/Delete work by word; Up/Down move through
+  wrapped lines; emoji and IME input (Chinese, Japanese, Korean…) work.
 
 ## [0.5.1] - 2026-11-25
 ### Fixed
