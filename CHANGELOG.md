@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+- Upgrading with the MSI while Snap It was running sat at "Validating install" for about
+  100 seconds. Snap It ignored Windows' "session ending" request (also sent by Restart
+  Manager during installs, sign-out and shutdown), so Windows waited for its hung-app
+  timeout. It now exits at once (measured: 0.1 s instead of about 100 s).
+- The MSI wizard now also asks a running Snap It to quit from its own process when Install is
+  clicked. The existing quit step runs in the Windows Installer service, which can't reach
+  the running copy.
+
 ## [0.3.1] - 2026-11-24
 ### Added
 - **MSI setup wizard** with the same choices as the setup .exe: license, install folder,

@@ -36,8 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
     KillTimer, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
     TranslateMessage, CW_USEDEFAULT, HICON, MSG, WINDOW_EX_STYLE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_COPYDATA, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_QUERYENDSESSION,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use actions::Action;
@@ -373,6 +373,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         tasks::WM_SAVED => {
             let r = unsafe { Box::from_raw(lparam.0 as *mut tasks::SaveResult) };
             tasks::on_saved(*r);
+            LRESULT(0)
+        }
+        // Sign-out, shutdown, or an installer's Restart Manager closing apps that hold its
+        // files: agree, then exit straight away. Ignoring WM_ENDSESSION made Windows wait for
+        // its hung-app timeout (about 100 s in the MSI upgrade) before terminating Snap It.
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                request_exit();
+            }
             LRESULT(0)
         }
         instance::WM_APP_QUIT => {

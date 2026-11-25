@@ -25,10 +25,18 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Snap It is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Snap It is a tray app: on upgrade or uninstall, ask a running copy to quit
-         (running the installed exe with the quit flag forwards it to the running copy)
-         before files are checked for being in use. -->
+    <!-- Snap It is a tray app: on upgrade or uninstall, ask a running copy to quit (running
+         the installed exe with the quit flag signals the running copy) before files are
+         checked for being in use.
+         The UI-sequence copy matters most: it runs in the wizard's own process, in the user's
+         session, when Install is clicked. The execute-sequence copy runs from the Windows
+         Installer service, which may be outside the user's session and unable to reach the
+         running copy; it remains for silent installs, where Restart Manager is the fallback. -->
     <CustomAction Id="QuitRunningSnapIt" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]snapit.exe&quot; --quit" Execute="immediate" Return="ignore" />
+    <CustomAction Id="QuitRunningSnapItUI" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]snapit.exe&quot; --quit" Execute="immediate" Return="ignore" />
+    <InstallUISequence>
+      <Custom Action="QuitRunningSnapItUI" Before="ExecuteAction" Condition="Installed OR WIX_UPGRADE_DETECTED" />
+    </InstallUISequence>
     <InstallExecuteSequence>
       <Custom Action="QuitRunningSnapIt" Before="InstallValidate" Condition="Installed OR WIX_UPGRADE_DETECTED" />
     </InstallExecuteSequence>
