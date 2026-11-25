@@ -632,7 +632,8 @@ impl Overlay {
             y: r.bottom() as f32 + 10.0 * s,
             scale: s,
             palette: self.settings.annotate.palette.clone(),
-            allow_none: o == Opt::FillColor,
+            allow_none: matches!(o, Opt::FillColor | Opt::Outline),
+            none_label: if o == Opt::Outline { "No outline" } else { "No fill" },
             current: self.values().swatch(o),
         };
         let above = self.options_panel().is_some_and(|pr| pr.bottom() <= self.bar.rect().y);

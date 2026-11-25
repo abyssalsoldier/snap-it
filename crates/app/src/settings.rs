@@ -92,6 +92,10 @@ pub struct ToolOptions {
     pub heads: snapit_annotate::ArrowHeads,
     pub step_type: snapit_annotate::StepType,
     pub text_background: bool,
+    /// Text outline: on/off, colour and stroke width.
+    pub text_outline: bool,
+    pub text_outline_color: Rgba,
+    pub text_outline_width: f32,
     pub blur_radius: f32,
     pub pixel_size: f32,
     /// Magnify zoom, as a factor (2.0 = 200%).
@@ -114,6 +118,9 @@ impl Default for ToolOptions {
             heads: snapit_annotate::ArrowHeads::End,
             step_type: snapit_annotate::StepType::Numbers,
             text_background: false,
+            text_outline: true,
+            text_outline_color: Rgba::WHITE,
+            text_outline_width: 3.0,
             blur_radius: 12.0,
             pixel_size: 12.0,
             zoom: 2.0,

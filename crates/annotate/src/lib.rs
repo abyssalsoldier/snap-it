@@ -198,6 +198,9 @@ pub struct Style {
     pub step_type: StepType,
     /// Blur radius, pixelate block size or spotlight dim (%). 0 derives it from `width`.
     pub strength: f32,
+    /// Text outline colour (`None` = no outline) and stroke width, in document pixels.
+    pub outline: Option<Rgba>,
+    pub outline_width: f32,
 }
 
 impl Default for Style {
@@ -214,6 +217,8 @@ impl Default for Style {
             heads: ArrowHeads::End,
             step_type: StepType::Numbers,
             strength: 0.0,
+            outline: Some(Rgba::WHITE),
+            outline_width: 3.0,
         }
     }
 }
@@ -514,7 +519,11 @@ impl Item {
             }
             Shape::Text { at, text, .. } => {
                 let l = text::layout(if text.is_empty() { " " } else { text }, self.style.font_size, false);
-                let pad = self.style.font_size * 0.35;
+                let mut pad = self.style.font_size * 0.35;
+                if self.style.outline.is_some() {
+                    // Half the outline stroke lies outside the glyphs.
+                    pad = pad.max(self.style.outline_width / 2.0 + 2.0);
+                }
                 Bx { x0: at.x - pad, y0: at.y - pad, x1: at.x + l.width.max(2.0) + pad, y1: at.y + l.height + pad }
             }
             Shape::Balloon { r, tail, text } => {
@@ -731,16 +740,16 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
                 return;
             }
             let size = st.font_size;
+            let outline = st.outline.map(|c| (c, st.outline_width.max(0.5)));
             if *background {
                 let l = text::layout(s, size, false);
                 let pad = size * 0.3;
                 if let Some(bg) = effects::rounded_rect(at.x - pad, at.y - pad, l.width + pad * 2.0, l.height + pad * 2.0, pad) {
                     pm.fill_path(&bg, &paint, FillRule::Winding, t, None);
                 }
-                text::draw(pm, s, ox + at.x, oy + at.y, size, false, contrast(st.color), None);
+                text::draw(pm, s, ox + at.x, oy + at.y, size, false, contrast(st.color), outline);
             } else {
-                let ow = (size * 0.12).max(2.0);
-                text::draw(pm, s, ox + at.x, oy + at.y, size, false, st.color, Some((contrast(st.color), ow)));
+                text::draw(pm, s, ox + at.x, oy + at.y, size, false, st.color, outline);
             }
         }
         Shape::Balloon { r, tail, text: s } => {

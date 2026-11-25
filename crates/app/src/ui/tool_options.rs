@@ -33,6 +33,9 @@ pub enum Opt {
     ArrowPath,
     Shadow,
     Background,
+    /// Text outline colour (or none); its width stepper sits right beside it.
+    Outline,
+    OutlineWidth,
 }
 
 /// The options shown for each tool, in ShareX's order (colour, size, fill, …, shadow).
@@ -44,7 +47,7 @@ pub fn options_for(tool: Tool) -> &'static [Opt] {
         Tool::Line | Tool::Pen => &[Color, Width, Dash, Shadow],
         Tool::Arrow => &[Color, Width, ArrowPath, Heads, Dash, Shadow],
         Tool::Highlight => &[Highlight],
-        Tool::Text => &[Color, FontSize, Background, Shadow],
+        Tool::Text => &[Color, FontSize, Outline, Background, Shadow],
         Tool::Balloon => &[Color, FontSize, Shadow],
         Tool::Step => &[Color, FontSize, StepType, Shadow],
         Tool::Blur => &[Blur],
@@ -83,6 +86,8 @@ fn label(o: Opt, tool: Tool) -> &'static str {
         Opt::ArrowPath => "Path",
         Opt::Shadow => "Shadow",
         Opt::Background => "Background",
+        Opt::Outline => "Outline",
+        Opt::OutlineWidth => "Outline size",
     }
 }
 
@@ -113,6 +118,7 @@ impl Values {
             Opt::Pixel => self.opts.pixel_size,
             Opt::Zoom => self.opts.zoom,
             Opt::Dim => self.opts.spot_dim,
+            Opt::OutlineWidth => self.opts.text_outline_width,
             _ => 0.0,
         }
     }
@@ -126,6 +132,7 @@ impl Values {
             Opt::Pixel => self.opts.pixel_size = v,
             Opt::Zoom => self.opts.zoom = v,
             Opt::Dim => self.opts.spot_dim = v,
+            Opt::OutlineWidth => self.opts.text_outline_width = v,
             _ => {}
         }
     }
@@ -164,6 +171,7 @@ impl Values {
             Opt::Color => Some(self.style.color),
             Opt::Highlight => Some(self.marker),
             Opt::FillColor => self.opts.fill.then_some(self.opts.fill_color),
+            Opt::Outline => self.opts.text_outline.then_some(self.opts.text_outline_color),
             _ => None,
         }
     }
@@ -178,6 +186,11 @@ impl Values {
                 self.opts.fill_color = c;
             }
             (Opt::FillColor, None) => self.opts.fill = false,
+            (Opt::Outline, Some(c)) => {
+                self.opts.text_outline = true;
+                self.opts.text_outline_color = c;
+            }
+            (Opt::Outline, None) => self.opts.text_outline = false,
             _ => {}
         }
     }
@@ -248,6 +261,8 @@ impl Values {
             heads: o.heads,
             step_type: o.step_type,
             strength: 0.0,
+            outline: o.text_outline.then_some(o.text_outline_color),
+            outline_width: o.text_outline_width,
             ..self.style
         };
         match tool {
@@ -290,6 +305,11 @@ impl Values {
             }
             Shape::Text { background, .. } => {
                 o.text_background = *background;
+                o.text_outline = st.outline.is_some();
+                if let Some(c) = st.outline {
+                    o.text_outline_color = c;
+                }
+                o.text_outline_width = st.outline_width;
                 self.style.color = st.color;
                 self.style.font_size = st.font_size;
                 o.shadow = st.shadow;
@@ -340,6 +360,8 @@ impl Values {
             Opt::Heads => it.style.heads = new.heads,
             Opt::StepType => it.style.step_type = new.step_type,
             Opt::Blur | Opt::Pixel => it.style.strength = new.strength,
+            Opt::Outline => it.style.outline = new.outline,
+            Opt::OutlineWidth => it.style.outline_width = new.outline_width,
             Opt::Background => {
                 it.style.fill = opts.text_background;
                 if let Shape::Text { background, .. } = &mut it.shape {
@@ -387,6 +409,7 @@ fn range(o: Opt, tool: Tool) -> (f32, f32, f32) {
         Opt::Blur | Opt::Pixel => (2.0, 60.0, 2.0),
         Opt::Zoom => (1.25, 8.0, 0.25),
         Opt::Dim => (10.0, 90.0, 5.0),
+        Opt::OutlineWidth => (1.0, 20.0, 1.0),
         _ => (0.0, 0.0, 1.0),
     }
 }
@@ -465,6 +488,14 @@ impl OptionsBar {
             x += LGAP * s;
             match o {
                 Opt::Color | Opt::FillColor | Opt::Highlight => push(&mut x, h, Part::Swatch(o)),
+                // Outline colour, then its width: one labelled group.
+                Opt::Outline => {
+                    push(&mut x, h, Part::Swatch(o));
+                    x += LGAP * s;
+                    push(&mut x, STEP_BTN * s, Part::Minus(Opt::OutlineWidth));
+                    push(&mut x, VALUE_W * s, Part::Value(Opt::OutlineWidth));
+                    push(&mut x, STEP_BTN * s, Part::Plus(Opt::OutlineWidth));
+                }
                 Opt::Dash | Opt::Heads | Opt::StepType | Opt::SpotShape | Opt::ArrowPath => {
                     for i in 0..choice_count(o) {
                         push(&mut x, SEG * s, Part::Seg(o, i));
@@ -566,6 +597,7 @@ impl OptionsBar {
                             match o {
                                 Opt::FillColor => "Fill colour",
                                 Opt::Highlight => "Highlight colour",
+                                Opt::Outline => "Outline colour",
                                 _ => "Colour",
                             },
                             *r,
@@ -731,6 +763,8 @@ pub struct ColorPopup {
     pub scale: f32,
     pub palette: Vec<Rgba>,
     pub allow_none: bool,
+    /// Caption of the "none" cell ("No fill", "No outline").
+    pub none_label: &'static str,
     pub current: Option<Rgba>,
 }
 
@@ -816,7 +850,7 @@ impl ColorPopup {
                 }
                 ColorHit::None | ColorHit::Custom => {
                     pm.fill_path(&p, &t.raised.paint(), FillRule::Winding, id, None);
-                    let txt = if h == ColorHit::None { "No fill" } else { "Custom…" };
+                    let txt = if h == ColorHit::None { self.none_label } else { "Custom…" };
                     let size = 12.0 * s;
                     let l = text::layout(txt, size, false);
                     text::draw(pm, txt, x + (w - l.width) / 2.0, y + (hh - l.height) / 2.0, size, false, t.text, None);
@@ -861,6 +895,27 @@ mod tests {
         assert_eq!(v.swatch(Opt::FillColor), Some(Rgba::BLACK));
         v.set_swatch(Opt::FillColor, None);
         assert!(!v.opts.fill);
+    }
+
+    #[test]
+    fn text_outline_reaches_new_and_selected_items() {
+        let mut v = values();
+        assert_eq!(v.item_style(Tool::Text).outline, Some(Rgba::WHITE));
+        v.set_swatch(Opt::Outline, Some(Rgba::BLACK));
+        assert!(v.step(Opt::OutlineWidth, 1, Tool::Text));
+        let mut it = Item::begin(Tool::Text, snapit_gfx::PointF::new(0.0, 0.0), v.item_style(Tool::Text), &[], Rgba::WHITE).unwrap();
+        assert_eq!((it.style.outline, it.style.outline_width), (Some(Rgba::BLACK), 4.0));
+        v.set_swatch(Opt::Outline, None);
+        v.apply_to_item(Opt::Outline, &mut it);
+        assert_eq!(it.style.outline, None);
+        // Selecting the item shows its own outline.
+        let mut w = values();
+        w.load_from_item(&it);
+        assert_eq!((w.swatch(Opt::Outline), w.opts.text_outline_width), (None, 4.0));
+        // The outline's width stepper sits in the strip and is clickable.
+        let bar = OptionsBar { x: 0.0, y: 0.0, scale: 1.0, tool: Some(Tool::Text), hover: None };
+        let r = bar.parts().into_iter().find(|(_, p)| *p == Part::Plus(Opt::OutlineWidth)).unwrap().0;
+        assert_eq!(bar.hit(r.x + 1, r.y + 1), Some(OptHit::Step(Opt::OutlineWidth, 1)));
     }
 
     #[test]

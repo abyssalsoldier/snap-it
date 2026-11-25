@@ -746,7 +746,8 @@ impl Editor {
             y: r.bottom() as f32 + 4.0 * self.s(),
             scale: self.s(),
             palette: app::settings().annotate.palette.clone(),
-            allow_none: o == Opt::FillColor,
+            allow_none: matches!(o, Opt::FillColor | Opt::Outline),
+            none_label: if o == Opt::Outline { "No outline" } else { "No fill" },
             current: v.swatch(o),
         }
     }
