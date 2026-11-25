@@ -1,0 +1,57 @@
+[package]
+name = "snap-it"
+description = "Snap It screenshot tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "snapit"
+path = "src/main.rs"
+
+[dependencies]
+snapit-gfx = { path = "../gfx" }
+snapit-capture = { path = "../capture" }
+snapit-annotate = { path = "../annotate" }
+snapit-record = { path = "../record" }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+qrcode = { version = "0.14", default-features = false }
+rqrr = "0.8"
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-manifest = "1.4"
+embed-resource = "3"
+
+[lints]
+workspace = true

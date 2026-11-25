@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+# Plain, unpacked binary: no UPX or obfuscation (EDR-safety rule).
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[workspace.lints.clippy]
+# GUI builder helpers legitimately take many positional layout arguments.
+too_many_arguments = "allow"
+type_complexity = "allow"
+

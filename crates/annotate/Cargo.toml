@@ -1,0 +1,12 @@
+[package]
+name = "snapit-annotate"
+description = "Annotation model and renderer shared by Snap It's quick-annotate overlay and editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+snapit-gfx = { path = "../gfx" }
+
+[lints]
+workspace = true
