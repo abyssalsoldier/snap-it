@@ -60,7 +60,13 @@ pub fn on_done(d: Done) {
     let explain = |body: &str| crate::ui::dialogs::info(None, "Snap It: scrolling capture", body);
     match d.result {
         Ok((image, r, stop, steps)) => {
-            let tasks = app::settings().tasks_for(Action::CaptureScrolling);
+            let s = app::settings();
+            let mut tasks = s.tasks_for(Action::CaptureScrolling);
+            // A tall stitched image is hard to judge from a "Saved" balloon (if Windows even
+            // shows it), so open it in the editor unless this workflow sets its own tasks.
+            if !s.workflows.iter().any(|w| w.action == Action::CaptureScrolling.name() && w.tasks.is_some()) {
+                tasks.open_editor = true;
+            }
             crate::tasks::run(Capture { image, kind: Action::CaptureScrolling, title: "Scrolling".into(), screen_rect: Some(r) }, tasks);
             match stop {
                 Stop::Lost => explain(&format!(
