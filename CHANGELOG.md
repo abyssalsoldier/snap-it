@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.7.0] - 2026-11-25
 ### Added
 - **Text boxes you can edit like a Windows text box.** Double-click a text or balloon annotation
   with the pointer to edit it, with the caret where you clicked (editor and quick edit). Click to
@@ -266,7 +268,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.1...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.7.0...dev
+[0.7.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.5.0...v0.5.1
