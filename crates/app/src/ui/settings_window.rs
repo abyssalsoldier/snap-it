@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use snapit_gfx::effects::rounded_rect;
-use snapit_gfx::tiny_skia::{FillRule, Pixmap, PixmapMut, Transform};
+use snapit_gfx::tiny_skia::{FillRule, Pixmap, PixmapMut, Stroke, Transform};
 use snapit_gfx::{text, Rect};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use super::{backbuffer, Backbuffer, Handler, Win};
 use crate::actions::Action;
 use crate::app::{self, Command};
-use crate::settings::{Settings, Theme as PrefTheme, Workflow};
+use crate::settings::{Settings, Theme as PrefTheme, ThemePreset, Workflow};
 use snapit_gfx::io::Format;
 
 thread_local! {
@@ -92,6 +92,7 @@ enum Hit {
     Nav(usize),
     Toggle(u16),
     Seg(u16, usize),
+    Preset(ThemePreset),
     Text(Field),
     Hotkey(usize),
     Btn(u16),
@@ -121,6 +122,7 @@ fn key(h: Hit) -> u32 {
         Hit::Text(f) => 0x400 + FIELDS.iter().position(|x| *x == f).unwrap_or(0) as u32,
         Hit::Hotkey(i) => 0x500 + i as u32,
         Hit::Btn(id) => 0x600 + id as u32,
+        Hit::Preset(p) => 0x700 + theme::PRESETS.iter().position(|x| x.id == p).unwrap_or(0) as u32,
     }
 }
 
@@ -133,6 +135,7 @@ fn decode(k: u32) -> Option<Hit> {
         4 => Hit::Text(*FIELDS.get(v)?),
         5 => Hit::Hotkey(v),
         6 => Hit::Btn(v as u16),
+        7 => Hit::Preset(theme::PRESETS.get(v)?.id),
         _ => return None,
     })
 }
@@ -196,6 +199,7 @@ struct SettingsWin {
     format: usize,
     jpeg_q: TextInput,
     theme_pref: usize,
+    theme_preset: ThemePreset,
     history_limit: TextInput,
 
     capture_cursor: bool,
@@ -268,6 +272,7 @@ pub fn open() {
         format,
         jpeg_q: TextInput::new(s.jpeg_quality.to_string(), "90", true, false),
         theme_pref,
+        theme_preset: s.theme_preset,
         history_limit: TextInput::new(s.history_limit.to_string(), "500", true, false),
         capture_cursor: s.capture_cursor,
         delay: TextInput::new(s.capture_delay_ms.to_string(), "0", true, false),
@@ -400,6 +405,7 @@ impl SettingsWin {
         s.format = [Format::Png, Format::Jpg, Format::Webp][self.format.min(2)];
         s.jpeg_quality = Self::parse_num(&self.jpeg_q, 90, 1, 100) as u8;
         s.theme = [PrefTheme::System, PrefTheme::Light, PrefTheme::Dark][self.theme_pref.min(2)];
+        s.theme_preset = self.theme_preset;
         s.history_limit = Self::parse_num(&self.history_limit, 500, 10, 100_000) as usize;
 
         s.capture_cursor = self.capture_cursor;
@@ -478,7 +484,7 @@ impl SettingsWin {
                     super::dialogs::info(Some(w.hwnd), "Snap It", &format!("Could not save settings.\n{e}"));
                     return;
                 }
-                let theme_changed = prev.theme != next.theme;
+                let theme_changed = prev.theme != next.theme || prev.theme_preset != next.theme_preset;
                 app::with(|st| st.settings = std::rc::Rc::new(next));
                 app::post(Command::ReloadSettings);
                 // The saved setting now matches the preview; re-theme against it.
@@ -648,6 +654,10 @@ impl SettingsWin {
                 let sel = if g == SEG_THEME { self.theme_pref } else { self.format };
                 single_stop(Node::new(k, r, Role::RadioButton, name).checked(sel == i), sel == i)
             }
+            Hit::Preset(p) => {
+                let on = self.theme_preset == p;
+                single_stop(Node::new(k, r, Role::RadioButton, name).checked(on), on)
+            }
             Hit::Text(f) => {
                 let v = self.text_input_mut(f).map(|t| t.value.clone()).unwrap_or_default();
                 Node::new(k, r, Role::Edit, name).value(v)
@@ -750,8 +760,12 @@ impl SettingsWin {
         let ix = x0 + pad;
         let iw = cw - pad * 2.0;
 
-        // Card 1: Appearance
-        let c1_h = 74.0 * s;
+        // Card 1: Appearance (Mode + 11-theme live-preview gallery)
+        let rows = theme::PRESETS.len().div_ceil(2);
+        let tile_h = 52.0 * s;
+        let tile_gap = 8.0 * s;
+        let grid_h = rows as f32 * tile_h + (rows.saturating_sub(1)) as f32 * tile_gap;
+        let c1_h = 92.0 * s + grid_h + 14.0 * s;
         widgets::draw_card(pm, &t, Rect::new(x0 as i32, *y as i32, cw as i32, c1_h as i32), 10.0, s);
         text::draw(pm, "Appearance", ix, *y + 12.0 * s, 12.0 * s, true, t.subtext, None);
         let seg_r = Rect::new(ix as i32, (*y + 32.0 * s) as i32, iw as i32, (32.0 * s) as i32);
@@ -759,6 +773,59 @@ impl SettingsWin {
         widgets::draw_segmented(pm, &t, seg_r, &THEME_OPTS, self.theme_pref, hov_t, s);
         for (i, sr) in widgets::segmented_rects(seg_r, 3, s).into_iter().enumerate() {
             self.add(cr, sr, Hit::Seg(SEG_THEME, i), THEME_OPTS[i], "Appearance");
+        }
+
+        text::draw(pm, "Theme gallery (click to live-preview)", ix, *y + 72.0 * s, 11.5 * s, false, t.subtext, None);
+        let gy = *y + 92.0 * s;
+        let tile_w = (iw - tile_gap) / 2.0;
+        let id = Transform::identity();
+        let preview_dark = self.theme.dark;
+        for (idx, preset) in theme::PRESETS.iter().enumerate() {
+            let col = idx % 2;
+            let row = idx / 2;
+            let tx = ix + col as f32 * (tile_w + tile_gap);
+            let ty = gy + row as f32 * (tile_h + tile_gap);
+            let tr = Rect::new(tx as i32, ty as i32, tile_w as i32, tile_h as i32);
+            let selected = self.theme_preset == preset.id;
+            let hovered = self.hover == Some(Hit::Preset(preset.id));
+            let pv = if preview_dark { &preset.dark } else { &preset.light };
+
+            if let Some(p) = rounded_rect(tx, ty, tile_w, tile_h, 8.0 * s) {
+                let fill = if selected { t.accent_soft } else if hovered { t.hover } else { t.raised };
+                pm.fill_path(&p, &fill.paint(), FillRule::Winding, id, None);
+                if selected {
+                    pm.stroke_path(
+                        &p,
+                        &t.accent_paint(tx, ty, tx + tile_w, ty + tile_h),
+                        &Stroke { width: 1.8 * s, ..Default::default() },
+                        id,
+                        None,
+                    );
+                } else {
+                    pm.stroke_path(&p, &t.border_subtle.paint(), &Stroke { width: 1.0, ..Default::default() }, id, None);
+                }
+            }
+
+            // Mini 3-part UI preview swatch: dark/light backdrop + card + accent gradient pill.
+            let sw = 44.0 * s;
+            let sh = 32.0 * s;
+            let sx = tx + 10.0 * s;
+            let sy = ty + (tile_h - sh) / 2.0;
+            if let Some(bg_p) = rounded_rect(sx, sy, sw, sh, 6.0 * s) {
+                pm.fill_path(&bg_p, &pv.bg.paint(), FillRule::Winding, id, None);
+                pm.stroke_path(&bg_p, &pv.border.paint(), &Stroke { width: 1.0, ..Default::default() }, id, None);
+            }
+            if let Some(card_p) = rounded_rect(sx + 4.0 * s, sy + 4.0 * s, sw - 8.0 * s, 11.0 * s, 3.0 * s) {
+                pm.fill_path(&card_p, &pv.panel.paint(), FillRule::Winding, id, None);
+            }
+            if let Some(acc_p) = rounded_rect(sx + 4.0 * s, sy + 18.0 * s, sw - 8.0 * s, 9.0 * s, 4.0 * s) {
+                pm.fill_path(&acc_p, &pv.accent_paint(sx, sy + 18.0 * s, sx + sw, sy + 27.0 * s), FillRule::Winding, id, None);
+            }
+
+            let lx = sx + sw + 10.0 * s;
+            text::draw(pm, preset.name, lx, ty + 10.0 * s, 12.5 * s, true, t.text, None);
+            text::draw(pm, preset.tagline, lx, ty + 28.0 * s, 11.0 * s, false, t.subtext, None);
+            self.add(cr, tr, Hit::Preset(preset.id), preset.name, preset.tagline);
         }
         *y += c1_h + 14.0 * s;
 
@@ -1096,8 +1163,11 @@ impl SettingsWin {
             Hit::Seg(SEG_THEME, i) => {
                 // Preview the choice in every window right away; undone if Settings closes unsaved.
                 self.theme_pref = i.min(SEG_COUNT - 1);
-                let pref = [PrefTheme::System, PrefTheme::Light, PrefTheme::Dark][self.theme_pref];
-                theme::set_preview((pref != app::settings().theme).then_some(pref));
+                self.update_theme_preview();
+            }
+            Hit::Preset(p) => {
+                self.theme_preset = p;
+                self.update_theme_preview();
             }
             Hit::Seg(..) => {}
             Hit::Toggle(id) => {
@@ -1131,6 +1201,13 @@ impl SettingsWin {
         w.invalidate();
     }
 
+    fn update_theme_preview(&self) {
+        let pref = [PrefTheme::System, PrefTheme::Light, PrefTheme::Dark][self.theme_pref.min(SEG_COUNT - 1)];
+        let saved = app::settings();
+        let diff = pref != saved.theme || self.theme_preset != saved.theme_preset;
+        theme::set_preview(diff.then_some((pref, self.theme_preset)));
+    }
+
     fn on_click(&mut self, w: &mut Win, x: i32, y: i32) {
         if self.chrome.release(w.hwnd, self.client.0, self.scale, x, y) {
             w.invalidate();
@@ -1161,6 +1238,13 @@ impl SettingsWin {
             (VK_RETURN, _) => self.save(w),
             (VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN, Some(Hit::Seg(g, i))) => {
                 let h = Hit::Seg(g, step(i, SEG_COUNT, matches!(vk, VK_LEFT | VK_UP)));
+                self.focus(Some(key(h)), true);
+                self.activate(w, h);
+            }
+            (VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN, Some(Hit::Preset(p))) => {
+                let cur = theme::PRESETS.iter().position(|x| x.id == p).unwrap_or(0);
+                let next = step(cur, theme::PRESETS.len(), matches!(vk, VK_LEFT | VK_UP));
+                let h = Hit::Preset(theme::PRESETS[next].id);
                 self.focus(Some(key(h)), true);
                 self.activate(w, h);
             }

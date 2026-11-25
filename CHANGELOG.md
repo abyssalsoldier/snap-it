@@ -15,6 +15,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   then fall back to the window's undo.
 - **Live theme preview.** Choosing Follow Windows, Light or Dark in Settings re-themes every Snap It
   window straight away; Save keeps it, closing Settings without saving puts it back.
+- **Theme gallery.** Settings > Appearance offers 11 color themes (Studio, Crimson, Amethyst,
+  Cyber, Nord, Forest, Sunset, Rose, Mono, Terminal and Arcane), each with a light and a dark
+  version. Click one to preview it in every window, then Save to keep it.
 
 ### Changed
 - Double-clicking empty space in the capture no longer finishes it.

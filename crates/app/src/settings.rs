@@ -203,6 +203,23 @@ pub enum Theme {
     Dark,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreset {
+    #[default]
+    Studio,
+    Crimson,
+    Amethyst,
+    Cyber,
+    Nord,
+    Forest,
+    Sunset,
+    Rose,
+    Mono,
+    Terminal,
+    Arcane,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -221,6 +238,7 @@ pub struct Settings {
     pub recording: Recording,
     pub integration: Integration,
     pub theme: Theme,
+    pub theme_preset: ThemePreset,
     /// Opt-in: scrolling capture sends synthetic wheel input to the target window.
     pub scrolling_capture: bool,
     pub custom_region: Option<Rect>,
@@ -248,6 +266,7 @@ impl Default for Settings {
             recording: Recording::default(),
             integration: Integration::default(),
             theme: Theme::System,
+            theme_preset: ThemePreset::Studio,
             scrolling_capture: false,
             custom_region: None,
             last_region: None,
@@ -318,8 +337,13 @@ mod tests {
 
         let partial: Settings = toml::from_str("jpeg_quality = 70\n[tasks]\nsave = false\n").unwrap();
         assert_eq!(partial.jpeg_quality, 70);
+        assert_eq!(partial.theme_preset, ThemePreset::Studio);
         assert!(!partial.tasks.save && partial.tasks.copy);
         assert_eq!(partial.workflows.len(), 4);
+
+        let themed: Settings = toml::from_str("theme = \"dark\"\ntheme_preset = \"amethyst\"\n").unwrap();
+        assert_eq!(themed.theme, Theme::Dark);
+        assert_eq!(themed.theme_preset, ThemePreset::Amethyst);
     }
 
     #[test]
