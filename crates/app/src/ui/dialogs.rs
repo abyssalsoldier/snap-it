@@ -88,6 +88,12 @@ pub enum Answer {
     Cancel,
 }
 
+/// A Yes/No question with no owner window. True for Yes.
+pub fn confirm(text: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_SETFOREGROUND, MB_YESNO};
+    unsafe { MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("Snap It"), MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES }
+}
+
 pub fn ask_save(owner: HWND, what: &str) -> Answer {
     let r = unsafe {
         MessageBoxW(Some(owner), &HSTRING::from(format!("Save changes to {what}?")), &HSTRING::from("Snap It"), MB_YESNOCANCEL | MB_ICONQUESTION)
@@ -97,6 +103,66 @@ pub fn ask_save(owner: HWND, what: &str) -> Answer {
         IDCANCEL => Answer::Cancel,
         _ => Answer::No,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateChoice {
+    Download,
+    Notes,
+    Later,
+}
+
+/// "Snap It vX is available" (a Windows task dialog). Returns the choice and
+/// whether "Don't remind me about this version" was ticked. Blocks the calling
+/// thread, so call it off the main thread.
+pub fn update_prompt(latest: &str, current: &str, how: &str, notes: &str) -> (UpdateChoice, bool) {
+    use windows::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_SIZE_TO_CONTENT, TD_INFORMATION_ICON,
+    };
+    const DOWNLOAD: i32 = 100;
+    const NOTES: i32 = 101;
+    const LATER: i32 = 102;
+    let title = HSTRING::from("Snap It update");
+    let main = HSTRING::from(format!("Snap It {} is available", latest.trim_start_matches('v')));
+    let content = HSTRING::from(format!("You have version {current}.\n\n{how}"));
+    let expanded = HSTRING::from(notes);
+    let (show, hide) = (HSTRING::from("Show what's new"), HSTRING::from("Hide what's new"));
+    let verify = HSTRING::from("Don't remind me about this version");
+    let labels = [HSTRING::from("Download"), HSTRING::from("Release notes"), HSTRING::from("Later")];
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: DOWNLOAD, pszButtonText: PCWSTR(labels[0].as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: NOTES, pszButtonText: PCWSTR(labels[1].as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: LATER, pszButtonText: PCWSTR(labels[2].as_ptr()) },
+    ];
+    let cfg = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_INFORMATION_ICON },
+        pszMainInstruction: PCWSTR(main.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: DOWNLOAD,
+        pszVerificationText: PCWSTR(verify.as_ptr()),
+        pszExpandedInformation: if notes.is_empty() { PCWSTR::null() } else { PCWSTR(expanded.as_ptr()) },
+        pszExpandedControlText: PCWSTR(hide.as_ptr()),
+        pszCollapsedControlText: PCWSTR(show.as_ptr()),
+        ..Default::default()
+    };
+    let mut pressed = 0i32;
+    let mut skip = windows::core::BOOL(0);
+    if let Err(e) = unsafe { TaskDialogIndirect(&cfg, Some(&mut pressed), None, Some(&mut skip)) } {
+        crate::log(&format!("update prompt: {e}"));
+        return (UpdateChoice::Later, false);
+    }
+    let choice = match pressed {
+        DOWNLOAD => UpdateChoice::Download,
+        NOTES => UpdateChoice::Notes,
+        _ => UpdateChoice::Later,
+    };
+    (choice, skip.as_bool())
 }
 
 thread_local! {

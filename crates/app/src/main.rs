@@ -8,6 +8,7 @@ mod commands;
 mod history;
 mod hotkeys;
 mod icon;
+mod instance;
 mod integration;
 mod naming;
 mod paths;
@@ -175,36 +176,6 @@ fn forward_to_running(args: &[String]) -> bool {
     true
 }
 
-/// Named event a running copy waits on; `snapit --quit` sets it. A kernel event needs no
-/// window lookup or cross-process window messages, so it works from any installer context.
-const QUIT_EVENT: windows::core::PCWSTR = w!("Local\\SnapIt.Quit");
-const WM_APP_QUIT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 7;
-
-fn signal_quit() {
-    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
-    // Nothing running means no event: nothing to do.
-    if let Ok(ev) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, QUIT_EVENT) } {
-        unsafe {
-            let _ = SetEvent(ev);
-            let _ = windows::Win32::Foundation::CloseHandle(ev);
-        }
-    }
-}
-
-/// Exits cleanly (as the tray's Exit does) when the quit event is set.
-fn watch_quit_event(main: HWND) {
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
-    // Kept open for the life of the process.
-    let Ok(ev) = (unsafe { CreateEventW(None, false, false, QUIT_EVENT) }) else { return };
-    let (ev, main) = (ev.0 as isize, main.0 as isize);
-    let _ = std::thread::Builder::new().name("snapit-quit".into()).spawn(move || unsafe {
-        let ev = windows::Win32::Foundation::HANDLE(ev as *mut _);
-        if WaitForSingleObject(ev, INFINITE) == windows::Win32::Foundation::WAIT_OBJECT_0 {
-            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(main as *mut _)), WM_APP_QUIT, WPARAM(0), LPARAM(0));
-        }
-    });
-}
-
 fn main() -> Result<()> {
     // Only load DLLs from System32 (blocks DLL planting next to the exe).
     unsafe {
@@ -232,17 +203,42 @@ fn main() -> Result<()> {
 
     // `--quit` (used by the installers): signal a running copy, never start one.
     if args.iter().any(|a| a == "--quit") {
-        signal_quit();
+        instance::signal_quit();
         return Ok(());
     }
 
-    // Single instance: a second launch forwards its arguments and exits.
-    let _mutex = unsafe { CreateMutexW(None, true, w!("Local\\SnapIt.SingleInstance"))? };
+    // Single instance. A second launch with arguments forwards them; without arguments it
+    // either reminds the user that Snap It is running or (newer/different copy) takes over.
+    let mutex = unsafe { CreateMutexW(None, true, w!("Local\\SnapIt.SingleInstance"))? };
+    let mut updated_from = None;
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         if !args.is_empty() {
             forward_to_running(&args);
+            return Ok(());
         }
-        return Ok(());
+        let me = env!("CARGO_PKG_VERSION");
+        let take_over = match instance::decide_now() {
+            instance::SecondLaunch::Activate => false,
+            instance::SecondLaunch::TakeOver { updated_from: v } => {
+                updated_from = Some(v);
+                true
+            }
+            instance::SecondLaunch::Ask { running } => {
+                let which = match &running {
+                    Some(r) => format!("Snap It {} is already running from:\n{}", r.version, r.exe),
+                    None => "Another copy of Snap It is already running.".to_string(),
+                };
+                ui::dialogs::confirm(&format!("{which}\n\nClose it and run this copy (version {me}) instead?"))
+            }
+        };
+        if !take_over {
+            instance::signal_activate();
+            return Ok(());
+        }
+        if !instance::take_over(mutex, 8000) {
+            ui::dialogs::info(None, "Snap It", "The running copy of Snap It did not close. Exit it from its tray icon, then start Snap It again.");
+            return Ok(());
+        }
     }
 
     // COM (apartment-threaded) for the shell link, file and folder dialogs.
@@ -252,7 +248,8 @@ fn main() -> Result<()> {
     // Worker threads (OCR, recording) use the MTA; keep it alive for the whole process.
     snapit_record::ensure_mta();
     let hwnd = create_main_window()?;
-    watch_quit_event(hwnd);
+    instance::watch(hwnd);
+    instance::publish();
 
     app::init(app::State {
         settings: std::rc::Rc::new(settings::Settings::load()),
@@ -278,6 +275,9 @@ fn main() -> Result<()> {
         );
     }
     log("running; right-click the tray icon for the menu");
+    if let Some(old) = updated_from {
+        app::post(Command::Notify { title: format!("Snap It updated to {}", env!("CARGO_PKG_VERSION")), body: format!("The running copy ({old}) was closed and replaced.") });
+    }
 
     if app::settings().integration.update_check {
         integration::check_for_updates(false);
@@ -360,6 +360,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             tools::on_result(*r);
             LRESULT(0)
         }
+        integration::WM_UPDATE_SKIP => {
+            let tag = unsafe { Box::from_raw(lparam.0 as *mut String) };
+            integration::on_skip_version(*tag);
+            LRESULT(0)
+        }
         integration::WM_UPDATE_RESULT => {
             let r = unsafe { Box::from_raw(lparam.0 as *mut integration::UpdateResult) };
             integration::on_update_result(*r);
@@ -370,8 +375,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             tasks::on_saved(*r);
             LRESULT(0)
         }
-        WM_APP_QUIT => {
+        instance::WM_APP_QUIT => {
             request_exit();
+            LRESULT(0)
+        }
+        instance::WM_APP_ACTIVATE => {
+            // Someone started Snap It again while it was already running.
+            app::post(Command::Notify {
+                title: "Snap It is already running".into(),
+                body: "Use your capture hotkey (Print Screen by default), or right-click the Snap It icon in the tray.".into(),
+            });
             LRESULT(0)
         }
         WM_COPYDATA => {

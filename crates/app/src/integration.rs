@@ -5,8 +5,10 @@
 //! - **Explorer context menu:** "Edit with Snap It" / "Pin with Snap It" verbs for
 //!   image files, under HKCU only (no admin, removable with one click).
 //! - **Update check:** one HTTPS GET to the GitHub releases API through WinHTTP
-//!   (system proxy and certificate store). It only *notifies*; nothing is downloaded
-//!   or run. The user agent is a generic product string with no personal data.
+//!   (system proxy and certificate store). A newer release shows a prompt whose
+//!   Download button opens the matching installer in the browser; Snap It itself
+//!   never downloads or runs anything. The user agent is a generic product string
+//!   with no personal data.
 
 use std::path::PathBuf;
 
@@ -23,6 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use crate::app::{self, Command};
 
 pub const WM_UPDATE_RESULT: u32 = WM_APP + 3;
+/// The update prompt's "don't remind me" choice (lparam: Box<String> tag).
+pub const WM_UPDATE_SKIP: u32 = WM_APP + 8;
 
 fn exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("snapit.exe"))
@@ -107,7 +111,7 @@ pub fn set_context_menu(on: bool) -> Result<(), String> {
 // ---------------- update check ----------------
 
 pub struct UpdateResult {
-    pub result: Result<Option<(String, String)>, String>,
+    pub result: Result<Option<Release>, String>,
     pub manual: bool,
 }
 
@@ -182,20 +186,120 @@ fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn check(repo: &str) -> Result<Option<(String, String)>, String> {
+/// A newer release than the running version.
+#[derive(Clone, Debug)]
+pub struct Release {
+    pub tag: String,
+    /// The release page.
+    pub page: String,
+    /// Release notes (Markdown), as published.
+    pub notes: String,
+    /// (file name, download URL) of each attached file.
+    pub assets: Vec<(String, String)>,
+}
+
+fn parse_release(v: &serde_json::Value) -> Result<Release, String> {
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let tag = v["tag_name"].as_str().ok_or("unexpected response")?.to_string();
+    let assets = v["assets"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| Some((x["name"].as_str()?.to_string(), x["browser_download_url"].as_str()?.to_string())))
+                // Only GitHub's own download links are ever offered.
+                .filter(|(_, url)| url.starts_with("https://github.com/"))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Release { tag, page: s("html_url"), notes: s("body"), assets })
+}
+
+fn check(repo: &str) -> Result<Option<Release>, String> {
     if !valid_repo(repo) {
         return Err("Set the update repository as owner/repo in Settings > Integration.".into());
     }
     let body = https_get("api.github.com", &format!("/repos/{repo}/releases/latest"))?;
     let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    let tag = v["tag_name"].as_str().ok_or("unexpected response")?.to_string();
-    let url = v["html_url"].as_str().unwrap_or_default().to_string();
-    Ok(is_newer(&tag, env!("CARGO_PKG_VERSION")).then_some((tag, url)))
+    let rel = parse_release(&v)?;
+    Ok(is_newer(&rel.tag, env!("CARGO_PKG_VERSION")).then_some(rel))
+}
+
+/// How this copy was installed, which decides the matching download.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallKind {
+    /// Setup .exe (Inno Setup): its uninstaller sits next to snapit.exe.
+    Setup,
+    /// MSI: the package records its folder under HKCU\Software\SnapIt\Installer.
+    Msi,
+    Portable,
+}
+
+pub fn install_kind() -> InstallKind {
+    if crate::paths::portable() {
+        return InstallKind::Portable;
+    }
+    let dir = crate::paths::exe_dir();
+    if dir.join("unins000.exe").exists() {
+        return InstallKind::Setup;
+    }
+    let norm = |p: &str| p.trim_end_matches(['\\', '/']).to_lowercase();
+    match read_hkcu_string("Software\\SnapIt\\Installer", "InstallDir") {
+        Some(d) if norm(&d) == norm(&dir.to_string_lossy()) => InstallKind::Msi,
+        // A copy that is neither (a dev build, a hand-copied exe): offer the installer.
+        _ => InstallKind::Setup,
+    }
+}
+
+fn read_hkcu_string(key: &str, value: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_SZ};
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, &HSTRING::from(key), &HSTRING::from(value), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut size)) };
+    if r.is_err() {
+        return None;
+    }
+    let n = (size as usize / 2).saturating_sub(1).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// The download matching `kind`, by the release file naming in scripts/package.ps1.
+pub fn pick_asset(assets: &[(String, String)], kind: InstallKind) -> Option<String> {
+    let want = |name: &str| match kind {
+        InstallKind::Setup => name.ends_with("-setup-x64.exe"),
+        InstallKind::Msi => name.ends_with("-x64.msi"),
+        InstallKind::Portable => name.ends_with("-portable-x64.zip"),
+    };
+    assets.iter().find(|(n, _)| want(n)).map(|(_, u)| u.clone())
+}
+
+/// Release notes as plain text for the prompt: the download list is dropped
+/// (the prompt has its own button) and Markdown emphasis is removed.
+pub fn notes_text(md: &str) -> String {
+    let body = md.split("### Downloads").next().unwrap_or_default();
+    let mut out = String::new();
+    for line in body.lines() {
+        let l = line.trim_end().replace("**", "").replace('`', "");
+        let l = l.strip_prefix("### ").or_else(|| l.strip_prefix("## ")).map(str::to_string).unwrap_or(l);
+        out.push_str(&l);
+        out.push('\n');
+    }
+    let out = out.trim().to_string();
+    const MAX: usize = 1800;
+    match out.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…\n\n(See the release notes for the rest.)", &out[..i]),
+        None => out,
+    }
+}
+
+/// The release repository: the setting, or this project's own when it is left empty.
+fn update_repo() -> String {
+    let r = app::settings().integration.update_repo.trim().to_string();
+    if r.is_empty() { crate::settings::DEFAULT_UPDATE_REPO.to_string() } else { r }
 }
 
 /// Runs the check on a worker thread; the result arrives as WM_UPDATE_RESULT.
 pub fn check_for_updates(manual: bool) {
-    let repo = app::settings().integration.update_repo.trim().to_string();
+    let repo = update_repo();
     let hwnd = app::main_hwnd().0 as isize;
     std::thread::spawn(move || {
         let r = Box::new(UpdateResult { result: check(&repo), manual });
@@ -208,11 +312,67 @@ pub fn check_for_updates(manual: bool) {
     });
 }
 
+static PROMPT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shows the update prompt on its own thread (so hotkeys and captures keep working).
+/// "Download" opens the matching installer in the browser; Snap It itself never
+/// downloads or runs anything. The installers close and replace a running copy.
+fn prompt_update(rel: Release) {
+    use std::sync::atomic::Ordering;
+    if PROMPT_OPEN.swap(true, Ordering::SeqCst) {
+        return; // one prompt at a time
+    }
+    let kind = install_kind();
+    // Portable copies are offered the setup wizard too, so updating always means "run the wizard".
+    let download = pick_asset(&rel.assets, if kind == InstallKind::Portable { InstallKind::Setup } else { kind });
+    let main = app::main_hwnd().0 as isize;
+    let spawned = std::thread::Builder::new().name("snapit-update-prompt".into()).spawn(move || {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let how = match (kind, download.is_some()) {
+            (_, false) => "Download opens the release page, where you can get the installer.",
+            (InstallKind::Setup, true) => "Download saves the installer in your browser. Run it to update: it closes Snap It, updates it and starts it again.",
+            (InstallKind::Msi, true) => "Download saves the MSI package in your browser. Run it to update: it closes Snap It and updates it; start it again from the Start menu.",
+            (InstallKind::Portable, true) => "Download saves the installer in your browser. Run it to install Snap It with a Start menu shortcut; it closes this portable copy and starts the installed one. Your portable folder is left as it is (the installed copy keeps its settings in %APPDATA%\\SnapIt).",
+        };
+        let notes = notes_text(&rel.notes);
+        let (choice, skip) = crate::ui::dialogs::update_prompt(&rel.tag, env!("CARGO_PKG_VERSION"), how, &notes);
+        crate::log(&format!("update prompt: {choice:?}, skip this version: {skip}"));
+        match choice {
+            crate::ui::dialogs::UpdateChoice::Download => crate::shell::open_url(download.as_deref().unwrap_or(&rel.page)),
+            crate::ui::dialogs::UpdateChoice::Notes => crate::shell::open_url(&rel.page),
+            crate::ui::dialogs::UpdateChoice::Later => {}
+        }
+        if skip {
+            let raw = Box::into_raw(Box::new(rel.tag));
+            unsafe {
+                if PostMessageW(Some(HWND(main as *mut _)), WM_UPDATE_SKIP, WPARAM(0), LPARAM(raw as isize)).is_err() {
+                    drop(Box::from_raw(raw));
+                }
+            }
+        }
+        PROMPT_OPEN.store(false, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        PROMPT_OPEN.store(false, Ordering::SeqCst);
+    }
+}
+
+/// "Don't remind me about this version" (posted by the prompt thread).
+pub fn on_skip_version(tag: String) {
+    app::update_settings(|s| s.integration.skipped_version = tag);
+}
+
 pub fn on_update_result(r: UpdateResult) {
     match r.result {
-        Ok(Some((tag, url))) => {
-            app::with(|s| s.pending_click = Some(app::Click::Url(url)));
-            app::post(Command::Notify { title: format!("Snap It {tag} is available"), body: "Click to open the release page.".into() });
+        Ok(Some(rel)) => {
+            // "Don't remind me" silences the automatic check for that version; "Check now" still shows it.
+            if !r.manual && app::settings().integration.skipped_version == rel.tag {
+                return;
+            }
+            crate::log(&format!("update available: {}", rel.tag));
+            prompt_update(rel);
         }
         Ok(None) if r.manual => app::post(Command::Notify { title: "Snap It is up to date".into(), body: format!("You have version {}.", env!("CARGO_PKG_VERSION")) }),
         Ok(None) => {}
@@ -257,5 +417,53 @@ mod tests {
         assert!(!valid_repo("a/b/c"));
         assert!(!valid_repo("a/b?x=1"));
         assert!(!valid_repo(""));
+    }
+
+    fn release_json() -> serde_json::Value {
+        let a = |n: &str, host: &str| serde_json::json!({ "name": n, "browser_download_url": format!("https://{host}/x/releases/download/v0.3.0/{n}") });
+        serde_json::json!({
+            "tag_name": "v0.3.0",
+            "html_url": "https://github.com/x/releases/tag/v0.3.0",
+            "body": "### Added\n- **Spotlight** tool (`S`)\n\n### Downloads\n- setup.exe: installer",
+            "assets": [
+                a("SHA256SUMS.txt", "github.com"),
+                a("SnapIt-0.3.0-portable-x64.zip", "github.com"),
+                a("SnapIt-0.3.0-setup-x64.exe", "github.com"),
+                a("SnapIt-0.3.0-x64.msi", "github.com"),
+                a("SnapIt-0.3.0-evil-setup-x64.exe", "example.com"),
+            ]
+        })
+    }
+
+    #[test]
+    fn picks_the_download_for_each_install_kind() {
+        let rel = parse_release(&release_json()).unwrap();
+        assert_eq!(rel.tag, "v0.3.0");
+        assert!(rel.assets.iter().all(|(_, u)| u.starts_with("https://github.com/")), "non-GitHub links are dropped");
+        let pick = |k| pick_asset(&rel.assets, k).unwrap();
+        assert!(pick(InstallKind::Setup).ends_with("SnapIt-0.3.0-setup-x64.exe"));
+        assert!(pick(InstallKind::Msi).ends_with("SnapIt-0.3.0-x64.msi"));
+        assert!(pick(InstallKind::Portable).ends_with("SnapIt-0.3.0-portable-x64.zip"));
+        assert_eq!(pick_asset(&[], InstallKind::Setup), None);
+    }
+
+    /// Live check against GitHub: `cargo test -p snap-it live_update_check -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_update_check() {
+        let t = std::time::Instant::now();
+        let body = https_get("api.github.com", &format!("/repos/{}/releases/latest", crate::settings::DEFAULT_UPDATE_REPO));
+        println!("https_get took {:?}: {}", t.elapsed(), body.as_ref().map(|b| format!("{} bytes", b.len())).unwrap_or_else(|e| e.clone()));
+        let v: serde_json::Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        let rel = parse_release(&v).unwrap();
+        println!("tag {} assets {:?}", rel.tag, rel.assets.iter().map(|a| &a.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn release_notes_become_plain_text() {
+        let t = notes_text(release_json()["body"].as_str().unwrap());
+        assert_eq!(t, "Added\n- Spotlight tool (S)");
+        let long = "x".repeat(5000);
+        assert!(notes_text(&long).ends_with("(See the release notes for the rest.)"));
     }
 }

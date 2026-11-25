@@ -398,7 +398,7 @@ impl SettingsWin {
         y += 30;
         self.check(hwnd, 5, ID_CTXMENU, "Add \"Edit with Snap It\" and \"Pin with Snap It\" to the Explorer menu for images", ig.context_menu, x0, y, cw - 60);
         y += 30;
-        self.check(hwnd, 5, ID_UPDATE, "Check for new versions at startup (notify only, nothing is downloaded)", ig.update_check, x0, y, cw - 60);
+        self.check(hwnd, 5, ID_UPDATE, "Check for new versions at startup (asks first; downloads open in your browser)", ig.update_check, x0, y, cw - 60);
         y += 32;
         self.label(hwnd, 5, "Release repository (owner/repo)", x0 + 18, y, 220);
         self.edit(hwnd, 5, ID_REPO, &ig.update_repo, 260, y, 200, false);

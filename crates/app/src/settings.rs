@@ -162,15 +162,25 @@ impl Default for Recording {
     }
 }
 
+/// Where Snap It's own releases are published.
+pub const DEFAULT_UPDATE_REPO: &str = "abyssalsoldier/snap-it";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-#[derive(Default)]
 pub struct Integration {
     pub start_with_windows: bool,
     pub context_menu: bool,
     pub update_check: bool,
-    /// GitHub "owner/repo" whose releases are checked. Empty disables the check.
+    /// GitHub "owner/repo" whose releases are checked. Empty means [`DEFAULT_UPDATE_REPO`].
     pub update_repo: String,
+    /// A release the user chose "Don't remind me about this version" for.
+    pub skipped_version: String,
+}
+
+impl Default for Integration {
+    fn default() -> Self {
+        Self { start_with_windows: false, context_menu: false, update_check: false, update_repo: DEFAULT_UPDATE_REPO.into(), skipped_version: String::new() }
+    }
 }
 
 

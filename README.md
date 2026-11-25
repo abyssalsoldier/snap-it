@@ -92,8 +92,8 @@ you which hotkeys were taken. Change them in **Settings > Hotkeys**.
 | Low-level keyboard or mouse hooks (`SetWindowsHookEx`) | `RegisterHotKey`. Snap It only receives the chords it registered. |
 | Background or timed screen capture | Every capture starts from a hotkey, the tray or the command line. The tray icon is always visible. |
 | Child processes (FFmpeg, cmd, PowerShell) | Everything runs in-process: Media Foundation, a Rust GIF encoder, Windows OCR. Folders and URLs open through the shell. |
-| Uploads or any network use of captures | There is no upload code at all. The only network call is an opt-in update check that only notifies. |
-| Self-updating | The update check opens the release page and never downloads or runs anything. |
+| Uploads or any network use of captures | There is no upload code at all. The only network call is an opt-in update check (one HTTPS GET to the GitHub releases API). |
+| Self-updating | A newer release shows a prompt; its Download button opens the installer in your browser (the .msi for MSI installs, otherwise the setup wizard). Snap It never downloads or runs anything itself; the installer closes and replaces it. |
 | `Run` key persistence | An opt-in shortcut in the Startup folder |
 | Clipboard monitoring | The clipboard is written only when you copy and read only when you paste |
 | Elevation | `asInvoker` manifest; no admin rights needed or requested |

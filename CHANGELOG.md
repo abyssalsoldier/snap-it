@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- **Update prompt:** when a newer release exists, a dialog shows what's new with Download,
+  Release notes and Later, plus "Don't remind me about this version". Download opens the
+  installer in the browser: the .msi for MSI installs, otherwise the setup wizard (portable
+  copies included, so updating always means running the wizard). Snap It still never
+  downloads or runs anything itself.
+- MIT license (JRankin Tech). The repository is now public.
+
+### Fixed
+- Starting Snap It while it was already running did nothing visible. Now the running copy
+  shows "Snap It is already running"; a newer version (for example a freshly unzipped
+  portable copy) closes the old one and takes over; a different copy of the same or an older
+  version asks before switching. This uses named kernel objects only, no window lookup.
+
+### Changed
+- The update check uses Snap It's own release repository by default (the setting can still
+  point elsewhere).
+
 ## [0.2.0] - 2026-11-24
 ### Added
 - Versioning: `CHANGELOG.md`, `scripts/bump-version.ps1`, a `snapit --version` flag, and the
