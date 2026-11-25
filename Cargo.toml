@@ -19,3 +19,7 @@ panic = "abort"
 too_many_arguments = "allow"
 type_complexity = "allow"
 
+
+# Optimise dependencies (tiny-skia, image…) even in debug builds so dev runs feel real.
+[profile.dev.package."*"]
+opt-level = 3

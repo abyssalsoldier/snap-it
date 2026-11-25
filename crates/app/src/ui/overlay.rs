@@ -128,13 +128,24 @@ struct Overlay {
     editing: Option<usize>,
     edit_before: Option<Vec<Item>>,
     selected: Option<usize>,
-    comp: Option<Pixmap>,
+    /// Full-screen screenshot + annotations. Patched locally when items change, so
+    /// moving or resizing the selection never re-renders anything.
+    comp: Pixmap,
+    /// Items changed since the last sync (cheap flag; the diff happens in `sync_comp`).
     comp_dirty: bool,
+    /// Per-item (signature, bounds) from the last sync, to find what changed.
+    item_sigs: Vec<(u64, Rect)>,
     bar: Toolbar<Btn>,
     popup: Popup,
     sticker: Sticker,
     ruler: Option<(i32, i32, i32, i32)>,
-    prev_dirty: Rect,
+    /// Chrome element rects drawn in the previous frame (they must be erased).
+    prev_elems: Vec<Rect>,
+    /// Bright/bordered rectangle (hover or selection) in the previous frame.
+    prev_frame: Option<Rect>,
+    /// Areas to recompose at the next WM_PAINT.
+    pending: Vec<Rect>,
+    first_paint: bool,
     style_changed: bool,
     /// Highlighter colour (separate from the pen colour).
     marker: Rgba,
@@ -196,6 +207,7 @@ pub fn open(mode: Mode) {
         theme: theme::DARK,
         origin: (vs.x, vs.y),
         bb: Backbuffer::new(shot.width(), shot.height()),
+        comp: shot.clone(),
         shot,
         dim,
         wins,
@@ -213,13 +225,16 @@ pub fn open(mode: Mode) {
         editing: None,
         edit_before: None,
         selected: None,
-        comp: None,
-        comp_dirty: true,
+        comp_dirty: false,
+        item_sigs: Vec::new(),
         bar: Toolbar::new(Vec::new(), 1.0),
         popup: Popup::None,
         sticker: Sticker::Check,
         ruler: None,
-        prev_dirty: Rect::default(),
+        prev_elems: Vec::new(),
+        prev_frame: None,
+        pending: Vec::new(),
+        first_paint: true,
         style_changed: false,
         marker: s.annotate.highlight,
         settings: s,
@@ -258,6 +273,8 @@ fn dimmed(src: &Pixmap, amount: u8) -> Pixmap {
     d
 }
 
+/// Self-test: recompose the whole frame from scratch.
+pub const WM_OVERLAY_TEST_FULL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 92;
 const HANDLE: f32 = 9.0;
 const MAG_CELLS: i32 = 17;
 const MAG_CELL: f32 = 8.0;
@@ -403,15 +420,62 @@ impl Overlay {
         PointF::new(x as f32, y as f32)
     }
 
-    fn composite(&mut self) -> Option<&Pixmap> {
-        let sel = self.sel?;
-        if self.comp_dirty || self.comp.is_none() {
-            let mut c = crop(&self.shot, sel)?;
-            ann::render(&mut c.as_mut(), &self.items, -sel.x as f32, -sel.y as f32);
-            self.comp = Some(c);
-            self.comp_dirty = false;
+    /// Brings `comp` up to date with the items, re-rendering only the areas of items
+    /// that changed. Returns those areas (they also need repainting).
+    fn sync_comp(&mut self) -> Vec<Rect> {
+        if !self.comp_dirty {
+            return Vec::new();
         }
-        self.comp.as_ref()
+        self.comp_dirty = false;
+        let full = self.full();
+        let sigs: Vec<(u64, Rect)> = self.items.iter().map(|it| (item_sig(it), it.bounds().to_rect().inflate(2))).collect();
+        let mut changed = Vec::new();
+        for i in 0..sigs.len().max(self.item_sigs.len()) {
+            let (old, new) = (self.item_sigs.get(i), sigs.get(i));
+            if old.map(|o| o.0) != new.map(|n| n.0) {
+                changed.extend(old.map(|o| o.1));
+                changed.extend(new.map(|n| n.1));
+            }
+        }
+        self.item_sigs = sigs;
+        // Pixel effects (blur, pixelate, magnify) read their whole area, so any region
+        // touching one must include all of it or the effect would be cut at the edge.
+        let mut rects = merge_rects(changed);
+        for _ in 0..4 {
+            let mut grown = false;
+            for r in rects.iter_mut() {
+                for it in &self.items {
+                    if matches!(it.shape, Shape::Blur(_) | Shape::Pixelate(_) | Shape::Magnify { .. }) {
+                        let b = it.bounds().to_rect().inflate(2);
+                        if b.intersect(*r).is_some() && r.union(b) != *r {
+                            *r = r.union(b);
+                            grown = true;
+                        }
+                    }
+                }
+            }
+            if !grown {
+                break;
+            }
+            rects = merge_rects(rects);
+        }
+        let mut out = Vec::new();
+        for r in rects {
+            let Some(r) = r.intersect(full) else { continue };
+            if let Some(mut sub) = crop(&self.shot, r) {
+                ann::render(&mut sub.as_mut(), &self.items, -r.x as f32, -r.y as f32);
+                blit_rect(&mut self.comp.as_mut(), &sub, Rect::new(0, 0, r.w, r.h), r.x, r.y);
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// The final image: the selected part of the annotated screenshot.
+    fn composite(&mut self) -> Option<Pixmap> {
+        let sel = self.sel?;
+        self.sync_comp();
+        crop(&self.comp, sel)
     }
 
     fn screen_rect(&self, r: Rect) -> Rect {
@@ -463,7 +527,7 @@ impl Overlay {
                 items.iter_mut().for_each(|i| i.translate(-sel.x as f32, -sel.y as f32));
                 app::post(Command::OpenEditorWith { image: base, items });
             }
-        } else if let Some(img) = self.composite().cloned() {
+        } else if let Some(img) = self.composite() {
             app::post(Command::Finish(Capture { image: img, kind: Action::CaptureRegion, title: "Region".into(), screen_rect: Some(screen) }, how));
         }
         w.close();
@@ -1024,66 +1088,110 @@ impl Overlay {
         Some(r.union(Rect::new(x1 + 10, y1 + 10, (260.0 * self.scale.max(1.0)) as i32, (60.0 * self.scale.max(1.0)) as i32)))
     }
 
-    fn chrome_bounds(&self) -> Rect {
+    /// The bright, outlined rectangle: the selection, or the hovered window while choosing.
+    fn frame_rect(&self) -> Option<Rect> {
+        self.sel.or(if self.annotating { None } else { self.hover })
+    }
+
+    /// Bounds of every translucent / anti-aliased chrome element drawn this frame.
+    /// Each must be fully restored before it is drawn again, so they are always repainted.
+    /// (The frame outline is drawn without anti-aliasing, so redrawing it is idempotent.)
+    fn elements(&self) -> Vec<Rect> {
         let s = self.scale.max(1.0);
-        let mut r = Rect::default();
-        if let Some(h) = self.hover {
-            r = r.union(h.inflate(3));
-        }
+        let mut v = Vec::new();
         if let Some(sel) = self.sel {
-            r = r.union(sel.inflate((HANDLE * s) as i32 + 3)).union(self.label_rect(sel));
-            if let Some(i) = self.selected.or(self.editing) {
-                if let Some(it) = self.items.get(i) {
-                    r = r.union(it.bounds().to_rect().inflate(4));
+            v.push(self.label_rect(sel).inflate(2));
+            if self.handles_visible() {
+                let hs = (HANDLE * s) as i32 + 3;
+                for (hx, hy) in handles(sel) {
+                    v.push(Rect::new(hx as i32 - hs, hy as i32 - hs, hs * 2, hs * 2));
+                }
+            }
+            for i in self.selected.iter().chain(self.editing.iter()) {
+                if let Some(it) = self.items.get(*i) {
+                    v.push(it.bounds().to_rect().inflate((4.0 * s) as i32 + 4));
                 }
             }
         }
         if self.show_magnifier() {
-            r = r.union(self.magnifier_rect().inflate(4));
+            v.push(self.magnifier_rect().inflate(5));
         }
         if self.settings.region.crosshair && !self.annotating {
             let (x, y) = self.cursor;
-            r = r.union(Rect::new(0, y - 1, self.shot.width() as i32, 3)).union(Rect::new(x - 1, 0, 3, self.shot.height() as i32));
+            v.push(Rect::new(0, y - 2, self.shot.width() as i32, 5));
+            v.push(Rect::new(x - 2, 0, 5, self.shot.height() as i32));
         }
         if let Some(h) = self.hint_rect() {
-            r = r.union(h.inflate(2));
+            v.push(h.inflate(2));
         }
         if let Some(rb) = self.ruler_bounds() {
-            r = r.union(rb);
+            v.push(rb.inflate(4));
         }
         if self.annotating {
-            r = r.union(self.bar.paint_bounds());
+            v.push(self.bar.paint_bounds());
             if let Some(p) = self.popup_rect() {
-                r = r.union(p.inflate(4));
+                v.push(p.inflate(4));
             }
         }
-        r
+        v
     }
 
+    fn handles_visible(&self) -> bool {
+        (self.annotating && self.tool == Tool::Pointer) || matches!(self.drag, Drag::Resize { .. })
+    }
+
+    /// Records what changed since the last frame and schedules a repaint of just those
+    /// areas. The actual drawing happens in WM_PAINT, so a burst of mouse moves costs
+    /// one frame, not one frame each.
     fn redraw(&mut self, w: &Win) {
         if self.scale == 1.0 {
             self.scale = w.dpi_scale();
         }
-        let chrome = self.chrome_bounds();
-        let sel = self.sel.map(|s| s.inflate(2)).unwrap_or_default();
-        let dirty = chrome.union(sel).union(self.prev_dirty);
-        let Some(dirty) = dirty.intersect(self.full()) else { return };
-        self.compose(dirty);
-        self.prev_dirty = chrome.union(sel);
-        super::invalidate(w.hwnd, Some(dirty));
+        let mut dirty = std::mem::take(&mut self.prev_elems);
+        let cur = self.elements();
+        dirty.extend(cur.iter().copied());
+        self.prev_elems = cur;
+
+        // Frame (hover/selection) moved: only the strips that changed brightness, plus
+        // both outlines, need repainting.
+        let frame = self.frame_rect();
+        if frame != self.prev_frame {
+            let t = (2.5 * self.scale.max(1.0)).ceil() as i32 + 2;
+            match (self.prev_frame, frame) {
+                (Some(a), Some(b)) => {
+                    dirty.extend(subtract(a, b));
+                    dirty.extend(subtract(b, a));
+                }
+                (Some(a), None) | (None, Some(a)) => dirty.push(a),
+                (None, None) => {}
+            }
+            dirty.extend(self.prev_frame.iter().flat_map(|r| edges(*r, t)));
+            dirty.extend(frame.iter().flat_map(|r| edges(*r, t)));
+            self.prev_frame = frame;
+        }
+        dirty.extend(self.sync_comp());
+
+        let full = self.full();
+        for r in dirty.into_iter().filter_map(|r| r.intersect(full)) {
+            super::invalidate(w.hwnd, Some(r));
+            self.pending.push(r);
+        }
     }
 
-    fn compose(&mut self, r: Rect) {
-        let _ = self.composite();
+    /// Restores every pending area from the dimmed / bright images, then draws the chrome once.
+    fn compose_pending(&mut self) {
+        let rects = merge_rects(std::mem::take(&mut self.pending));
+        if rects.is_empty() {
+            return;
+        }
         let Some(mut bb) = self.bb.take() else { return };
         {
             let mut pm = bb.pixmap();
-            blit_rect(&mut pm, &self.dim, r, r.x, r.y);
-            let bright = self.sel.or(if self.annotating { None } else { self.hover });
-            if let Some(b) = bright.and_then(|b| b.intersect(r)) {
-                match (self.annotating, &self.comp, self.sel) {
-                    (true, Some(c), Some(sel)) => blit_rect(&mut pm, c, b.offset(-sel.x, -sel.y), b.x, b.y),
-                    _ => blit_rect(&mut pm, &self.shot, b, b.x, b.y),
+            let frame = self.frame_rect();
+            for r in &rects {
+                blit_rect(&mut pm, &self.dim, *r, r.x, r.y);
+                if let Some(b) = frame.and_then(|f| f.intersect(*r)) {
+                    blit_rect(&mut pm, &self.comp, b, b.x, b.y);
                 }
             }
             self.draw_chrome(&mut pm);
@@ -1096,16 +1204,19 @@ impl Overlay {
         let s = self.scale.max(1.0);
         let id = Transform::identity();
         let thin = Stroke { width: 1.0, ..Default::default() };
+        // Frame outline: opaque and not anti-aliased, so drawing it again over itself is a no-op.
+        let mut frame_paint = t.accent.paint();
+        frame_paint.anti_alias = false;
         if let (Some(h), None) = (self.hover, self.sel) {
             if let Some(p) = h.to_skia().map(PathBuilder::from_rect) {
-                pm.stroke_path(&p, &t.accent.paint(), &Stroke { width: 2.0 * s, ..Default::default() }, id, None);
+                pm.stroke_path(&p, &frame_paint, &Stroke { width: (2.0 * s).round(), ..Default::default() }, id, None);
             }
         }
         if let Some(sel) = self.sel {
             if let Some(p) = sel.to_skia().map(PathBuilder::from_rect) {
-                pm.stroke_path(&p, &t.accent.paint(), &Stroke { width: 1.5 * s, ..Default::default() }, id, None);
+                pm.stroke_path(&p, &frame_paint, &Stroke { width: (1.5 * s).round().max(1.0), ..Default::default() }, id, None);
             }
-            if self.annotating && self.tool == Tool::Pointer || matches!(self.drag, Drag::Resize { .. }) {
+            if self.handles_visible() {
                 for (hx, hy) in handles(sel) {
                     let hs = HANDLE * s * 0.8;
                     if let Some(p) = rounded_rect(hx - hs / 2.0, hy - hs / 2.0, hs, hs, 2.0) {
@@ -1262,6 +1373,82 @@ impl Overlay {
     }
 }
 
+/// A cheap fingerprint of everything that affects how an item renders.
+fn item_sig(it: &Item) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let f = |v: f32| v.to_bits();
+    let b = it.bounds();
+    (f(b.x0), f(b.y0), f(b.x1), f(b.y1)).hash(&mut h);
+    let st = &it.style;
+    (st.color.r, st.color.g, st.color.b, st.color.a, f(st.width), f(st.font_size), st.fill).hash(&mut h);
+    std::mem::discriminant(&it.shape).hash(&mut h);
+    match &it.shape {
+        Shape::Line(a, b) | Shape::Arrow(a, b) => (f(a.x), f(a.y), f(b.x), f(b.y)).hash(&mut h),
+        Shape::Pen(p) => {
+            p.len().hash(&mut h);
+            if let Some(l) = p.last() {
+                (f(l.x), f(l.y)).hash(&mut h);
+            }
+        }
+        Shape::Text { text, background, .. } => (text, background).hash(&mut h),
+        Shape::Balloon { text, tail, .. } => (text, f(tail.x), f(tail.y)).hash(&mut h),
+        Shape::Step { n, .. } => n.hash(&mut h),
+        Shape::Eraser(_, c) => (c.r, c.g, c.b, c.a).hash(&mut h),
+        Shape::Sticker { kind, .. } => kind.hash(&mut h),
+        Shape::Image { img, .. } => (std::sync::Arc::as_ptr(img) as usize).hash(&mut h),
+        Shape::Magnify { zoom, .. } => f(*zoom).hash(&mut h),
+        _ => {}
+    }
+    h.finish()
+}
+
+/// Parts of `a` not covered by `b` (up to four rectangles).
+fn subtract(a: Rect, b: Rect) -> Vec<Rect> {
+    let Some(i) = a.intersect(b) else { return vec![a] };
+    [
+        Rect::from_ltrb(a.x, a.y, a.right(), i.y),
+        Rect::from_ltrb(a.x, i.bottom(), a.right(), a.bottom()),
+        Rect::from_ltrb(a.x, i.y, i.x, i.bottom()),
+        Rect::from_ltrb(i.right(), i.y, a.right(), i.bottom()),
+    ]
+    .into_iter()
+    .filter(|r| !r.is_empty())
+    .collect()
+}
+
+/// Thin strips covering a rectangle's outline (`t` pixels either side of each edge).
+fn edges(r: Rect, t: i32) -> [Rect; 4] {
+    [
+        Rect::new(r.x - t, r.y - t, r.w + 2 * t, 2 * t),
+        Rect::new(r.x - t, r.bottom() - t, r.w + 2 * t, 2 * t),
+        Rect::new(r.x - t, r.y - t, 2 * t, r.h + 2 * t),
+        Rect::new(r.right() - t, r.y - t, 2 * t, r.h + 2 * t),
+    ]
+}
+
+/// Merges rectangles whose union is not much bigger than the pair, to avoid
+/// restoring overlapping areas twice without inflating small, distant ones.
+fn merge_rects(mut v: Vec<Rect>) -> Vec<Rect> {
+    v.retain(|r| !r.is_empty());
+    let mut merged = true;
+    while merged && v.len() > 1 {
+        merged = false;
+        'outer: for i in 0..v.len() {
+            for j in i + 1..v.len() {
+                let u = v[i].union(v[j]);
+                if u.area() * 10 <= (v[i].area() + v[j].area()) * 12 {
+                    v[i] = u;
+                    v.swap_remove(j);
+                    merged = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    v
+}
+
 fn draw_caret(pm: &mut PixmapMut, it: &Item, s: f32) {
     let size = it.style.font_size;
     let (x, y, h) = match &it.shape {
@@ -1296,17 +1483,25 @@ impl Handler for Overlay {
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_PAINT => {
-                if self.prev_dirty.is_empty() {
+                if self.first_paint {
                     // First paint: compose everything once.
+                    self.first_paint = false;
                     self.scale = w.dpi_scale();
-                    let full = self.full();
-                    self.compose(full);
-                    self.prev_dirty = self.chrome_bounds();
+                    self.prev_elems = self.elements();
+                    self.prev_frame = self.frame_rect();
+                    self.pending = vec![self.full()];
                 }
-                backbuffer::paint(w.hwnd, self.bb.as_ref());
+                self.compose_pending();
+                backbuffer::paint_region(w.hwnd, self.bb.as_ref());
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)),
+            WM_OVERLAY_TEST_FULL => {
+                // Self-test: recompose everything from scratch (to compare with the incremental frame).
+                self.pending = vec![self.full()];
+                self.compose_pending();
+                Some(LRESULT(1))
+            }
             WM_DPICHANGED => Some(LRESULT(0)), // keep covering the whole virtual screen
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
@@ -1363,6 +1558,7 @@ impl Handler for Overlay {
                     self.annotating = false;
                     self.sel = None;
                     self.items.clear();
+                    self.comp_dirty = true;
                     self.selected = None;
                     self.popup = Popup::None;
                     let (x, y) = self.cursor;

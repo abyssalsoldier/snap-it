@@ -35,9 +35,33 @@ impl Report {
         }
     }
     fn dump(&mut self, h: HWND, name: &str) {
+        send(h, WM_PAINT, 0, 0); // rendering happens at paint time
         let path = self.dir.join(format!("{name}.png"));
         let ok = unsafe { SendMessageW(h, ui::WM_SNAPIT_DUMP, Some(WPARAM(0)), Some(LPARAM(Box::into_raw(Box::new(path.clone())) as isize))) }.0 == 1;
         self.check(&format!("render {name}.png"), ok && path.exists(), "no frame");
+    }
+}
+
+/// Incremental frame must equal a from-scratch recompose (catches stale-pixel bugs).
+fn consistent(r: &mut Report, h: HWND, name: &str) {
+    let a = r.dir.join(format!("_{name}_inc.png"));
+    let b = r.dir.join(format!("_{name}_full.png"));
+    let dump = |p: &PathBuf| {
+        send(h, WM_PAINT, 0, 0);
+        send(h, ui::WM_SNAPIT_DUMP, 0, Box::into_raw(Box::new(p.clone())) as isize);
+    };
+    dump(&a);
+    send(h, crate::ui::overlay::WM_OVERLAY_TEST_FULL, 0, 0);
+    dump(&b);
+    let (pa, pb) = (snapit_gfx::io::load(&a), snapit_gfx::io::load(&b));
+    let diff = match (&pa, &pb) {
+        (Ok(x), Ok(y)) => x.data().as_chunks::<4>().0.iter().zip(y.data().as_chunks::<4>().0.iter()).filter(|(p, q)| p != q).count(),
+        _ => usize::MAX,
+    };
+    r.check(&format!("incremental frame == full redraw ({name})"), diff == 0, &format!("{diff} pixels differ"));
+    if diff == 0 {
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 }
 
@@ -195,6 +219,7 @@ pub fn run(dir: &Path) -> i32 {
     send(ov, WM_MOUSEMOVE, 1, xy(700, 420));
     send(ov, WM_MOUSEMOVE, 1, xy(990, 680));
     r.dump(ov, "02_overlay_dragging");
+    consistent(&mut r, ov, "dragging");
     send(ov, WM_LBUTTONUP, 0, xy(990, 680));
 
     key(ov, b'A');
@@ -223,11 +248,16 @@ pub fn run(dir: &Path) -> i32 {
     key(ov, b'V');
     send(ov, WM_MOUSEMOVE, 0, xy(420, 705)); // hover a toolbar button to show its tooltip
     r.dump(ov, "03_overlay_annotated");
+    consistent(&mut r, ov, "annotated");
 
     // Undo/redo through the toolbar keyboard path (Ctrl isn't held, so use Delete on a selection).
     click(ov, 470, 150); // select the rectangle outline edge region
     key(ov, 0x2E);
     r.dump(ov, "04_overlay_after_delete");
+    consistent(&mut r, ov, "after_delete");
+    // Move the selection with the pointer tool, then undo via right-click reset paths.
+    drag(ov, (500, 600), (560, 640));
+    consistent(&mut r, ov, "moved_selection");
 
     // Open the result in the editor with annotations still editable.
     key(ov, b'E');
@@ -311,6 +341,49 @@ pub fn run(dir: &Path) -> i32 {
         send(q, WM_PAINT, 0, 0);
         r.dump(q, "08_qr_maker");
         send(q, WM_CLOSE, 0, 0);
+    }
+
+    // --- Overlay frame cost on a 4K desktop (mouse move + paint, averaged) ---
+    crate::ui::overlay::set_test_shot(fake_desktop(3840, 2160));
+    crate::ui::overlay::open(crate::ui::overlay::Mode::Region);
+    if let Some(ov) = find("SnapItOverlay") {
+        send(ov, WM_PAINT, 0, 0);
+        let frames = 150;
+        let time = |label: &str, f: &mut dyn FnMut(i32)| {
+            let t = Instant::now();
+            for i in 0..frames {
+                f(i);
+                send(ov, WM_PAINT, 0, 0);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            println!("  {ms:6.2} ms/frame  {label}");
+            ms
+        };
+        let a = time("4K: moving the cursor (magnifier + hover)", &mut |i| {
+            send(ov, WM_MOUSEMOVE, 0, xy(400 + i * 13, 500 + i * 7));
+        });
+        send(ov, WM_LBUTTONDOWN, 1, xy(300, 200));
+        let b = time("4K: dragging out a selection", &mut |i| {
+            send(ov, WM_MOUSEMOVE, 1, xy(600 + i * 18, 400 + i * 10));
+        });
+        send(ov, WM_LBUTTONUP, 0, xy(600 + 149 * 18, 400 + 149 * 10));
+        key(ov, b'D');
+        send(ov, WM_LBUTTONDOWN, 1, xy(800, 800));
+        let c = time("4K: drawing with the pen", &mut |i| {
+            send(ov, WM_MOUSEMOVE, 1, xy(800 + i * 9, 800 + ((i as f32 * 0.3).sin() * 120.0) as i32));
+        });
+        send(ov, WM_LBUTTONUP, 0, xy(2141, 800));
+        key(ov, b'V');
+        send(ov, WM_LBUTTONDOWN, 1, xy(1500, 1300));
+        let d = time("4K: moving the selection", &mut |i| {
+            send(ov, WM_MOUSEMOVE, 1, xy(1500 - i * 2, 1300 - i));
+        });
+        send(ov, WM_LBUTTONUP, 0, xy(1200, 1150));
+        consistent(&mut r, ov, "4k_after_interaction");
+        let worst = a.max(b).max(c).max(d);
+        r.check("4K overlay stays under 16 ms per frame", worst < 16.0, &format!("worst {worst:.1} ms"));
+        key(ov, 0x1B);
+        pump(50);
     }
 
     // --- Settings: build every control, then Save without changes ---

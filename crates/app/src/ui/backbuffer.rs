@@ -81,6 +81,49 @@ impl Drop for Backbuffer {
     }
 }
 
+/// Handles WM_PAINT by blitting only the rectangles of the update region (not its
+/// bounding box), so two small changes far apart don't copy the space between them.
+pub fn paint_region(hwnd: windows::Win32::Foundation::HWND, bb: Option<&Backbuffer>) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateRectRgn, DeleteObject, EndPaint, GetRegionData, GetUpdateRgn, PAINTSTRUCT, RGNDATA, RGNDATAHEADER,
+    };
+    unsafe {
+        let mut rects: Vec<Rect> = Vec::new();
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        if GetUpdateRgn(hwnd, rgn, false).0 > 1 {
+            let size = GetRegionData(rgn, 0, None);
+            if size as usize >= std::mem::size_of::<RGNDATAHEADER>() {
+                let mut buf = vec![0u8; size as usize];
+                if GetRegionData(rgn, size, Some(buf.as_mut_ptr() as *mut RGNDATA)) == size {
+                    let hdr = &*(buf.as_ptr() as *const RGNDATAHEADER);
+                    let n = hdr.nCount as usize;
+                    if n <= 256 {
+                        let first = buf.as_ptr().add(hdr.dwSize as usize) as *const RECT;
+                        for i in 0..n {
+                            let r = *first.add(i);
+                            rects.push(Rect::from_ltrb(r.left, r.top, r.right, r.bottom));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = DeleteObject(rgn.into());
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if let Some(bb) = bb {
+            if rects.is_empty() {
+                let r = ps.rcPaint;
+                rects.push(Rect::from_ltrb(r.left, r.top, r.right, r.bottom));
+            }
+            for r in rects {
+                bb.present(hdc, r);
+            }
+        }
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
 /// Handles WM_PAINT by blitting the dirty part of `bb`.
 pub fn paint(hwnd: windows::Win32::Foundation::HWND, bb: Option<&Backbuffer>) {
     use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
