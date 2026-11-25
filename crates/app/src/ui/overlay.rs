@@ -116,6 +116,8 @@ struct Overlay {
     bb: Option<Backbuffer>,
     wins: Vec<cap::WindowInfo>,
     mons: Vec<Rect>,
+    /// Each monitor's work area (without the taskbar), same order as `mons`.
+    works: Vec<Rect>,
     scale: f32,
     cursor: (i32, i32),
     annotating: bool,
@@ -207,7 +209,9 @@ pub fn open(mode: Mode) {
     } else {
         Vec::new()
     };
-    let mons: Vec<Rect> = cap::monitors().into_iter().map(|m| to_client(m.rect)).collect();
+    let monitors = cap::monitors();
+    let mons: Vec<Rect> = monitors.iter().map(|m| to_client(m.rect)).collect();
+    let works: Vec<Rect> = monitors.iter().map(|m| to_client(m.work)).collect();
     let dim = if mode.dims() { dimmed(&shot, s.region.dim_opacity) } else { shot.clone() };
     let a = &s.annotate;
     let style = Style { color: a.color, width: a.width, font_size: a.font_size, ..Style::default() };
@@ -223,6 +227,7 @@ pub fn open(mode: Mode) {
         dim,
         wins,
         mons,
+        works,
         scale: 1.0,
         cursor,
         annotating: false,
@@ -301,6 +306,8 @@ const QUICK_BTN: f32 = 42.0;
 /// Padding around the options strip inside its panel (unscaled).
 const OPT_PAD_X: f32 = 10.0;
 const OPT_PAD_Y: f32 = 6.0;
+/// Gap between the toolbar and the options panel (unscaled).
+const OPT_GAP: f32 = 6.0;
 
 /// Two rows: drawing tools on top, style and actions underneath.
 fn tool_buttons() -> Vec<toolbar::Button<Btn>> {
@@ -452,21 +459,37 @@ impl Overlay {
 
     // ---------- selection & toolbar ----------
 
+    /// The monitor's work area (without the taskbar) at a point, so the toolbar and
+    /// options strip are never hidden behind it.
+    fn work_at(&self, x: i32, y: i32) -> Rect {
+        let i = self.mons.iter().position(|m| m.contains(x, y)).unwrap_or(0);
+        self.works.get(i).copied().filter(|w| w.w > 0 && w.h > 0).unwrap_or_else(|| self.monitor_at(x, y))
+    }
+
+    /// Height (with its gap) kept free beside the toolbar for the options strip.
+    fn panel_room(&self) -> f32 {
+        (28.0 + OPT_PAD_Y * 2.0 + OPT_GAP) * self.scale
+    }
+
     fn place_toolbar(&mut self) {
         let Some(sel) = self.sel else { return };
         let (cx, cy) = sel.center();
-        let mon = self.monitor_at(cx, cy);
+        let work = self.work_at(cx, cy);
         let (w, h) = self.bar.size();
         let gap = 8.0 * self.scale;
-        let x = (cx as f32 - w / 2.0).clamp(mon.x as f32 + 4.0, (mon.right() as f32 - w - 4.0).max(mon.x as f32));
+        let room = self.panel_room();
+        let (top, bottom) = (work.y as f32 + 4.0, work.bottom() as f32 - 4.0);
+        let x = (cx as f32 - w / 2.0).clamp(work.x as f32 + 4.0, (work.right() as f32 - w - 4.0).max(work.x as f32));
+        // Below the selection with the strip under it, else above with the strip over
+        // it, else inside the selection's bottom edge with the strip above.
         let below = sel.bottom() as f32 + gap;
         let above = sel.y as f32 - gap - h;
-        let y = if below + h <= mon.bottom() as f32 - 30.0 * self.scale {
+        let y = if below + h + room <= bottom {
             below
-        } else if above >= mon.y as f32 + 4.0 {
+        } else if above - room >= top {
             above
         } else {
-            sel.bottom() as f32 - h - gap
+            (sel.bottom() as f32 - h - gap).min(bottom - h).max(top + room)
         };
         self.bar.x = x;
         self.bar.y = y;
@@ -475,9 +498,9 @@ impl Overlay {
     fn popup_origin(&self) -> (f32, f32) {
         let r = self.bar.rect();
         let below = r.bottom() as f32 + 6.0 * self.scale;
-        let mon = self.monitor_at(r.x, r.y);
+        let work = self.work_at(r.x, r.y);
         let ph = 90.0 * self.scale;
-        if below + ph < mon.bottom() as f32 { (r.x as f32, below) } else { (r.x as f32, r.y as f32 - ph - 6.0 * self.scale) }
+        if below + ph < work.bottom() as f32 { (r.x as f32, below) } else { (r.x as f32, r.y as f32 - ph - 6.0 * self.scale) }
     }
 
     /// The tool whose options the strip shows: the selected item's, else the current
@@ -487,8 +510,8 @@ impl Overlay {
         (!options_for(t).is_empty()).then_some(t)
     }
 
-    /// The panel holding the options strip, beside the toolbar on the side away from
-    /// the selection (or wherever it fits on the monitor).
+    /// The panel holding the options strip: under the toolbar when the toolbar is
+    /// below the selection and there is room, otherwise over it. Always on screen.
     fn options_panel(&self) -> Option<Rect> {
         if !self.annotating {
             return None;
@@ -498,14 +521,21 @@ impl Overlay {
         let strip = OptionsBar { x: 0.0, y: 0.0, scale: s, tool: Some(tool), hover: None }.width();
         let (w, h) = (strip + OPT_PAD_X * 2.0 * s, (28.0 + OPT_PAD_Y * 2.0) * s);
         let bar = self.bar.rect();
-        let mon = self.monitor_at(bar.x, bar.y);
-        let gap = 6.0 * s;
+        let work = self.work_at(bar.x, bar.y);
+        let gap = OPT_GAP * s;
+        let (top, bottom) = (work.y as f32 + 4.0, work.bottom() as f32 - 4.0);
         let below = bar.bottom() as f32 + gap;
         let above = bar.y as f32 - gap - h;
-        let bar_above_sel = self.sel.is_some_and(|sel| bar.bottom() <= sel.y);
-        let fits_below = below + h <= mon.bottom() as f32 - 4.0;
-        let y = if (bar_above_sel || !fits_below) && above >= mon.y as f32 + 4.0 { above } else { below };
-        let x = (bar.x as f32).clamp(mon.x as f32 + 4.0, (mon.right() as f32 - w - 4.0).max(mon.x as f32));
+        let bar_below_sel = self.sel.is_none_or(|sel| bar.y >= sel.bottom());
+        let y = if bar_below_sel && below + h <= bottom {
+            below
+        } else if above >= top {
+            above
+        } else {
+            below
+        };
+        let y = y.min(bottom - h).max(top);
+        let x = (bar.x as f32).clamp(work.x as f32 + 4.0, (work.right() as f32 - w - 4.0).max(work.x as f32));
         Some(Rect::new(x as i32, y as i32, w.ceil() as i32, h.ceil() as i32))
     }
 
@@ -606,7 +636,7 @@ impl Overlay {
             current: self.values().swatch(o),
         };
         let above = self.options_panel().is_some_and(|pr| pr.bottom() <= self.bar.rect().y);
-        let mon = self.monitor_at(r.x, r.y);
+        let mon = self.work_at(r.x, r.y);
         if above || p.rect().bottom() > mon.bottom() {
             p.y = r.y as f32 - 10.0 * s - p.rect().h as f32;
         }
@@ -1605,7 +1635,7 @@ fn item_sig(it: &Item) -> u64 {
     std::mem::discriminant(&it.shape).hash(&mut h);
     match &it.shape {
         Shape::Line(a, b) | Shape::Arrow(a, b) => (f(a.x), f(a.y), f(b.x), f(b.y)).hash(&mut h),
-        Shape::Pen(p) => {
+        Shape::Pen(p) | Shape::FreeArrow(p) => {
             p.len().hash(&mut h);
             if let Some(l) = p.last() {
                 (f(l.x), f(l.y)).hash(&mut h);

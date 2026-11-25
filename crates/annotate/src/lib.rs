@@ -234,6 +234,8 @@ pub enum Shape {
     Line(PointF, PointF),
     Arrow(PointF, PointF),
     Pen(Vec<PointF>),
+    /// A freehand stroke with arrow heads (`Style::heads`) that follow the path at its ends.
+    FreeArrow(Vec<PointF>),
     Highlight(Bx),
     Blur(Bx),
     Pixelate(Bx),
@@ -338,7 +340,7 @@ impl Item {
             Shape::Rect(_) => Tool::Rect,
             Shape::Ellipse(_) => Tool::Ellipse,
             Shape::Line(..) => Tool::Line,
-            Shape::Arrow(..) => Tool::Arrow,
+            Shape::Arrow(..) | Shape::FreeArrow(_) => Tool::Arrow,
             Shape::Pen(_) => Tool::Pen,
             Shape::Highlight(_) => Tool::Highlight,
             Shape::Blur(_) => Tool::Blur,
@@ -393,7 +395,7 @@ impl Item {
                 *tail = PointF::new(n.x0 + n.w() * 0.25, n.y1 + (n.h() * 0.5).clamp(16.0, 48.0));
             }
             Shape::Line(_, b) | Shape::Arrow(_, b) => *b = snap(p),
-            Shape::Pen(pts) => {
+            Shape::Pen(pts) | Shape::FreeArrow(pts) => {
                 if pts.last().is_none_or(|l| l.dist(p) >= 1.5) {
                     pts.push(p);
                 }
@@ -410,6 +412,7 @@ impl Item {
             Shape::Magnify { r, .. } | Shape::Sticker { r, .. } | Shape::Image { r, .. } | Shape::Spotlight { r, .. } => r.w() < 6.0 || r.h() < 6.0,
             Shape::Line(a, b) | Shape::Arrow(a, b) => a.dist(*b) < 4.0,
             Shape::Pen(p) => p.len() < 2,
+            Shape::FreeArrow(p) => p.len() < 2 || path_len(p) < 4.0,
             Shape::Text { text, .. } => text.trim().is_empty(),
             Shape::Balloon { .. } | Shape::Step { .. } => false,
         }
@@ -448,7 +451,7 @@ impl Item {
                 mv(a);
                 mv(b);
             }
-            Shape::Pen(pts) => pts.iter_mut().for_each(mv),
+            Shape::Pen(pts) | Shape::FreeArrow(pts) => pts.iter_mut().for_each(mv),
             Shape::Step { at, .. } | Shape::Text { at, .. } => mv(at),
         }
     }
@@ -468,7 +471,7 @@ impl Item {
     fn casts_shadow(&self) -> bool {
         matches!(
             self.shape,
-            Shape::Rect(_) | Shape::Ellipse(_) | Shape::Line(..) | Shape::Arrow(..) | Shape::Pen(_) | Shape::Step { .. } | Shape::Text { .. } | Shape::Balloon { .. } | Shape::Magnify { .. }
+            Shape::Rect(_) | Shape::Ellipse(_) | Shape::Line(..) | Shape::Arrow(..) | Shape::Pen(_) | Shape::FreeArrow(_) | Shape::Step { .. } | Shape::Text { .. } | Shape::Balloon { .. } | Shape::Magnify { .. }
         )
     }
 
@@ -497,12 +500,13 @@ impl Item {
             Shape::Spotlight { .. } => Bx { x0: -EVERYWHERE, y0: -EVERYWHERE, x1: EVERYWHERE, y1: EVERYWHERE },
             Shape::Line(a, b) => grow(Bx::new(*a, *b), w),
             Shape::Arrow(a, b) => grow(Bx::new(*a, *b), w * 4.0 + 12.0),
-            Shape::Pen(pts) => {
+            Shape::Pen(pts) | Shape::FreeArrow(pts) => {
                 let mut b = Bx::new(pts[0], pts[0]).norm();
                 for p in pts {
                     b = Bx { x0: b.x0.min(p.x), y0: b.y0.min(p.y), x1: b.x1.max(p.x), y1: b.y1.max(p.y) };
                 }
-                grow(b, w)
+                // Arrow heads stick out sideways from the ends.
+                grow(b, if matches!(self.shape, Shape::FreeArrow(_)) { w * 4.0 + 12.0 } else { w })
             }
             Shape::Step { at, .. } => {
                 let r = self.step_radius() + 2.0;
@@ -526,7 +530,7 @@ impl Item {
         let tol = self.style.width / 2.0 + 5.0;
         match &self.shape {
             Shape::Line(a, b) | Shape::Arrow(a, b) => seg_dist(p, *a, *b) <= tol,
-            Shape::Pen(pts) => pts.windows(2).any(|s| seg_dist(p, s[0], s[1]) <= tol) || pts[0].dist(p) <= tol,
+            Shape::Pen(pts) | Shape::FreeArrow(pts) => pts.windows(2).any(|s| seg_dist(p, s[0], s[1]) <= tol) || pts[0].dist(p) <= tol,
             Shape::Rect(b) if !self.style.fill => {
                 // Outline rectangles are hit only near their edges.
                 let n = b.norm();
@@ -678,22 +682,11 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
         }
         Shape::Arrow(a, b) => draw_arrow(pm, *a, *b, st, t),
         Shape::Pen(pts) => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(pts[0].x, pts[0].y);
-            if pts.len() == 1 {
-                pb.line_to(pts[0].x + 0.1, pts[0].y);
-            }
-            for w in pts.windows(2).skip(1) {
-                let mid = PointF::new((w[0].x + w[1].x) / 2.0, (w[0].y + w[1].y) / 2.0);
-                pb.quad_to(w[0].x, w[0].y, mid.x, mid.y);
-            }
-            if let Some(l) = pts.last() {
-                pb.line_to(l.x, l.y);
-            }
-            if let Some(p) = pb.finish() {
+            if let Some(p) = smooth_path(pts) {
                 pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
             }
         }
+        Shape::FreeArrow(pts) => draw_free_arrow(pm, pts, st, t),
         Shape::Highlight(b) => {
             if let Some(r) = b.skia() {
                 let mut p = st.color.paint();
@@ -780,6 +773,89 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
     }
 }
 
+/// A pen-style path through `pts`, smoothed with quadratic curves between midpoints.
+fn smooth_path(pts: &[PointF]) -> Option<snapit_gfx::tiny_skia::Path> {
+    let first = pts.first()?;
+    let mut pb = PathBuilder::new();
+    pb.move_to(first.x, first.y);
+    if pts.len() == 1 {
+        pb.line_to(first.x + 0.1, first.y);
+    }
+    for w in pts.windows(2).skip(1) {
+        let mid = PointF::new((w[0].x + w[1].x) / 2.0, (w[0].y + w[1].y) / 2.0);
+        pb.quad_to(w[0].x, w[0].y, mid.x, mid.y);
+    }
+    if let Some(l) = pts.last() {
+        pb.line_to(l.x, l.y);
+    }
+    pb.finish()
+}
+
+/// Total length of a polyline.
+fn path_len(pts: &[PointF]) -> f32 {
+    pts.windows(2).map(|w| w[0].dist(w[1])).sum()
+}
+
+/// The point `d` along a polyline from its start (clamped to its ends).
+fn point_along(pts: &[PointF], d: f32) -> PointF {
+    let mut left = d.max(0.0);
+    for w in pts.windows(2) {
+        let l = w[0].dist(w[1]);
+        if l > 0.0 && l >= left {
+            let k = left / l;
+            return PointF::new(w[0].x + (w[1].x - w[0].x) * k, w[0].y + (w[1].y - w[0].y) * k);
+        }
+        left -= l;
+    }
+    pts.last().copied().unwrap_or(PointF::new(0.0, 0.0))
+}
+
+/// The part of a polyline between distances `a` and `b` from its start.
+fn sub_path(pts: &[PointF], a: f32, b: f32) -> Vec<PointF> {
+    let mut out = vec![point_along(pts, a)];
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        acc += w[0].dist(w[1]);
+        if acc > a && acc < b {
+            out.push(w[1]);
+        }
+    }
+    out.push(point_along(pts, b));
+    out
+}
+
+/// Which ends get a head: (start, end).
+fn head_ends(h: ArrowHeads) -> (bool, bool) {
+    match h {
+        ArrowHeads::End => (false, true),
+        ArrowHeads::Start => (true, false),
+        ArrowHeads::Both => (true, true),
+    }
+}
+
+/// Head length for an arrow of `len` with `st`'s width and heads.
+fn head_size(st: &Style, len: f32) -> f32 {
+    let (a, b) = head_ends(st.heads);
+    let heads = if a && b { 2.0 } else { 1.0 };
+    (st.width * 3.5 + 8.0).min(len * 0.6 / heads)
+}
+
+/// A filled arrow head with its tip at `tip`, pointing along the unit vector (ux, uy).
+fn draw_head(pm: &mut PixmapMut, tip: PointF, ux: f32, uy: f32, head: f32, paint: &Paint, t: Transform) {
+    let half = head * 0.6;
+    let base = PointF::new(tip.x - ux * head, tip.y - uy * head);
+    let mut pb = PathBuilder::new();
+    pb.move_to(tip.x, tip.y);
+    pb.line_to(base.x - uy * half, base.y + ux * half);
+    pb.line_to(base.x + uy * half, base.y - ux * half);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, paint, FillRule::Winding, t, None);
+        let s = Stroke { width: 1.5, line_join: LineJoin::Round, ..Default::default() };
+        pm.stroke_path(&p, paint, &s, t, None);
+    }
+}
+
 fn draw_arrow(pm: &mut PixmapMut, a: PointF, b: PointF, st: &Style, t: Transform) {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
     let len = (dx * dx + dy * dy).sqrt();
@@ -787,14 +863,8 @@ fn draw_arrow(pm: &mut PixmapMut, a: PointF, b: PointF, st: &Style, t: Transform
         return;
     }
     let (ux, uy) = (dx / len, dy / len);
-    let (at_start, at_end) = match st.heads {
-        ArrowHeads::End => (false, true),
-        ArrowHeads::Start => (true, false),
-        ArrowHeads::Both => (true, true),
-    };
-    let heads = if at_start && at_end { 2.0 } else { 1.0 };
-    let head = (st.width * 3.5 + 8.0).min(len * 0.6 / heads);
-    let half = head * 0.6;
+    let (at_start, at_end) = head_ends(st.heads);
+    let head = head_size(st, len);
     let paint = st.color.paint();
     // The shaft stops inside each head so its round cap does not poke out of the tip.
     let s0 = if at_start { PointF::new(a.x + ux * head * 0.7, a.y + uy * head * 0.7) } else { a };
@@ -805,24 +875,46 @@ fn draw_arrow(pm: &mut PixmapMut, a: PointF, b: PointF, st: &Style, t: Transform
     if let Some(p) = pb.finish() {
         pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
     }
-    let mut draw_head = |tip: PointF, ux: f32, uy: f32| {
-        let base = PointF::new(tip.x - ux * head, tip.y - uy * head);
-        let mut pb = PathBuilder::new();
-        pb.move_to(tip.x, tip.y);
-        pb.line_to(base.x - uy * half, base.y + ux * half);
-        pb.line_to(base.x + uy * half, base.y - ux * half);
-        pb.close();
-        if let Some(p) = pb.finish() {
-            pm.fill_path(&p, &paint, FillRule::Winding, t, None);
-            let s = Stroke { width: 1.5, line_join: LineJoin::Round, ..Default::default() };
-            pm.stroke_path(&p, &paint, &s, t, None);
-        }
-    };
     if at_end {
-        draw_head(b, ux, uy);
+        draw_head(pm, b, ux, uy, head, &paint, t);
     }
     if at_start {
-        draw_head(a, -ux, -uy);
+        draw_head(pm, a, -ux, -uy, head, &paint, t);
+    }
+}
+
+/// A freehand arrow: the smoothed stroke, with heads aimed along the path's last
+/// (or first) stretch of about one head length, so a wobble at the very end does
+/// not swing the head around.
+fn draw_free_arrow(pm: &mut PixmapMut, pts: &[PointF], st: &Style, t: Transform) {
+    let len = path_len(pts);
+    if pts.len() < 2 || len < 1.0 {
+        return;
+    }
+    let (at_start, at_end) = head_ends(st.heads);
+    let head = head_size(st, len);
+    let paint = st.color.paint();
+    let trim = head * 0.7;
+    let shaft = sub_path(pts, if at_start { trim } else { 0.0 }, if at_end { len - trim } else { len });
+    if let Some(p) = smooth_path(&shaft) {
+        pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
+    }
+    let aim = |tip: PointF, from: PointF| {
+        let (dx, dy) = (tip.x - from.x, tip.y - from.y);
+        let l = (dx * dx + dy * dy).sqrt();
+        (l > 0.01).then(|| (dx / l, dy / l))
+    };
+    if at_end {
+        let tip = pts[pts.len() - 1];
+        if let Some((ux, uy)) = aim(tip, point_along(pts, len - head)) {
+            draw_head(pm, tip, ux, uy, head, &paint, t);
+        }
+    }
+    if at_start {
+        let tip = pts[0];
+        if let Some((ux, uy)) = aim(tip, point_along(pts, head)) {
+            draw_head(pm, tip, ux, uy, head, &paint, t);
+        }
     }
 }
 
@@ -1034,6 +1126,30 @@ mod tests {
         assert_eq!(pixel_at(&pm, 34, 65), Some(Rgba::RED));
         assert_eq!(pixel_at(&pm, 166, 65), Some(Rgba::RED));
         assert_eq!(pixel_at(&pm, 100, 65), Some(Rgba::WHITE));
+    }
+
+    #[test]
+    fn freehand_arrow_heads_follow_the_path() {
+        let st = Style { heads: ArrowHeads::Both, width: 3.0, ..Style::default() };
+        let s = PointF::new(20.0, 30.0);
+        let mut it = Item { shape: Shape::FreeArrow(vec![s]), style: st };
+        // Right along y = 30, then down along x = 100.
+        for i in 1..=8 {
+            it.drag(s, PointF::new(20.0 + i as f32 * 10.0, 30.0), false);
+        }
+        for i in 1..=7 {
+            it.drag(s, PointF::new(100.0, 30.0 + i as f32 * 10.0), false);
+        }
+        assert_eq!(it.tool(), Some(Tool::Arrow));
+        assert!(!it.is_degenerate());
+        let mut pm = canvas();
+        render(&mut pm.as_mut(), std::slice::from_ref(&it), 0.0, 0.0);
+        // The start head points left (wide in y), the end head points down (wide in x).
+        assert_eq!(pixel_at(&pm, 34, 36), Some(Rgba::RED));
+        assert_eq!(pixel_at(&pm, 106, 86), Some(Rgba::RED));
+        assert_eq!(pixel_at(&pm, 60, 36), Some(Rgba::WHITE));
+        let b = it.bounds();
+        assert!(b.x1 >= 108.0 && b.y0 <= 22.0);
     }
 
     #[test]

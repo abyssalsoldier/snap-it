@@ -29,6 +29,8 @@ pub enum Opt {
     Heads,
     StepType,
     SpotShape,
+    /// Arrow path: straight or freehand.
+    ArrowPath,
     Shadow,
     Background,
 }
@@ -40,7 +42,7 @@ pub fn options_for(tool: Tool) -> &'static [Opt] {
         Tool::Rect => &[Color, Width, FillColor, Radius, Dash, Shadow],
         Tool::Ellipse => &[Color, Width, FillColor, Dash, Shadow],
         Tool::Line | Tool::Pen => &[Color, Width, Dash, Shadow],
-        Tool::Arrow => &[Color, Width, Heads, Dash, Shadow],
+        Tool::Arrow => &[Color, Width, ArrowPath, Heads, Dash, Shadow],
         Tool::Highlight => &[Highlight],
         Tool::Text => &[Color, FontSize, Background, Shadow],
         Tool::Balloon => &[Color, FontSize, Shadow],
@@ -78,6 +80,7 @@ fn label(o: Opt, tool: Tool) -> &'static str {
         Opt::Heads => "Heads",
         Opt::StepType => "Type",
         Opt::SpotShape => "Shape",
+        Opt::ArrowPath => "Path",
         Opt::Shadow => "Shadow",
         Opt::Background => "Background",
     }
@@ -142,6 +145,7 @@ impl Values {
             Opt::Heads => ArrowHeads::ALL.iter().position(|h| *h == self.opts.heads).unwrap_or(0),
             Opt::StepType => StepType::ALL.iter().position(|s| *s == self.opts.step_type).unwrap_or(0),
             Opt::SpotShape => self.opts.spot_ellipse as usize,
+            Opt::ArrowPath => self.opts.arrow_freehand as usize,
             _ => 0,
         }
     }
@@ -196,6 +200,7 @@ impl Values {
             Opt::Heads => self.opts.heads = ArrowHeads::ALL[i.min(ArrowHeads::ALL.len() - 1)],
             Opt::StepType => self.opts.step_type = StepType::ALL[i.min(StepType::ALL.len() - 1)],
             Opt::SpotShape => self.opts.spot_ellipse = i == 1,
+            Opt::ArrowPath => self.opts.arrow_freehand = i == 1,
             _ => {}
         }
     }
@@ -263,6 +268,10 @@ impl Values {
         match &mut it.shape {
             Shape::Magnify { zoom, .. } => *zoom = self.opts.zoom,
             Shape::Spotlight { ellipse, .. } => *ellipse = self.opts.spot_ellipse,
+            Shape::Arrow(a, _) if self.opts.arrow_freehand => {
+                let start = *a;
+                it.shape = Shape::FreeArrow(vec![start]);
+            }
             _ => {}
         }
     }
@@ -301,6 +310,11 @@ impl Values {
                 o.step_type = st.step_type;
                 if let Shape::Magnify { zoom, .. } = shape {
                     o.zoom = *zoom;
+                }
+                match shape {
+                    Shape::Arrow(..) => o.arrow_freehand = false,
+                    Shape::FreeArrow(_) => o.arrow_freehand = true,
+                    _ => {}
                 }
             }
         }
@@ -347,6 +361,18 @@ impl Values {
                     *ellipse = opts.spot_ellipse;
                 }
             }
+            Opt::ArrowPath => {
+                // Switching keeps the ends: a straight arrow becomes a two-point path,
+                // a freehand one is straightened between its ends.
+                let shape = match &it.shape {
+                    Shape::Arrow(a, b) if opts.arrow_freehand => Some(Shape::FreeArrow(vec![*a, *b])),
+                    Shape::FreeArrow(p) if !opts.arrow_freehand && p.len() >= 2 => Some(Shape::Arrow(p[0], p[p.len() - 1])),
+                    _ => None,
+                };
+                if let Some(s) = shape {
+                    it.shape = s;
+                }
+            }
         }
     }
 }
@@ -370,7 +396,7 @@ fn choice_count(o: Opt) -> usize {
         Opt::Dash => Dash::ALL.len(),
         Opt::Heads => ArrowHeads::ALL.len(),
         Opt::StepType => StepType::ALL.len(),
-        Opt::SpotShape => 2,
+        Opt::SpotShape | Opt::ArrowPath => 2,
         _ => 0,
     }
 }
@@ -381,6 +407,7 @@ fn choice_name(o: Opt, i: usize) -> &'static str {
         Opt::Heads => ArrowHeads::ALL[i].name(),
         Opt::StepType => StepType::ALL[i].name(),
         Opt::SpotShape => ["Rectangle", "Ellipse"][i],
+        Opt::ArrowPath => ["Straight", "Freehand"][i],
         _ => "",
     }
 }
@@ -438,7 +465,7 @@ impl OptionsBar {
             x += LGAP * s;
             match o {
                 Opt::Color | Opt::FillColor | Opt::Highlight => push(&mut x, h, Part::Swatch(o)),
-                Opt::Dash | Opt::Heads | Opt::StepType | Opt::SpotShape => {
+                Opt::Dash | Opt::Heads | Opt::StepType | Opt::SpotShape | Opt::ArrowPath => {
                     for i in 0..choice_count(o) {
                         push(&mut x, SEG * s, Part::Seg(o, i));
                     }
@@ -665,6 +692,24 @@ fn draw_choice(pm: &mut PixmapMut, o: Opt, n: usize, r: &Rect, c: Rgba, s: f32) 
             let size = FONT * s;
             let l = text::layout(txt, size, true);
             text::draw(pm, txt, cx - l.width / 2.0, cy - l.height / 2.0, size, true, c, None);
+        }
+        Opt::ArrowPath => {
+            // A straight shaft, or a wavy one, with a head at the right.
+            let (x0, x1) = (cx - half, cx + half - 3.0 * s);
+            let mut pb = PathBuilder::new();
+            pb.move_to(x0, cy);
+            if n == 1 {
+                let q = (x1 - x0) / 4.0;
+                pb.quad_to(x0 + q, cy - 5.0 * s, x0 + q * 2.0, cy);
+                pb.quad_to(x0 + q * 3.0, cy + 5.0 * s, x1, cy);
+            } else {
+                pb.line_to(x1, cy);
+            }
+            if let Some(p) = pb.finish() {
+                let st = Stroke { width: 2.0 * s, line_cap: LineCap::Round, ..Default::default() };
+                pm.stroke_path(&p, &c.paint(), &st, id, None);
+            }
+            head(pm, cx + half, 1.0);
         }
         Opt::SpotShape => {
             let (w, h) = (r.w as f32 * 0.55, r.h as f32 * 0.42);

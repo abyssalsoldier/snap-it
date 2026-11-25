@@ -256,7 +256,7 @@ pub fn run(dir: &Path) -> i32 {
     r.dump(ov, "04_overlay_after_delete");
     consistent(&mut r, ov, "after_delete");
     // A drawing tool shows its options strip beside the quick-edit toolbar.
-    key(ov, b'R');
+    key(ov, b'A');
     r.dump(ov, "04b_overlay_tool_options");
     consistent(&mut r, ov, "tool_options");
     key(ov, b'V');

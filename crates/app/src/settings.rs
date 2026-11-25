@@ -99,6 +99,8 @@ pub struct ToolOptions {
     /// Spotlight dim, percent.
     pub spot_dim: f32,
     pub spot_ellipse: bool,
+    /// The arrow tool draws freehand paths instead of straight lines.
+    pub arrow_freehand: bool,
 }
 
 impl Default for ToolOptions {
@@ -117,6 +119,7 @@ impl Default for ToolOptions {
             zoom: 2.0,
             spot_dim: snapit_annotate::SPOTLIGHT_DIM as f32,
             spot_ellipse: false,
+            arrow_freehand: false,
         }
     }
 }
