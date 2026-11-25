@@ -18,6 +18,7 @@ use snapit_gfx::{blit_rect, io, pixel_at, text, PointF, Rect, Rgba};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, LoadCursorW,
     PostMessageW, SetCursor, SetForegroundWindow, SetWindowTextW, TrackPopupMenu,
@@ -25,10 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_POPUP, MF_SEPARATOR, MF_STRING, MINMAXINFO, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
     WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
-    WS_OVERLAPPEDWINDOW,
+    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZE,
+    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
+use super::chrome::Chrome;
 use super::dialogs::{self, Answer};
 use super::icons::Icon;
 use super::theme::{self, Theme};
@@ -41,6 +43,8 @@ use crate::app::{self, Command};
 pub const WM_EDITOR_INSERT: u32 = WM_APP + 20;
 /// Self-test: save the current image (same as the Save button).
 pub const WM_EDITOR_TEST_SAVE: u32 = WM_APP + 21;
+/// Self-test: returns the canvas size as `(width << 16) | height`.
+pub const WM_EDITOR_TEST_SIZE: u32 = WM_APP + 22;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -94,6 +98,7 @@ struct Editor {
     id: u64,
     theme: Theme,
     scale: f32,
+    chrome: Chrome,
     base: Rc<Pixmap>,
     items: Vec<Item>,
     history: History<Snapshot>,
@@ -129,22 +134,44 @@ struct Editor {
     space: bool,
     /// Highlighter colour (separate from the pen colour).
     marker: Rgba,
+    /// The blank canvas this editor was opened with. While `base` is still this exact
+    /// image (compared by pointer, so undo back to it counts) and nothing is drawn, the
+    /// first pasted or opened image replaces the canvas instead of being inserted.
+    blank: Option<Rc<Pixmap>>,
 }
+
+/// Size of the canvas when the editor is opened without an image.
+const BLANK_SIZE: (u32, u32) = (1280, 720);
 
 pub fn open(image: Pixmap, path: Option<PathBuf>) {
     open_with(image, path, Vec::new());
 }
 
 pub fn open_with(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>) {
+    create(image, path, items, false);
+}
+
+/// Opens the editor on a blank white canvas. Pasting (Ctrl+V) or opening (Ctrl+O, Image menu)
+/// an image while the canvas is untouched resizes the canvas to that image.
+pub fn open_blank() {
+    let Some(mut pm) = Pixmap::new(BLANK_SIZE.0, BLANK_SIZE.1) else { return };
+    pm.fill(Rgba::WHITE.color());
+    create(pm, None, Vec::new(), true);
+}
+
+fn create(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>, blank: bool) {
     let s = app::settings();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let style = Style { color: s.annotate.color, width: s.annotate.width, font_size: s.annotate.font_size, ..Style::default() };
     let (iw, ih) = (image.width() as i32, image.height() as i32);
+    let base = Rc::new(image);
     let ed = Editor {
         id,
         theme: theme::current(),
         scale: 1.0,
-        base: Rc::new(image),
+        chrome: Chrome::new(true, true, true),
+        blank: blank.then(|| base.clone()),
+        base,
         dirty: !items.is_empty(),
         items,
         history: History::new(),
@@ -195,19 +222,11 @@ pub fn open_with(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>) {
 
     match super::create("SnapItEditor", WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, "Snap It Editor", r, None, Box::new(ed)) {
         Ok(hwnd) => {
+            Chrome::init(hwnd);
             EDITORS.with(|m| m.borrow_mut().insert(id, hwnd.0 as isize));
             super::show(hwnd, true);
         }
         Err(e) => crate::log(&format!("editor: {e}")),
-    }
-}
-
-pub fn open_from_file_or_clipboard() {
-    if let Some(p) = dialogs::open_image(None) {
-        match io::load(&p) {
-            Ok(img) => open(img, Some(p)),
-            Err(e) => dialogs::info(None, "Snap It", &format!("Could not open the image.\n{e}")),
-        }
     }
 }
 
@@ -307,8 +326,12 @@ impl Editor {
         self.scale
     }
 
+    fn title_h(&self) -> i32 {
+        self.chrome.height(self.s())
+    }
+
     fn top_h(&self) -> i32 {
-        ((46.0 + if self.opts_row2 { OPT_ROW_H } else { 0.0 }) * self.s()) as i32
+        self.title_h() + ((48.0 + if self.opts_row2 { OPT_ROW_H } else { 0.0 }) * self.s()) as i32
     }
 
     /// The tool whose options the strip shows: the selected item's, else the current tool's.
@@ -324,8 +347,9 @@ impl Editor {
 
     fn options_bar(&self) -> OptionsBar {
         let s = self.s();
+        let ty = self.title_h() as f32;
         let (x, y) = if self.opts_row2 {
-            (14.0 * s, (46.0 + (OPT_ROW_H - 28.0) / 2.0 - 2.0) * s)
+            (14.0 * s, ty + (48.0 + (OPT_ROW_H - 28.0) / 2.0 - 2.0) * s)
         } else {
             (self.top.rect().right() as f32 + 20.0 * s, self.top.y + (self.top.size().1 - 28.0 * s) / 2.0)
         };
@@ -359,7 +383,7 @@ impl Editor {
         let s = self.s();
         self.top.scale = s;
         self.top.x = 8.0 * s;
-        self.top.y = 3.0 * s;
+        self.top.y = self.title_h() as f32 + 3.0 * s;
         self.opts_row2 = !self.options_fit_inline();
         // Shrink the tool palette if the window is too short for it.
         self.palette.vertical = true;
@@ -560,6 +584,37 @@ impl Editor {
         }
     }
 
+    /// True while the editor still shows its untouched blank canvas.
+    fn is_blank(&self) -> bool {
+        self.items.is_empty() && self.editing.is_none() && self.blank.as_ref().is_some_and(|b| Rc::ptr_eq(b, &self.base))
+    }
+
+    /// Adds an image from the clipboard, a file or the screen. On a blank canvas the image
+    /// becomes the canvas (same size); otherwise it is inserted as a movable item.
+    /// `path` is the file it came from: on a blank canvas that makes Save write back to it.
+    fn place_image(&mut self, img: Pixmap, path: Option<PathBuf>) {
+        if !self.is_blank() {
+            return self.insert_image(img);
+        }
+        let opened_file = path.is_some();
+        self.set_base(img, Vec::new());
+        if opened_file {
+            // Opening a file is not an unsaved change (undo still returns to the blank canvas).
+            self.path = path;
+            self.dirty = false;
+        }
+    }
+
+    /// Ctrl+O: opens an image file here if the canvas is blank, else in a new editor window.
+    fn open_file(&mut self, hwnd: HWND) {
+        let Some(p) = dialogs::open_image(Some(hwnd)) else { return };
+        match io::load(&p) {
+            Ok(img) if self.is_blank() => self.place_image(img, Some(p)),
+            Ok(image) => app::post(Command::OpenEditor { image, path: Some(p) }),
+            Err(e) => dialogs::info(Some(hwnd), "Snap It", &format!("Could not open the image.\n{e}")),
+        }
+    }
+
     fn insert_image(&mut self, img: Pixmap) {
         self.commit_text();
         let (bw, bh) = (self.base.width() as f32, self.base.height() as f32);
@@ -683,13 +738,13 @@ impl Editor {
             IMG_FILE => {
                 if let Some(p) = dialogs::open_image(Some(hwnd)) {
                     match io::load(&p) {
-                        Ok(img) => self.insert_image(img),
+                        Ok(img) => self.place_image(img, Some(p)),
                         Err(e) => dialogs::info(Some(hwnd), "Snap It", &e),
                     }
                 }
             }
             IMG_CLIP => match crate::clipboard::get_image() {
-                Some(img) => self.insert_image(img),
+                Some(img) => self.place_image(img, None),
                 None => dialogs::info(Some(hwnd), "Snap It", "The clipboard doesn't contain an image."),
             },
             IMG_SCREEN => crate::ui::overlay::open(crate::ui::overlay::Mode::PickForEditor(self.id)),
@@ -1103,9 +1158,10 @@ impl Editor {
             0x53 if ctrl => self.on_button(w, if shift { EBtn::SaveAs } else { EBtn::Save }),
             0x56 if ctrl => {
                 if let Some(img) = crate::clipboard::get_image() {
-                    self.insert_image(img);
+                    self.place_image(img, None);
                 }
             }
+            0x4F if ctrl => self.open_file(w.hwnd),
             0x30 if ctrl => {
                 self.fit = true;
                 self.fit_view();
@@ -1198,7 +1254,7 @@ impl Editor {
 
     // ---------- drawing ----------
 
-    fn render(&mut self) {
+    fn render(&mut self, hwnd: HWND) {
         let (cw, ch) = (self.client.0.max(1) as u32, self.client.1.max(1) as u32);
         Backbuffer::ensure(&mut self.bb, cw, ch);
         let interacting = !matches!(self.drag, Drag::None);
@@ -1213,13 +1269,14 @@ impl Editor {
         let Some(mut bb) = self.bb.take() else { return };
         {
             let mut pm = bb.pixmap();
-            self.draw(&mut pm, interacting);
+            self.draw(&mut pm, hwnd, interacting);
         }
         self.bb = Some(bb);
     }
 
-    fn draw(&self, pm: &mut PixmapMut, interacting: bool) {
-        let t = &self.theme;
+    fn draw(&mut self, pm: &mut PixmapMut, hwnd: HWND, interacting: bool) {
+        let t = self.theme;
+        let t = &t;
         let s = self.s();
         let id = Transform::identity();
         pm.fill(t.bg.color());
@@ -1227,6 +1284,11 @@ impl Editor {
         let comp = self.comp.as_ref().expect("composite built");
         let (iw, ih) = (comp.width() as f32 * self.zoom, comp.height() as f32 * self.zoom);
         let (ix, iy) = (c.x as f32 + self.off.0, c.y as f32 + self.off.1);
+
+        // Soft studio elevation shadow behind the image.
+        if let Some(sh) = snapit_gfx::effects::rounded_rect(ix - 2.0, iy + 4.0 * s, iw + 4.0, ih + 4.0, 4.0) {
+            pm.fill_path(&sh, &t.shadow.paint(), FillRule::Winding, id, None);
+        }
 
         // Checkerboard under the image (shows transparency).
         if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(ix, iy, iw, ih) {
@@ -1340,12 +1402,29 @@ impl Editor {
             _ => {}
         }
 
-        // Chrome: top bar, palette, status bar.
-        if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, 0.0, self.client.0 as f32, self.top_h() as f32) {
+        // Hint on the untouched blank canvas (drawn on the white image, so fixed dark text).
+        if self.is_blank() && !interacting {
+            let size = 15.0 * s;
+            for (i, line) in ["Paste an image with Ctrl+V, or open one with Ctrl+O", "The canvas takes the image's size"].iter().enumerate() {
+                let l = text::layout(line, size, i == 0);
+                let ty = iy + ih / 2.0 - l.height + i as f32 * l.height * 1.6;
+                text::draw(pm, line, ix + (iw - l.width) / 2.0, ty, size, i == 0, Rgba::rgb(110, 116, 130), None);
+            }
+        }
+
+        // Chrome: top dock, palette, status bar, integrated titlebar.
+        let ty = self.title_h() as f32;
+        if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, ty, self.client.0 as f32, (self.top_h() - self.title_h()) as f32) {
             pm.fill_rect(r, &t.panel.paint(), id, None);
         }
+        if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, self.top_h() as f32 - 1.0, self.client.0 as f32, 1.0) {
+            pm.fill_rect(r, &t.border_subtle.paint(), id, None);
+        }
         if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, (self.client.1 - self.status_h()) as f32, self.client.0 as f32, self.status_h() as f32) {
-            pm.fill_rect(r, &t.panel.paint(), id, None);
+            pm.fill_rect(r, &t.sidebar.paint(), id, None);
+        }
+        if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, (self.client.1 - self.status_h()) as f32, self.client.0 as f32, 1.0) {
+            pm.fill_rect(r, &t.border_subtle.paint(), id, None);
         }
         let tool = self.tool;
         let popup = self.popup;
@@ -1359,8 +1438,8 @@ impl Editor {
         let bar = self.options_bar();
         if self.opts_row2 {
             // A hairline between the toolbar row and the options row.
-            if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, 46.0 * s - 1.0, self.client.0 as f32, 1.0) {
-                pm.fill_rect(r, &t.border.paint(), id, None);
+            if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, ty + 48.0 * s - 1.0, self.client.0 as f32, 1.0) {
+                pm.fill_rect(r, &t.border_subtle.paint(), id, None);
             }
         }
         if bar.tool.is_some_and(tool_options_empty) {
@@ -1373,17 +1452,19 @@ impl Editor {
         }
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+        let title_str = format!("{}{} — Snap It Editor", name, if self.dirty { " •" } else { "" });
+        self.chrome.draw(pm, t, hwnd, self.client.0, s, &title_str, None, None);
+
+        // Size and zoom always live in the status bar (the titlebar may not have room).
         let status = format!(
-            "{} × {}    {:.0}%    {}{}    ·  Ctrl+wheel zoom  ·  Space+drag pan  ·  Shift constrains",
+            "{} × {}    {:.0}%    ·  Ctrl+wheel zoom  ·  Space+drag pan  ·  Shift constrains  ·  Del removes selection",
             self.base.width(),
             self.base.height(),
             self.zoom * 100.0,
-            name,
-            if self.dirty { " •" } else { "" }
         );
-        let ts = 12.0 * s;
+        let ts = 11.5 * s;
         let l = text::layout(&status, ts, false);
-        text::draw(pm, &status, 10.0 * s, (self.client.1 - self.status_h()) as f32 + (self.status_h() as f32 - l.height) / 2.0, ts, false, t.subtext, None);
+        text::draw(pm, &status, 12.0 * s, (self.client.1 - self.status_h()) as f32 + (self.status_h() as f32 - l.height) / 2.0, ts, false, t.subtext, None);
 
         match self.popup {
             Popup::Color(o) => self.color_popup(o).draw(pm, t),
@@ -1424,7 +1505,19 @@ impl Handler for Editor {
             self.reload_saved_options();
             w.invalidate();
         }
+        if let Some((r, dirty)) = self.chrome.nc_message(w.hwnd, msg, wp) {
+            if dirty {
+                w.invalidate();
+            }
+            return Some(r);
+        }
         let r = match msg {
+            WM_NCCALCSIZE => return Chrome::handle_nccalcsize(w.hwnd, wp, lp),
+            WM_MOUSELEAVE => {
+                self.chrome.mouse_leave();
+                Some(LRESULT(0))
+            }
+            WM_NCHITTEST => return Some(self.chrome.hit_test(w.hwnd, lp, self.scale, &[])),
             WM_SIZE => {
                 let mut rc = Default::default();
                 unsafe {
@@ -1446,15 +1539,16 @@ impl Handler for Editor {
                 return Some(LRESULT(0));
             }
             WM_PAINT => {
-                self.render();
+                self.render(w.hwnd);
                 backbuffer::paint(w.hwnd, self.bb.as_ref());
                 return Some(LRESULT(0));
             }
             WM_ERASEBKGND => return Some(LRESULT(1)),
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
+                    let cur = if self.chrome.hover.is_some() { IDC_HAND } else { self.cursor_shape() };
                     unsafe {
-                        if let Ok(c) = LoadCursorW(None, self.cursor_shape()) {
+                        if let Ok(c) = LoadCursorW(None, cur) {
                             SetCursor(Some(c));
                         }
                     }
@@ -1464,15 +1558,27 @@ impl Handler for Editor {
             }
             WM_MOUSEMOVE => {
                 let (x, y) = super::lparam_xy(lp);
+                self.chrome.set_hover(w.hwnd, self.client.0, self.scale, x, y);
                 self.mouse_move(x, y);
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let (x, y) = super::lparam_xy(lp);
+                if y < self.title_h() {
+                    // Only the Min/Close buttons are client area up here.
+                    self.chrome.press(self.client.0, self.scale, x, y);
+                    return Some(LRESULT(0));
+                }
                 self.mouse_down(w, x, y);
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                let (x, y) = super::lparam_xy(lp);
+                // A titlebar button acts only if the press started on it, so finishing a
+                // drag over the buttons always reaches mouse_up.
+                if self.chrome.release(w.hwnd, self.client.0, self.scale, x, y) {
+                    return Some(LRESULT(0));
+                }
                 self.mouse_up(w);
                 Some(LRESULT(0))
             }
@@ -1538,9 +1644,13 @@ impl Handler for Editor {
                 let ok = self.save(w.hwnd);
                 return Some(LRESULT(ok as isize));
             }
+            WM_EDITOR_TEST_SIZE => {
+                return Some(LRESULT(((self.base.width() as isize) << 16) | self.base.height() as isize));
+            }
             WM_EDITOR_INSERT => {
                 let img = unsafe { Box::from_raw(lp.0 as *mut Pixmap) };
-                self.insert_image(*img);
+                self.place_image(*img, None);
+                self.update_title(w.hwnd);
                 unsafe {
                     let _ = SetForegroundWindow(w.hwnd);
                 }

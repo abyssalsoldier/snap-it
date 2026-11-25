@@ -85,6 +85,13 @@ right on the overlay:
 If another app (for example the Windows Snipping Tool) already owns PrintScreen, Snap It tells
 you which hotkeys were taken. Change them in **Settings > Hotkeys**.
 
+When Windows' "Use the Print Screen key to open screen capture" setting is on, the setup wizard
+offers **Use Print Screen for Snap It**. It is off unless you turn it on; if you do, Finish
+switches that Windows setting off for your account only (`HKCU\Control Panel\Keyboard`,
+`PrintScreenKeyForSnippingEnabled = 0`). Win+Shift+S still opens Snipping Tool, and you can turn
+the setting back on in Windows Settings > Accessibility > Keyboard. Uninstalling Snap It does
+not change it back.
+
 ## EDR-safety design
 
 | Avoided | Used instead |

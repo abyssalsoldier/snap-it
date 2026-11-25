@@ -290,6 +290,27 @@ pub fn run(dir: &Path) -> i32 {
         r.check("editor closes after saving", find("SnapItEditor").is_none(), "");
     }
 
+    // --- Blank editor: the first pasted image sets the canvas size ---
+    crate::ui::editor::open_blank();
+    if let Some(ed) = find("SnapItEditor") {
+        use crate::ui::editor::{WM_EDITOR_INSERT, WM_EDITOR_TEST_SIZE};
+        let size = |ed| send(ed, WM_EDITOR_TEST_SIZE, 0, 0) as u32;
+        let paste = |ed, w: u32, h: u32| {
+            let img = snapit_gfx::tiny_skia::Pixmap::new(w, h).unwrap();
+            send(ed, WM_EDITOR_INSERT, 0, Box::into_raw(Box::new(img)) as isize);
+        };
+        paste(ed, 333, 222);
+        r.check("blank editor takes the pasted image's size", size(ed) == (333 << 16) | 222, &format!("{:#x}", size(ed)));
+        paste(ed, 50, 40);
+        r.check("second paste is added on top, canvas unchanged", size(ed) == (333 << 16) | 222, &format!("{:#x}", size(ed)));
+        unsafe {
+            let _ = DestroyWindow(ed);
+        }
+        pump(50);
+    } else {
+        r.check("blank editor opens", false, "");
+    }
+
     // --- Region capture straight through the task chain (Enter) ---
     crate::ui::overlay::set_test_shot(desk.clone());
     crate::ui::overlay::open(crate::ui::overlay::Mode::Region);
@@ -398,6 +419,7 @@ pub fn run(dir: &Path) -> i32 {
     crate::ui::welcome::open();
     if let Some(ww) = find("SnapItWelcome") {
         send(ww, WM_SHOWWINDOW, 1, 0);
+        r.dump(ww, "09_welcome");
         for _ in 0..4 {
             send(ww, WM_COMMAND, crate::ui::welcome::ID_NEXT as usize, 0);
         }
@@ -413,11 +435,25 @@ pub fn run(dir: &Path) -> i32 {
         r.check("setup wizard opens", false, "");
     }
 
+    // Render the Hotkeys step with the "Use Print Screen for Snap It" offer (layout check only;
+    // the Windows setting is never written in headless mode).
+    crate::ui::welcome::open();
+    if let Some(ww) = find("SnapItWelcome") {
+        send(ww, WM_SHOWWINDOW, 1, 0);
+        send(ww, WM_COMMAND, crate::ui::welcome::ID_TEST_PRTSC as usize, 0);
+        r.dump(ww, "09b_welcome_print_screen");
+        unsafe {
+            let _ = DestroyWindow(ww);
+        }
+        pump(50);
+    }
+
     // --- Settings: build every control, then Save without changes ---
     let before = (*app::settings()).clone();
     crate::ui::settings_window::open();
     if let Some(sw) = find("SnapItSettings") {
         send(sw, WM_SHOWWINDOW, 1, 0);
+        r.dump(sw, "10_settings");
         send(sw, WM_COMMAND, crate::ui::settings_window::ID_SAVE as usize, 0);
         pump(50);
         let after = Settings::load();

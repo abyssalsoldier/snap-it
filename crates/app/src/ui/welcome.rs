@@ -1,40 +1,31 @@
-//! First-launch setup: a short wizard shown the first time Snap It starts (no settings file
-//! yet), so new users pick their hotkeys and decide on the opt-in features before using it.
-//!
-//! It opens from the app itself rather than the installers, so it works the same for the
-//! setup .exe, the MSI and the portable zip, and always writes the signed-in user's settings
-//! (an all-users install runs elevated, possibly as another account). Both installers end
-//! with "Launch Snap It", which opens it. It can be run again from Settings > General or
-//! with `snapit --welcome`.
+//! First-launch setup: a Modern Studio 5-step wizard shown the first time Snap It starts
+//! (no settings file yet), so new users pick their hotkeys and decide on opt-in features.
 //!
 //! Steps: Welcome (key features) > Hotkeys > Features (opt-in) > After a capture > Done.
 //!
 //! Re-showing after updates: bump [`SETUP_VERSION`] in a release that adds something to these
 //! steps (a new opt-in feature, a new hotkey), and tag the new item with that number in its
-//! `since` field. Users whose `setup_version` is older see setup again once, with their
-//! current settings filled in and the new items marked "(new)". Bug-fix releases leave the
-//! number alone, so setup doesn't come back.
+//! `since` field.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 
-use windows::core::{w, HSTRING, PCWSTR};
+use snapit_gfx::effects::rounded_rect;
+use snapit_gfx::tiny_skia::{FillRule, Pixmap, PixmapMut, PixmapPaint, Transform};
+use snapit_gfx::{text, Rect};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, HDC, HFONT};
-use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetClientRect, GetWindowTextLengthW, GetWindowTextW, SendMessageW, SetForegroundWindow,
-    SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, HMENU, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_NOTIFY, WM_SETFONT,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+    GetClientRect, LoadCursorW, SetCursor, SetForegroundWindow, ShowWindow, HTCLIENT, IDC_ARROW,
+    IDC_HAND, SW_SHOW, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU, WINDOW_EX_STYLE,
 };
 
-use super::{Handler, Win};
+use super::chrome::Chrome;
+use super::icons::{self, Icon};
+use super::theme::{self, Theme};
+use super::widgets::{self, BtnStyle};
+use super::{backbuffer, Backbuffer, Handler, Win};
 use crate::actions::Action;
 use crate::app::{self, Command};
 use crate::hotkeys::Chord;
@@ -44,14 +35,25 @@ thread_local! {
     static OPEN: Cell<isize> = const { Cell::new(0) };
 }
 
-/// The version of these setup steps. Bump it only when a release adds something to them
-/// (see the module docs); every user with an older `setup_version` then sees setup again.
-pub const SETUP_VERSION: u32 = 1;
+/// The version of these setup steps. Bump it only when a release adds something to them.
+pub const SETUP_VERSION: u32 = 2;
 
-const STEPS: [&str; 5] = ["Welcome to Snap It", "Choose your hotkeys", "Turn on extra features", "After a capture", "You're all set"];
+/// Setup version that added the "Use Print Screen for Snap It" option.
+const PRTSC_SINCE: u32 = 2;
 
-/// The hotkeys offered here, with the [`SETUP_VERSION`] each was added in. The rest are in
-/// Settings > Hotkeys.
+/// Preserved for `--selftest` (`WM_COMMAND` with `ID_NEXT`).
+pub const ID_NEXT: u16 = 102;
+/// `--selftest` only: show the Hotkeys step with the Print Screen offer visible.
+pub const ID_TEST_PRTSC: u16 = 103;
+
+const STEPS: [&str; 5] = [
+    "Welcome to Snap It",
+    "Choose your hotkeys",
+    "Turn on extra features",
+    "After a capture",
+    "You're all set",
+];
+
 const HOTKEY_ACTIONS: [(Action, u32); 8] = [
     (Action::CaptureRegion, 1),
     (Action::CaptureWindow, 1),
@@ -63,45 +65,68 @@ const HOTKEY_ACTIONS: [(Action, u32); 8] = [
     (Action::Ocr, 1),
 ];
 
-// Control ids.
-const ID_TITLE: u16 = 100;
-const ID_STEP: u16 = 101;
-pub const ID_NEXT: u16 = 102;
-const ID_BACK: u16 = 103;
-const ID_SKIP: u16 = 104;
-const ID_HOTKEY0: u16 = 200;
-const ID_CHECK_KEYS: u16 = 220;
-const ID_KEY_STATUS: u16 = 221;
-const ID_KEYBOARD_SETTINGS: u16 = 222;
-const ID_SCROLLING: u16 = 300;
-const ID_UPDATE: u16 = 301;
-const ID_STARTUP: u16 = 302;
-const ID_CTXMENU: u16 = 303;
-const ID_QUICK: u16 = 304;
-const ID_T_COPY: u16 = 400;
-const ID_T_SAVE: u16 = 401;
-const ID_T_EDITOR: u16 = 402;
-const ID_T_NOTIFY: u16 = 403;
-const ID_T_SOUND: u16 = 404;
-const ID_SUMMARY: u16 = 500;
-const ID_TRY_NOW: u16 = 501;
-
 /// Temporary ids for testing whether chords are free (never left registered).
 const PROBE_BASE: u16 = 0xB000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Next,
+    Back,
+    Skip,
+    CheckKeys,
+    KeyboardSettings,
+    Hotkey(usize),
+    Toggle(u16),
+}
+
+const TOG_SCROLLING: u16 = 1;
+const TOG_UPDATE: u16 = 2;
+const TOG_STARTUP: u16 = 3;
+const TOG_CTXMENU: u16 = 4;
+const TOG_QUICK: u16 = 5;
+const TOG_PRTSC: u16 = 6;
+const TOG_T_COPY: u16 = 10;
+const TOG_T_SAVE: u16 = 11;
+const TOG_T_EDITOR: u16 = 12;
+const TOG_T_NOTIFY: u16 = 13;
+const TOG_T_SOUND: u16 = 14;
+const TOG_TRY_NOW: u16 = 20;
+
 struct WelcomeWin {
-    settings: Settings,
-    font: HFONT,
-    title_font: HFONT,
+    orig: Settings,
+    theme: Theme,
     scale: f32,
+    chrome: Chrome,
+    bb: Option<Backbuffer>,
+    client: (i32, i32),
     page: usize,
-    pages: Vec<Vec<HWND>>,
-    ctl: HashMap<u16, HWND>,
-    built: bool,
     finished: bool,
-    /// Opened for a user who already has settings (after an update, or from Settings).
     returning: bool,
-    nt: super::native_theme::NativeTheme,
+    focused_hk: Option<usize>,
+    hover: Option<Hit>,
+    hits: Vec<(Rect, Hit)>,
+    brand_cache: Option<(u32, Pixmap)>,
+
+    hotkeys: Vec<String>,
+    key_status: Option<(bool, String)>, // (is_ok, message)
+
+    scrolling_capture: bool,
+    update_check: bool,
+    start_with_windows: bool,
+    context_menu: bool,
+    quick_annotate: bool,
+
+    t_copy: bool,
+    t_save: bool,
+    t_editor: bool,
+    t_notify: bool,
+    t_sound: bool,
+    try_now: bool,
+
+    /// Windows currently gives Print Screen to its own screen capture, so offer to switch it.
+    prtsc_offer: bool,
+    /// The user opted in to turning that Windows setting off (applied on Finish).
+    prtsc_take: bool,
 }
 
 /// True when Snap It has never saved settings for this user (or portable folder).
@@ -112,11 +137,38 @@ pub fn is_first_run() -> bool {
 /// Whether setup should open by itself: on the first run, or once after an update that
 /// added setup steps this user hasn't seen.
 pub fn is_due(first_run: bool, s: &Settings) -> bool {
-    first_run || s.setup_version < SETUP_VERSION
+    is_due_with(first_run, s, crate::integration::print_screen_opens_snipping() == Some(true))
+}
+
+/// [`is_due`] with the Windows Print Screen setting passed in (`prtsc_useful`: it is on).
+fn is_due_with(first_run: bool, s: &Settings, prtsc_useful: bool) -> bool {
+    if first_run {
+        return true;
+    }
+    if s.setup_version >= SETUP_VERSION {
+        return false;
+    }
+    // When the Print Screen option is the only thing new since this user's last setup,
+    // only re-show setup where that option would actually do something.
+    let only_prtsc_is_new = s.setup_version + 1 == PRTSC_SINCE && PRTSC_SINCE == SETUP_VERSION;
+    !only_prtsc_is_new || prtsc_useful
+}
+
+/// Plain Print Screen, the key Windows' screen-capture setting takes.
+fn print_screen() -> Option<Chord> {
+    Chord::parse("PrintScreen")
+}
+
+/// Whether to offer turning off Windows' Print Screen → screen capture setting.
+fn print_screen_offer() -> bool {
+    match crate::integration::print_screen_opens_snipping() {
+        Some(on) => on,
+        // Never changed: the default depends on the Windows build, so test the key itself.
+        None => !super::headless() && print_screen().is_some_and(|p| !unavailable(&[p]).is_empty()),
+    }
 }
 
 /// Label text, marked "(new)" if the item was added after the setup this user last saw.
-/// Nothing is marked for someone who has never seen setup: it's all new to them.
 fn tagged(text: &str, since: u32, seen: u32) -> String {
     if seen > 0 && since > seen {
         format!("{text}  (new)")
@@ -135,31 +187,49 @@ pub fn open() {
         }
         return;
     }
-    unsafe {
-        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_STANDARD_CLASSES };
-        let _ = InitCommonControlsEx(&icc);
-    }
-    let ww = WelcomeWin {
-        settings: (*app::settings()).clone(),
-        font: HFONT::default(),
-        title_font: HFONT::default(),
-        scale: 1.0,
-        page: 0,
-        pages: Vec::new(),
-        ctl: HashMap::new(),
-        built: false,
-        finished: false,
-        returning: !is_first_run(),
-        nt: super::native_theme::NativeTheme::new(),
-    };
+    let s = (*app::settings()).clone();
+    let hotkeys = HOTKEY_ACTIONS.iter().map(|(a, _)| s.hotkey_for(*a).unwrap_or_default()).collect();
     let mons = snapit_capture::monitors();
     let m = mons.iter().find(|m| m.primary).or(mons.first());
-    let (work, sc) = m.map(|m| (m.work, m.scale())).unwrap_or((snapit_gfx::Rect::new(0, 0, 1280, 800), 1.0));
-    let (w, h) = ((620.0 * sc) as i32, (560.0 * sc) as i32);
-    let r = snapit_gfx::Rect::new(work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h.min(work.h));
-    let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPSIBLINGS;
-    match super::create("SnapItWelcome", WS_EX_CONTROLPARENT, style, "Snap It Setup", r, None, Box::new(ww)) {
+    let (work, sc) = m.map(|m| (m.work, m.scale())).unwrap_or((Rect::new(0, 0, 1280, 800), 1.0));
+    let (w, h) = ((700.0 * sc) as i32, (600.0 * sc) as i32);
+    let r = Rect::new(work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h.min(work.h));
+
+    let ww = WelcomeWin {
+        scrolling_capture: s.scrolling_capture,
+        update_check: s.integration.update_check,
+        start_with_windows: s.integration.start_with_windows,
+        context_menu: s.integration.context_menu,
+        quick_annotate: s.region.quick_annotate,
+        t_copy: s.tasks.copy,
+        t_save: s.tasks.save,
+        t_editor: s.tasks.open_editor,
+        t_notify: s.tasks.notify,
+        t_sound: s.tasks.sound,
+        try_now: false,
+        prtsc_offer: print_screen_offer(),
+        prtsc_take: false,
+        orig: s,
+        theme: theme::current(),
+        scale: sc,
+        chrome: Chrome::new(false, true, false),
+        bb: None,
+        client: (w, h),
+        page: 0,
+        finished: false,
+        returning: !is_first_run(),
+        focused_hk: None,
+        hover: None,
+        hits: Vec::new(),
+        brand_cache: None,
+        hotkeys,
+        key_status: None,
+    };
+
+    let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    match super::create("SnapItWelcome", WINDOW_EX_STYLE(0), style, "Snap It Setup", r, None, Box::new(ww)) {
         Ok(hwnd) => {
+            Chrome::init(hwnd);
             OPEN.with(|o| o.set(hwnd.0 as isize));
             super::show(hwnd, true);
         }
@@ -167,24 +237,7 @@ pub fn open() {
     }
 }
 
-fn set_text(h: HWND, s: &str) {
-    unsafe {
-        let _ = SetWindowTextW(h, &HSTRING::from(s));
-    }
-}
-
-fn get_text(h: HWND) -> String {
-    unsafe {
-        let n = GetWindowTextLengthW(h);
-        let mut buf = vec![0u16; n as usize + 1];
-        let got = GetWindowTextW(h, &mut buf);
-        String::from_utf16_lossy(&buf[..got.max(0) as usize])
-    }
-}
-
-/// Applies the hotkeys chosen here to `workflows`: an empty box removes that action's
-/// hotkey, a new one replaces it (keeping any per-hotkey task chain), and workflows for
-/// actions not shown here are kept as they are. Errors describe what to fix.
+/// Applies the hotkeys chosen here to `workflows`.
 fn apply_hotkeys(workflows: &[Workflow], chosen: &[(Action, String)]) -> Result<Vec<Workflow>, String> {
     let mut parsed: Vec<(Action, Option<Chord>)> = Vec::new();
     for (a, text) in chosen {
@@ -225,8 +278,6 @@ fn apply_hotkeys(workflows: &[Workflow], chosen: &[(Action, String)]) -> Result<
     Ok(out)
 }
 
-/// Which of `chords` another app already owns. Snap It's own hotkeys are released for the
-/// test and registered again afterwards.
 fn unavailable(chords: &[Chord]) -> Vec<Chord> {
     let hwnd = app::main_hwnd();
     crate::suspend_hotkeys();
@@ -238,275 +289,88 @@ fn unavailable(chords: &[Chord]) -> Vec<Chord> {
 }
 
 impl WelcomeWin {
-    fn px(&self, v: i32) -> i32 {
-        (v as f32 * self.scale).round() as i32
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn make(&mut self, parent: HWND, page: Option<usize>, class: PCWSTR, text: &str, style: WINDOW_STYLE, x: i32, y: i32, w: i32, h: i32, id: u16) -> HWND {
-        let visible = if page.is_none_or(|p| p == 0) { WS_VISIBLE } else { WINDOW_STYLE(0) };
-        let hwnd = unsafe {
-            CreateWindowExW(WINDOW_EX_STYLE(0), class, &HSTRING::from(text), WS_CHILD | visible | style, self.px(x), self.px(y), self.px(w), self.px(h), Some(parent), Some(HMENU(id as usize as *mut _)), None, None)
-        }
-        .unwrap_or_default();
-        unsafe {
-            SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
-        }
-        if let Some(p) = page {
-            self.pages[p].push(hwnd);
-        }
-        if id != 0 {
-            self.ctl.insert(id, hwnd);
-        }
-        hwnd
-    }
-
-    /// A label `lines` text lines tall (it wraps within its width).
-    fn label(&mut self, parent: HWND, page: usize, text: &str, x: i32, y: i32, w: i32, lines: i32) -> HWND {
-        self.make(parent, Some(page), w!("STATIC"), text, WINDOW_STYLE(0), x, y, w, 18 * lines + 2, 0)
-    }
-
-    fn check(&mut self, parent: HWND, page: usize, id: u16, text: &str, on: bool, x: i32, y: i32, w: i32) {
-        let h = self.make(parent, Some(page), w!("BUTTON"), text, WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32), x, y, w, 22, id);
-        unsafe {
-            SendMessageW(h, BM_SETCHECK, Some(WPARAM(on as usize)), None);
-        }
-    }
-
-    fn button(&mut self, parent: HWND, page: Option<usize>, id: u16, text: &str, x: i32, y: i32, w: i32, default: bool) {
-        let st = if default { BS_DEFPUSHBUTTON } else { BS_PUSHBUTTON };
-        self.make(parent, page, w!("BUTTON"), text, WS_TABSTOP | WINDOW_STYLE(st as u32), x, y, w, 28, id);
-    }
-
-    fn is_checked(&self, id: u16) -> bool {
-        self.ctl.get(&id).is_some_and(|&h| unsafe { SendMessageW(h, BM_GETCHECK, None, None).0 == 1 })
-    }
-
-    fn text_of(&self, id: u16) -> String {
-        self.ctl.get(&id).map(|&h| get_text(h)).unwrap_or_default().trim().to_string()
-    }
-
-    fn set(&self, id: u16, s: &str) {
-        if let Some(&h) = self.ctl.get(&id) {
-            set_text(h, s);
-        }
-    }
-
-    fn build(&mut self, hwnd: HWND) {
-        self.scale = super::dpi_scale(hwnd);
-        unsafe {
-            let dpi = GetDpiForWindow(hwnd);
-            let mut ncm = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
-            if SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, ncm.cbSize, Some(&mut ncm as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0).0, dpi).is_ok() {
-                self.font = CreateFontIndirectW(&ncm.lfMessageFont);
-                let mut big = ncm.lfMessageFont;
-                big.lfHeight = (big.lfHeight as f32 * 1.6).round() as i32;
-                big.lfWeight = 600;
-                self.title_font = CreateFontIndirectW(&big);
-            }
-        }
-        self.pages = vec![Vec::new(); STEPS.len()];
-        let mut rc = RECT::default();
-        unsafe {
-            let _ = GetClientRect(hwnd, &mut rc);
-        }
-        let cw = (rc.right as f32 / self.scale) as i32;
-        let ch = (rc.bottom as f32 / self.scale) as i32;
-        let x0 = 28;
-        let tw = cw - 2 * x0;
-        let s = self.settings.clone();
-        let seen = s.setup_version;
-
-        // Header, shared by every step.
-        let title = self.make(hwnd, None, w!("STATIC"), STEPS[0], WINDOW_STYLE(0), x0, 18, tw - 110, 34, ID_TITLE);
-        unsafe {
-            SendMessageW(title, WM_SETFONT, Some(WPARAM(self.title_font.0 as usize)), Some(LPARAM(1)));
-        }
-        self.make(hwnd, None, w!("STATIC"), "", WINDOW_STYLE(0x0002), cw - x0 - 100, 28, 100, 20, ID_STEP); // SS_RIGHT
-
-        // 1. Welcome: what Snap It does.
-        let mut y = 64;
-        let intro = if !self.returning {
-            "Screenshots, annotation and screen recording that stay on this PC. This short setup takes about a minute; you can change everything later in Settings."
-        } else if seen > 0 && seen < SETUP_VERSION {
-            "Snap It has new features you may want to set up; they're marked (new). Your current settings are filled in and stay as they are unless you change them."
-        } else {
-            "A quick tour of Snap It's main settings. Your current settings are filled in and stay as they are unless you change them."
-        };
-        self.label(hwnd, 0, intro, x0, y, tw, 2);
-        y += 50;
-        for line in [
-            "•  Capture a region, a window or the whole screen, snapping to windows and controls",
-            "•  Annotate straight away (arrows, text, highlight, blur, numbered steps) or open the editor",
-            "•  Record the screen to MP4 or GIF",
-            "•  Scrolling capture for long web pages and documents",
-            "•  Copy text with OCR, scan or make QR codes, pick colours, measure with a ruler",
-            "•  Pin screenshots above other windows and find older ones in History",
-        ] {
-            self.label(hwnd, 0, line, x0 + 6, y, tw - 6, 1);
-            y += 26;
-        }
-        y += 14;
-        self.label(hwnd, 0, "Snap It runs in the notification area (system tray) next to the clock. Right-click its icon for every action, or double-click it to capture a region.", x0, y, tw, 2);
-        y += 48;
-        self.label(hwnd, 0, "Nothing is uploaded and no account is needed.", x0, y, tw, 1);
-
-        // 2. Hotkeys.
-        let mut y = 64;
-        self.label(hwnd, 1, "Click a box and press the keys you want (for example Ctrl+Shift+S). Backspace clears it. More actions can get hotkeys in Settings > Hotkeys.", x0, y, tw, 2);
-        y += 48;
-        for (i, (a, since)) in HOTKEY_ACTIONS.iter().enumerate() {
-            let cur = s.hotkey_for(*a).unwrap_or_default();
-            self.label(hwnd, 1, &tagged(a.label().trim_end_matches('…'), *since, seen), x0, y + 3, 200, 1);
-            let id = ID_HOTKEY0 + i as u16;
-            let h = self.make(hwnd, Some(1), w!("EDIT"), &cur, WS_TABSTOP | WS_BORDER | WINDOW_STYLE(0x0080), 240, y, 220, 24, id); // ES_AUTOHSCROLL
-            set_text(h, &cur);
-            super::hotkey_field::attach(h);
-            y += 30;
-        }
-        y += 6;
-        self.button(hwnd, Some(1), ID_CHECK_KEYS, "Check hotkeys", x0, y, 130, false);
-        self.make(hwnd, Some(1), w!("STATIC"), "", WINDOW_STYLE(0), x0 + 142, y + 5, tw - 142, 40, ID_KEY_STATUS);
-        y += 48;
-        self.label(hwnd, 1, "Windows 11 can reserve the Print Screen key for the Snipping Tool. If PrintScreen shows as taken, turn off \"Use the Print Screen key to open screen capture\".", x0, y, tw, 2);
-        y += 42;
-        self.button(hwnd, Some(1), ID_KEYBOARD_SETTINGS, "Open Windows keyboard settings", x0, y, 230, false);
-
-        // 3. Opt-in features (all off unless already turned on).
-        let mut y = 64;
-        self.label(hwnd, 2, "These are off by default. Turn on the ones you want.", x0, y, tw, 1);
-        y += 32;
-        let ig = &s.integration;
-        // (id, text, current value, help, SETUP_VERSION it was added in)
-        for (id, text, on, help, since) in [
-            (ID_SCROLLING, "Scrolling capture", s.scrolling_capture, "Captures long pages by scrolling the area you select. It sends mouse-wheel input to that window.", 1),
-            (ID_UPDATE, "Check for updates when Snap It starts", ig.update_check, "Asks GitHub whether a newer version exists. Nothing is downloaded or installed without asking; downloads open in your browser.", 1),
-            (ID_STARTUP, "Start Snap It when I sign in", ig.start_with_windows, "Adds a shortcut to your Startup folder, so your hotkeys work right after sign-in. Snap It starts in the tray.", 1),
-            (ID_CTXMENU, "Add Snap It to the Explorer menu for images", ig.context_menu, "Right-click an image file for \"Edit with Snap It\" and \"Pin with Snap It\".", 1),
-            (ID_QUICK, "Show the quick-annotate toolbar after selecting a region", s.region.quick_annotate, "Draw, blur or add text before you copy or save. Turn off to finish a capture as soon as you release the mouse.", 1),
-        ] {
-            self.check(hwnd, 2, id, &tagged(text, since, seen), on, x0, y, tw);
-            y += 24;
-            self.label(hwnd, 2, help, x0 + 20, y, tw - 20, 2);
-            y += 48;
-        }
-
-        // 4. After a capture.
-        let mut y = 64;
-        self.label(hwnd, 3, "What happens when you finish a capture (press Enter after selecting, or use an instant capture such as the full screen):", x0, y, tw, 2);
-        y += 50;
-        let t = s.tasks;
-        for (id, text, on, since) in [
-            (ID_T_COPY, "Copy the image to the clipboard", t.copy, 1),
-            (ID_T_SAVE, "Save it to the screenshots folder", t.save, 1),
-            (ID_T_EDITOR, "Open it in the editor", t.open_editor, 1),
-            (ID_T_NOTIFY, "Show a notification (click it to open the capture)", t.notify, 1),
-            (ID_T_SOUND, "Play the capture sound", t.sound, 1),
-        ] {
-            self.check(hwnd, 3, id, &tagged(text, since, seen), on, x0 + 6, y, tw - 6);
-            y += 30;
-        }
-        y += 10;
-        self.label(hwnd, 3, &format!("Screenshots are saved to {}", s.save_dir().display()), x0, y, tw, 2);
-        y += 40;
-        self.label(hwnd, 3, "The quick-annotate toolbar also has its own Copy, Save, Pin and Edit buttons for one-off choices.", x0, y, tw, 2);
-
-        // 5. Done.
-        let y = 64;
-        self.make(hwnd, Some(4), w!("STATIC"), "", WINDOW_STYLE(0), x0, y, tw, 260, ID_SUMMARY);
-        self.check(hwnd, 4, ID_TRY_NOW, "Take a screenshot when I click Finish", false, x0, y + 280, tw);
-
-        // Footer.
-        self.button(hwnd, None, ID_SKIP, "Skip setup", x0, ch - 46, 110, false);
-        self.button(hwnd, None, ID_BACK, "< Back", cw - x0 - 200, ch - 46, 95, false);
-        self.button(hwnd, None, ID_NEXT, "Next >", cw - x0 - 95, ch - 46, 95, true);
-        self.built = true;
-        self.show_page(0);
-    }
-
-    fn show_page(&mut self, page: usize) {
-        self.page = page;
-        for (i, ctrls) in self.pages.iter().enumerate() {
-            for &c in ctrls {
-                unsafe {
-                    let _ = ShowWindow(c, if i == page { SW_SHOW } else { SW_HIDE });
-                }
-            }
-        }
-        self.set(ID_TITLE, STEPS[page]);
-        self.set(ID_STEP, &format!("Step {} of {}", page + 1, STEPS.len()));
-        let last = page + 1 == STEPS.len();
-        self.set(ID_NEXT, if last { "Finish" } else { "Next >" });
-        if let Some(&h) = self.ctl.get(&ID_BACK) {
-            unsafe {
-                let _ = EnableWindow(h, page > 0);
-            }
-        }
-        if last {
-            self.set(ID_SUMMARY, &self.summary());
+    fn set_hk_focus(&mut self, idx: Option<usize>) {
+        let was = self.focused_hk.is_some();
+        let now = idx.is_some();
+        self.focused_hk = idx;
+        if now && !was {
+            widgets::pause_hotkeys();
+        } else if !now && was {
+            widgets::resume_hotkeys();
         }
     }
 
     fn chosen_hotkeys(&self) -> Vec<(Action, String)> {
-        HOTKEY_ACTIONS.iter().enumerate().map(|(i, (a, _))| (*a, self.text_of(ID_HOTKEY0 + i as u16))).collect()
+        HOTKEY_ACTIONS.iter().enumerate().map(|(i, (a, _))| (*a, self.hotkeys[i].trim().to_string())).collect()
     }
 
-    /// Tests the chosen hotkeys and shows the result. Returns the ones that are taken.
-    fn check_keys(&self) -> Vec<Chord> {
+    fn check_keys(&mut self) -> Vec<Chord> {
         let chords: Vec<Chord> = self.chosen_hotkeys().iter().filter_map(|(_, t)| Chord::parse(t)).collect();
-        let taken = unavailable(&chords);
-        let msg = if chords.is_empty() {
-            "No hotkeys set. You can still use the tray icon.".to_string()
+        let mut taken = unavailable(&chords);
+        // Print Screen is about to be handed over by Windows, so it doesn't count as taken.
+        let before = taken.len();
+        if self.prtsc_offer && self.prtsc_take {
+            taken.retain(|c| Some(*c) != print_screen());
+        }
+        let freed = taken.len() < before;
+        self.key_status = Some(if chords.is_empty() {
+            (true, "No hotkeys set. You can still use the tray icon.".into())
+        } else if taken.is_empty() && freed {
+            (true, "Print Screen will switch to Snap It on Finish; the rest are free.".into())
         } else if taken.is_empty() {
-            "All of these hotkeys are free.".to_string()
+            (true, "All of these hotkeys are free.".into())
         } else {
             let names: Vec<String> = taken.iter().map(Chord::display).collect();
-            format!("In use by another app: {}. Pick other keys, or close that app.", names.join(", "))
-        };
-        self.set(ID_KEY_STATUS, &msg);
+            (false, format!("In use by another app: {}.", names.join(", ")))
+        });
         taken
     }
 
-    fn summary(&self) -> String {
+    fn summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         match self.chosen_hotkeys().into_iter().find(|(a, t)| *a == Action::CaptureRegion && !t.is_empty()) {
             Some((_, t)) => lines.push(format!("Press {t} to capture a region.")),
             None => lines.push("Capture a region by double-clicking the Snap It tray icon.".into()),
         }
-        lines.push("While selecting: drag to choose an area, click to take a whole window, press Enter to finish or Esc to cancel.".into());
+        lines.push("While selecting: drag to choose an area, click to capture a window, press Enter to finish or Esc to cancel.".into());
         let mut on = Vec::new();
-        for (id, name) in [(ID_SCROLLING, "scrolling capture"), (ID_UPDATE, "update checks"), (ID_STARTUP, "start at sign-in"), (ID_CTXMENU, "Explorer menu")] {
-            if self.is_checked(id) {
+        for (v, name) in [
+            (self.scrolling_capture, "scrolling capture"),
+            (self.update_check, "update checks"),
+            (self.start_with_windows, "start at sign-in"),
+            (self.context_menu, "Explorer menu"),
+            (self.prtsc_offer && self.prtsc_take, "Print Screen for Snap It"),
+        ] {
+            if v {
                 on.push(name);
             }
         }
         lines.push(if on.is_empty() { "Extra features: none turned on.".into() } else { format!("Turned on: {}.", on.join(", ")) });
-        lines.push("To change anything later, right-click the tray icon and choose Settings.".into());
-        lines.join("\n\n")
+        lines.push("Change anything later by right-clicking the Snap It tray icon and choosing Settings.".into());
+        lines
     }
 
-    /// Reads every step into a new Settings.
     fn collect(&self) -> Result<Settings, String> {
-        let mut s = self.settings.clone();
+        let mut s = self.orig.clone();
         s.workflows = apply_hotkeys(&s.workflows, &self.chosen_hotkeys())?;
-        s.scrolling_capture = self.is_checked(ID_SCROLLING);
-        s.integration.update_check = self.is_checked(ID_UPDATE);
-        s.integration.start_with_windows = self.is_checked(ID_STARTUP);
-        s.integration.context_menu = self.is_checked(ID_CTXMENU);
-        s.region.quick_annotate = self.is_checked(ID_QUICK);
-        s.tasks.copy = self.is_checked(ID_T_COPY);
-        s.tasks.save = self.is_checked(ID_T_SAVE);
-        s.tasks.open_editor = self.is_checked(ID_T_EDITOR);
-        s.tasks.notify = self.is_checked(ID_T_NOTIFY);
-        s.tasks.sound = self.is_checked(ID_T_SOUND);
+        s.scrolling_capture = self.scrolling_capture;
+        s.integration.update_check = self.update_check;
+        s.integration.start_with_windows = self.start_with_windows;
+        s.integration.context_menu = self.context_menu;
+        s.region.quick_annotate = self.quick_annotate;
+        s.tasks.copy = self.t_copy;
+        s.tasks.save = self.t_save;
+        s.tasks.open_editor = self.t_editor;
+        s.tasks.notify = self.t_notify;
+        s.tasks.sound = self.t_sound;
         s.setup_version = s.setup_version.max(SETUP_VERSION);
         Ok(s)
     }
 
     fn next(&mut self, w: &mut Win) {
+        self.set_hk_focus(None);
         if self.page == 1 {
-            // Leaving the hotkeys step: stop on mistakes, warn about keys another app owns.
-            if let Err(e) = apply_hotkeys(&self.settings.workflows, &self.chosen_hotkeys()) {
+            if let Err(e) = apply_hotkeys(&self.orig.workflows, &self.chosen_hotkeys()) {
                 return super::dialogs::info(Some(w.hwnd), "Snap It", &e);
             }
             let taken = self.check_keys();
@@ -518,7 +382,9 @@ impl WelcomeWin {
             }
         }
         if self.page + 1 < STEPS.len() {
-            return self.show_page(self.page + 1);
+            self.page += 1;
+            w.invalidate();
+            return;
         }
         self.finish(w);
     }
@@ -529,12 +395,27 @@ impl WelcomeWin {
             Err(e) => return super::dialogs::info(Some(w.hwnd), "Snap It", &e),
         };
         let prev = app::settings();
-        let errors = crate::integration::apply(&prev.integration, &next.integration);
+        let mut errors = crate::integration::apply(&prev.integration, &next.integration);
         if let Err(e) = next.save() {
             return super::dialogs::info(Some(w.hwnd), "Snap It", &format!("Could not save settings.\n{e}"));
         }
         let check_updates = next.integration.update_check && !prev.integration.update_check;
         app::with(|st| st.settings = std::rc::Rc::new(next));
+        if self.prtsc_offer && self.prtsc_take && !super::headless() {
+            // Opt-in only: turn off Windows' Print Screen → screen capture for this user.
+            // Verified on Windows 11 23H2 (22631): Windows releases the key immediately, no
+            // sign-out. The re-probe below is a fallback for builds that might not.
+            match crate::integration::set_print_screen_opens_snipping(false) {
+                Err(e) => errors.push(format!("Could not change the Windows Print Screen setting: {e}")),
+                Ok(()) => {
+                    if print_screen().is_some_and(|p| !unavailable(&[p]).is_empty()) {
+                        errors.push(
+                            "Windows is still holding the Print Screen key. Sign out and back in to finish the switch.".into(),
+                        );
+                    }
+                }
+            }
+        }
         app::post(Command::ReloadSettings);
         if check_updates {
             crate::integration::check_for_updates(false);
@@ -542,70 +423,519 @@ impl WelcomeWin {
         if !errors.is_empty() {
             super::dialogs::info(Some(w.hwnd), "Snap It", &errors.join("\n"));
         }
-        if self.is_checked(ID_TRY_NOW) {
+        if self.try_now {
             app::post(Command::Run(Action::CaptureRegion));
         } else {
-            app::post(Command::Notify { title: "Snap It is ready".into(), body: "It's in the notification area. Right-click the icon for every action.".into() });
+            app::post(Command::Notify {
+                title: "Snap It is ready".into(),
+                body: "It's in the notification area. Right-click the icon for every action.".into(),
+            });
         }
         self.finished = true;
         w.close();
     }
+
+    // ---------- Rendering ----------
+
+    fn render(&mut self, hwnd: HWND) {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        self.client = (rc.right.max(1), rc.bottom.max(1));
+        self.scale = super::dpi_scale(hwnd);
+        Backbuffer::ensure(&mut self.bb, self.client.0 as u32, self.client.1 as u32);
+        let Some(mut bb) = self.bb.take() else { return };
+        self.hits.clear();
+        {
+            let mut pm = bb.pixmap();
+            let t = self.theme;
+            let s = self.scale;
+            let id = Transform::identity();
+            pm.fill(t.bg.color());
+
+            let step_badge = format!("Step {} of {}", self.page + 1, STEPS.len());
+            self.chrome.draw(&mut pm, &t, hwnd, self.client.0, s, "Snap It Setup", Some(&step_badge), None);
+
+            let pad = 28.0 * s;
+            let cw = self.client.0 as f32 - pad * 2.0;
+            let mut y = self.chrome.height(s) as f32 + 16.0 * s;
+
+            // Segmented step progress bar.
+            let seg_gap = 6.0 * s;
+            let seg_w = (cw - seg_gap * (STEPS.len() - 1) as f32) / STEPS.len() as f32;
+            let seg_h = 4.5 * s;
+            for i in 0..STEPS.len() {
+                let sx = pad + i as f32 * (seg_w + seg_gap);
+                if let Some(p) = rounded_rect(sx, y, seg_w, seg_h, seg_h / 2.0) {
+                    if i <= self.page {
+                        pm.fill_path(&p, &t.accent_paint(sx, y, sx + seg_w, y), FillRule::Winding, id, None);
+                    } else {
+                        pm.fill_path(&p, &t.raised.paint(), FillRule::Winding, id, None);
+                    }
+                }
+            }
+            y += 18.0 * s;
+
+            // Step headline.
+            text::draw(&mut pm, STEPS[self.page], pad, y, 22.0 * s, true, t.text, None);
+            y += 34.0 * s;
+
+            match self.page {
+                0 => self.draw_step_welcome(&mut pm, pad, cw, y),
+                1 => self.draw_step_hotkeys(&mut pm, pad, cw, y),
+                2 => self.draw_step_features(&mut pm, pad, cw, y),
+                3 => self.draw_step_after(&mut pm, pad, cw, y),
+                4 => self.draw_step_done(&mut pm, pad, cw, y),
+                _ => {}
+            }
+
+            // Sticky footer bar.
+            let fh = (60.0 * s) as i32;
+            let fy = self.client.1 - fh;
+            if let Some(fr) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, fy as f32, self.client.0 as f32, fh as f32) {
+                pm.fill_rect(fr, &t.sidebar.paint(), id, None);
+            }
+            widgets::draw_divider(&mut pm, &t, 0.0, self.client.0 as f32, fy as f32);
+
+            let bh = (36.0 * s) as i32;
+            let by = fy + (fh - bh) / 2;
+            let skip_r = Rect::new(pad as i32, by, (108.0 * s) as i32, bh);
+            let next_w = (112.0 * s) as i32;
+            let back_w = (96.0 * s) as i32;
+            let next_r = Rect::new(self.client.0 - pad as i32 - next_w, by, next_w, bh);
+            let back_r = Rect::new(next_r.x - (10.0 * s) as i32 - back_w, by, back_w, bh);
+
+            widgets::draw_button(&mut pm, &t, skip_r, "Skip setup", None, BtnStyle::Ghost, self.hover == Some(Hit::Skip), false, s);
+            widgets::draw_button(&mut pm, &t, back_r, "Back", Some(Icon::ChevronLeft), BtnStyle::Secondary, self.hover == Some(Hit::Back), self.page == 0, s);
+            let last = self.page + 1 == STEPS.len();
+            widgets::draw_button(
+                &mut pm,
+                &t,
+                next_r,
+                if last { "Finish" } else { "Next" },
+                if last { Some(Icon::Done) } else { Some(Icon::ChevronRight) },
+                BtnStyle::Primary,
+                self.hover == Some(Hit::Next),
+                false,
+                s,
+            );
+            self.hits.push((skip_r, Hit::Skip));
+            if self.page > 0 {
+                self.hits.push((back_r, Hit::Back));
+            }
+            self.hits.push((next_r, Hit::Next));
+        }
+        self.bb = Some(bb);
+    }
+
+    fn draw_step_welcome(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
+        let t = self.theme;
+        let s = self.scale;
+        let seen = self.orig.setup_version;
+
+        // Hero card with brand icon.
+        let hero_h = 84.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, hero_h as i32), 12.0, s);
+        let isz = (48.0 * s).round() as u32;
+        if self.brand_cache.as_ref().is_none_or(|(sz, _)| *sz != isz) {
+            self.brand_cache = Some((isz, snapit_gfx::brand::icon(isz)));
+        }
+        if let Some((_, ref ico)) = self.brand_cache {
+            pm.draw_pixmap((pad + 18.0 * s) as i32, (y + (hero_h - isz as f32) / 2.0) as i32, ico.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        }
+        let intro = if !self.returning {
+            "Fast screenshots, annotation, and screen recording that stay 100% on this PC. This quick setup takes about a minute."
+        } else if seen > 0 && seen < SETUP_VERSION {
+            "Snap It has new features marked (new). Your existing settings stay intact unless you change them."
+        } else {
+            "A quick tour of Snap It's main settings. Your current settings are filled in and stay unchanged unless edited."
+        };
+        widgets::draw_wrapped(pm, intro, pad + 82.0 * s, y + 18.0 * s, cw - 98.0 * s, 13.0 * s, false, t.text);
+        y += hero_h + 16.0 * s;
+
+        // 2x3 feature highlight grid.
+        let features = [
+            (Icon::Camera, "Smart Snapping", "Region, window & control detection"),
+            (Icon::Editor, "Quick Annotate", "Arrows, text, blur, highlight & steps"),
+            (Icon::Video, "Screen Recording", "Capture crisp MP4 & GIF clips"),
+            (Icon::ZoomFit, "Scrolling Capture", "Stitch long web pages & docs"),
+            (Icon::Effects, "Built-in Tools", "OCR, QR codes, colour picker & ruler"),
+            (Icon::Pin, "Pin & History", "Float captures on top or browse past ones"),
+        ];
+        let gap = 12.0 * s;
+        let card_w = (cw - gap) / 2.0;
+        let card_h = 68.0 * s;
+        for (i, (ic, title, desc)) in features.iter().enumerate() {
+            let col = i % 2;
+            let row = i / 2;
+            let cx = pad + col as f32 * (card_w + gap);
+            let cy = y + row as f32 * (card_h + gap);
+            widgets::draw_card(pm, &t, Rect::new(cx as i32, cy as i32, card_w as i32, card_h as i32), 10.0, s);
+            let ib = 34.0 * s;
+            if let Some(p) = rounded_rect(cx + 12.0 * s, cy + (card_h - ib) / 2.0, ib, ib, 8.0 * s) {
+                pm.fill_path(&p, &t.accent_soft.paint(), FillRule::Winding, Transform::identity(), None);
+            }
+            icons::draw(pm, *ic, cx + 19.0 * s, cy + (card_h - 20.0 * s) / 2.0, 20.0 * s, t.accent);
+            text::draw(pm, title, cx + 56.0 * s, cy + 14.0 * s, 13.0 * s, true, t.text, None);
+            text::draw(pm, desc, cx + 56.0 * s, cy + 34.0 * s, 11.5 * s, false, t.subtext, None);
+        }
+        y += 3.0 * (card_h + gap) + 6.0 * s;
+
+        // Privacy / tray footer note.
+        let note = "Runs quietly in the system tray next to the clock · Nothing is uploaded · No account needed";
+        let nl = text::layout(note, 11.5 * s, false);
+        text::draw(pm, note, pad + (cw - nl.width) / 2.0, y, 11.5 * s, false, t.subtext, None);
+    }
+
+    fn draw_step_hotkeys(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
+        let t = self.theme;
+        let s = self.scale;
+        let seen = self.orig.setup_version;
+
+        text::draw(pm, "Click a box and press your keys. Backspace clears it. More actions are in Settings > Hotkeys.", pad, y, 12.5 * s, false, t.subtext, None);
+        y += 24.0 * s;
+
+        let row_h = 34.0 * s;
+        let card_h = HOTKEY_ACTIONS.len() as f32 * row_h + 12.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, card_h as i32), 10.0, s);
+        let ix = pad + 14.0 * s;
+        let iw = cw - 28.0 * s;
+        let mut cy = y + 7.0 * s;
+        for (i, (a, since)) in HOTKEY_ACTIONS.iter().enumerate() {
+            if i > 0 {
+                widgets::draw_divider(pm, &t, ix, ix + iw, cy - 1.0 * s);
+            }
+            let lbl = tagged(a.label().trim_end_matches('…'), *since, seen);
+            text::draw(pm, &lbl, ix, cy + 7.0 * s, 12.5 * s, false, t.text, None);
+            let fw = (220.0 * s) as i32;
+            let fr = Rect::new((ix + iw - fw as f32) as i32, (cy + 2.0 * s) as i32, fw, (28.0 * s) as i32);
+            widgets::draw_hotkey_field(pm, &t, fr, &self.hotkeys[i], self.focused_hk == Some(i), self.hover == Some(Hit::Hotkey(i)), s);
+            self.hits.push((fr, Hit::Hotkey(i)));
+            cy += row_h;
+        }
+        y += card_h + 12.0 * s;
+
+        let chk_r = Rect::new(pad as i32, y as i32, (132.0 * s) as i32, (32.0 * s) as i32);
+        widgets::draw_button(pm, &t, chk_r, "Check hotkeys", None, BtnStyle::Secondary, self.hover == Some(Hit::CheckKeys), false, s);
+        self.hits.push((chk_r, Hit::CheckKeys));
+
+        let kbd_w = (224.0 * s) as i32;
+        let kbd_r = Rect::new((pad + cw) as i32 - kbd_w, y as i32, kbd_w, (32.0 * s) as i32);
+        widgets::draw_button(pm, &t, kbd_r, "Windows keyboard settings", None, BtnStyle::Ghost, self.hover == Some(Hit::KeyboardSettings), false, s);
+        self.hits.push((kbd_r, Hit::KeyboardSettings));
+
+        if let Some((ok, ref msg)) = self.key_status {
+            let c = if ok { t.success } else { t.danger };
+            let clipped = widgets::ellipsize(msg, 12.0 * s, false, (kbd_r.x - chk_r.right()) as f32 - 16.0 * s);
+            text::draw(pm, &clipped, chk_r.right() as f32 + 12.0 * s, y + 8.0 * s, 12.0 * s, false, c, None);
+        }
+        y += 42.0 * s;
+        if !self.prtsc_offer {
+            widgets::draw_wrapped(
+                pm,
+                "Tip: Windows 11 may reserve Print Screen for Snipping Tool. If taken, disable \"Use the Print Screen key to open screen capture\" in Windows settings.",
+                pad,
+                y,
+                cw,
+                11.0 * s,
+                false,
+                t.subtext,
+            );
+            return;
+        }
+
+        // Windows currently gives Print Screen to its own screen capture: offer to switch it.
+        let ch = 56.0 * s;
+        let cr = Rect::new(pad as i32, y as i32, cw as i32, ch as i32);
+        widgets::draw_card(pm, &t, cr, 10.0, s);
+        let title = "Use Print Screen for Snap It";
+        text::draw(pm, title, pad + 16.0 * s, y + 10.0 * s, 13.5 * s, true, t.text, None);
+        if seen > 0 && PRTSC_SINCE > seen {
+            let tw = text::layout(title, 13.5 * s, true).width;
+            widgets::draw_badge(pm, &t, pad + 24.0 * s + tw, y + 9.0 * s, "NEW", true, s);
+        }
+        let help = "Turns off Windows' Print Screen shortcut to Snipping Tool. Win+Shift+S still opens it.";
+        let help = widgets::ellipsize(help, 11.5 * s, false, cw - 90.0 * s);
+        text::draw(pm, &help, pad + 16.0 * s, y + 32.0 * s, 11.5 * s, false, t.subtext, None);
+        let tr = Rect::new((pad + cw - 56.0 * s) as i32, (y + (ch - 24.0 * s) / 2.0) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
+        widgets::draw_toggle(pm, &t, tr, self.prtsc_take, self.hover == Some(Hit::Toggle(TOG_PRTSC)), s);
+        self.hits.push((cr, Hit::Toggle(TOG_PRTSC)));
+    }
+
+    fn draw_step_features(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
+        let t = self.theme;
+        let s = self.scale;
+        let seen = self.orig.setup_version;
+
+        text::draw(pm, "These optional features are off by default. Turn on the ones you want.", pad, y, 12.5 * s, false, t.subtext, None);
+        y += 24.0 * s;
+
+        let items = [
+            (TOG_SCROLLING, "Scrolling capture", self.scrolling_capture, "Captures long pages by sending mouse-wheel input to the window you select.", 1),
+            (TOG_UPDATE, "Check for updates at startup", self.update_check, "Checks GitHub for newer releases. Never downloads without asking.", 1),
+            (TOG_STARTUP, "Start Snap It when I sign in", self.start_with_windows, "Adds a Startup shortcut so your hotkeys work right after sign-in.", 1),
+            (TOG_CTXMENU, "Add Snap It to the Explorer menu", self.context_menu, "Right-click images for \"Edit with Snap It\" and \"Pin with Snap It\".", 1),
+            (TOG_QUICK, "Show quick-annotate after selecting", self.quick_annotate, "Draw, blur, or add text before copying or saving a region.", 1),
+        ];
+        for (id, title, on, help, since) in items {
+            let ch = 66.0 * s;
+            let cr = Rect::new(pad as i32, y as i32, cw as i32, ch as i32);
+            widgets::draw_card(pm, &t, cr, 10.0, s);
+            let is_new = seen > 0 && since > seen;
+            text::draw(pm, title, pad + 16.0 * s, y + 12.0 * s, 13.5 * s, true, t.text, None);
+            if is_new {
+                let tw = text::layout(title, 13.5 * s, true).width;
+                widgets::draw_badge(pm, &t, pad + 24.0 * s + tw, y + 11.0 * s, "NEW", true, s);
+            }
+            text::draw(pm, help, pad + 16.0 * s, y + 36.0 * s, 11.5 * s, false, t.subtext, None);
+            let tr = Rect::new((pad + cw - 56.0 * s) as i32, (y + (ch - 24.0 * s) / 2.0) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
+            widgets::draw_toggle(pm, &t, tr, on, self.hover == Some(Hit::Toggle(id)), s);
+            self.hits.push((cr, Hit::Toggle(id)));
+            y += ch + 10.0 * s;
+        }
+    }
+
+    fn draw_step_after(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
+        let t = self.theme;
+        let s = self.scale;
+        let seen = self.orig.setup_version;
+
+        text::draw(pm, "Choose what happens automatically when you finish a capture:", pad, y, 12.5 * s, false, t.subtext, None);
+        y += 26.0 * s;
+
+        let card_h = 200.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, card_h as i32), 10.0, s);
+        let ix = pad + 16.0 * s;
+        let iw = cw - 32.0 * s;
+        let mut cy = y + 14.0 * s;
+        for (idx, (id, title, on, since)) in [
+            (TOG_T_COPY, "Copy the image to the clipboard", self.t_copy, 1),
+            (TOG_T_SAVE, "Save it to the screenshots folder", self.t_save, 1),
+            (TOG_T_EDITOR, "Open it in the editor", self.t_editor, 1),
+            (TOG_T_NOTIFY, "Show a notification (click to open)", self.t_notify, 1),
+            (TOG_T_SOUND, "Play the capture sound", self.t_sound, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if idx > 0 {
+                widgets::draw_divider(pm, &t, ix, ix + iw, cy - 5.0 * s);
+            }
+            let lbl = tagged(title, since, seen);
+            text::draw(pm, &lbl, ix, cy + 2.0 * s, 13.0 * s, false, t.text, None);
+            let tr = Rect::new((ix + iw - 42.0 * s) as i32, cy as i32, (42.0 * s) as i32, (24.0 * s) as i32);
+            widgets::draw_toggle(pm, &t, tr, on, self.hover == Some(Hit::Toggle(id)), s);
+            self.hits.push((Rect::new(ix as i32, (cy - 4.0 * s) as i32, iw as i32, (34.0 * s) as i32), Hit::Toggle(id)));
+            cy += 36.0 * s;
+        }
+        y += card_h + 16.0 * s;
+
+        let save_card_h = 68.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, save_card_h as i32), 10.0, s);
+        text::draw(pm, &format!("Save folder: {}", self.orig.save_dir().display()), pad + 16.0 * s, y + 14.0 * s, 12.0 * s, true, t.text, None);
+        text::draw(pm, "The quick-annotate toolbar also has Copy, Save, Pin and Edit buttons for one-off choices.", pad + 16.0 * s, y + 38.0 * s, 11.5 * s, false, t.subtext, None);
+    }
+
+    fn draw_step_done(&mut self, pm: &mut PixmapMut, pad: f32, cw: f32, mut y: f32) {
+        let t = self.theme;
+        let s = self.scale;
+
+        let card_h = 240.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(pad as i32, y as i32, cw as i32, card_h as i32), 12.0, s);
+        let mut cy = y + 20.0 * s;
+        for line in self.summary_lines() {
+            let lh = widgets::draw_wrapped(pm, &line, pad + 20.0 * s, cy, cw - 40.0 * s, 13.0 * s, false, t.text);
+            cy += lh + 14.0 * s;
+        }
+        y += card_h + 18.0 * s;
+
+        let tr_card = Rect::new(pad as i32, y as i32, cw as i32, (56.0 * s) as i32);
+        widgets::draw_card(pm, &t, tr_card, 10.0, s);
+        text::draw(pm, "Take a screenshot when I click Finish", pad + 16.0 * s, y + 19.0 * s, 13.5 * s, true, t.text, None);
+        let tr = Rect::new((pad + cw - 58.0 * s) as i32, (y + 16.0 * s) as i32, (42.0 * s) as i32, (24.0 * s) as i32);
+        widgets::draw_toggle(pm, &t, tr, self.try_now, self.hover == Some(Hit::Toggle(TOG_TRY_NOW)), s);
+        self.hits.push((tr_card, Hit::Toggle(TOG_TRY_NOW)));
+    }
 }
 
 impl Handler for WelcomeWin {
+    fn snapshot(&self) -> Option<Pixmap> {
+        self.bb.as_ref()?.to_pixmap()
+    }
+
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        if !self.built && msg == windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW {
-            self.build(w.hwnd);
-            self.nt.style_children(w.hwnd);
-        }
         if msg == super::WM_SNAPIT_THEME {
-            self.nt.refresh();
-            self.nt.style_children(w.hwnd);
-            return None;
+            self.theme = theme::current();
+            w.invalidate();
+            return Some(LRESULT(0));
+        }
+        if let Some((r, dirty)) = self.chrome.nc_message(w.hwnd, msg, wp) {
+            if dirty {
+                w.invalidate();
+            }
+            return Some(r);
         }
         match msg {
-            WM_ERASEBKGND => {
-                self.nt.erase(w.hwnd, HDC(wp.0 as *mut _));
+            WM_NCCALCSIZE => Chrome::handle_nccalcsize(w.hwnd, wp, lp),
+            WM_NCHITTEST => Some(self.chrome.hit_test(w.hwnd, lp, self.scale, &[])),
+            WM_KILLFOCUS => {
+                // Never leave the global hotkeys paused while another window has the keyboard.
+                if self.focused_hk.is_some() {
+                    self.set_hk_focus(None);
+                    w.invalidate();
+                }
+                None
+            }
+            WM_MOUSELEAVE => {
+                self.chrome.mouse_leave();
+                self.hover = None;
+                w.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_SIZE => {
+                self.scale = w.dpi_scale();
+                w.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_ERASEBKGND => Some(LRESULT(1)),
+            WM_PAINT => {
+                self.render(w.hwnd);
+                backbuffer::paint(w.hwnd, self.bb.as_ref());
+                Some(LRESULT(0))
+            }
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let cur = if self.hover.is_some() || self.chrome.hover.is_some() { IDC_HAND } else { IDC_ARROW };
+                unsafe {
+                    if let Ok(c) = LoadCursorW(None, cur) {
+                        SetCursor(Some(c));
+                    }
+                }
                 Some(LRESULT(1))
             }
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => self.nt.ctlcolor(msg, wp),
-            WM_NOTIFY => self.nt.custom_draw(lp),
-            WM_COMMAND => {
-                let id = (wp.0 & 0xFFFF) as u16;
-                let code = ((wp.0 >> 16) & 0xFFFF) as u32;
-                if code != BN_CLICKED {
-                    return None;
+            WM_MOUSEMOVE => {
+                let (x, y) = super::lparam_xy(lp);
+                let mut dirty = self.chrome.set_hover(w.hwnd, self.client.0, self.scale, x, y);
+                let h = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
+                if h != self.hover {
+                    self.hover = h;
+                    dirty = true;
                 }
-                match id {
-                    ID_NEXT => self.next(w),
-                    ID_BACK if self.page > 0 => self.show_page(self.page - 1),
-                    ID_SKIP => w.close(),
-                    ID_CHECK_KEYS => {
-                        if let Err(e) = apply_hotkeys(&self.settings.workflows, &self.chosen_hotkeys()) {
-                            self.set(ID_KEY_STATUS, &e);
+                if dirty {
+                    w.invalidate();
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = super::lparam_xy(lp);
+                self.chrome.press(self.client.0, self.scale, x, y);
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = super::lparam_xy(lp);
+                if self.chrome.release(w.hwnd, self.client.0, self.scale, x, y) {
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
+                let hit = self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h);
+                match hit {
+                    Some(Hit::Next) => self.next(w),
+                    Some(Hit::Back) if self.page > 0 => {
+                        self.set_hk_focus(None);
+                        self.page -= 1;
+                    }
+                    Some(Hit::Skip) => w.close(),
+                    Some(Hit::CheckKeys) => {
+                        self.set_hk_focus(None);
+                        if let Err(e) = apply_hotkeys(&self.orig.workflows, &self.chosen_hotkeys()) {
+                            self.key_status = Some((false, e));
                         } else {
                             self.check_keys();
                         }
                     }
-                    ID_KEYBOARD_SETTINGS => crate::shell::open_keyboard_settings(),
-                    _ => {}
+                    Some(Hit::KeyboardSettings) => crate::shell::open_keyboard_settings(),
+                    Some(Hit::Hotkey(i)) => self.set_hk_focus(Some(i)),
+                    Some(Hit::Toggle(id)) => {
+                        self.set_hk_focus(None);
+                        match id {
+                            TOG_SCROLLING => self.scrolling_capture = !self.scrolling_capture,
+                            TOG_UPDATE => self.update_check = !self.update_check,
+                            TOG_STARTUP => self.start_with_windows = !self.start_with_windows,
+                            TOG_CTXMENU => self.context_menu = !self.context_menu,
+                            TOG_QUICK => self.quick_annotate = !self.quick_annotate,
+                            TOG_PRTSC => {
+                                self.prtsc_take = !self.prtsc_take;
+                                // A previous "in use" result may no longer apply.
+                                self.key_status = None;
+                            }
+                            TOG_T_COPY => self.t_copy = !self.t_copy,
+                            TOG_T_SAVE => self.t_save = !self.t_save,
+                            TOG_T_EDITOR => self.t_editor = !self.t_editor,
+                            TOG_T_NOTIFY => self.t_notify = !self.t_notify,
+                            TOG_T_SOUND => self.t_sound = !self.t_sound,
+                            TOG_TRY_NOW => self.try_now = !self.try_now,
+                            _ => {}
+                        }
+                    }
+                    _ => self.set_hk_focus(None),
+                }
+                w.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let vk = wp.0 as u32;
+                if let Some(i) = self.focused_hk {
+                    if vk == 0x1B {
+                        self.set_hk_focus(None);
+                        w.invalidate();
+                        return Some(LRESULT(0));
+                    }
+                    if let Some(new_val) = widgets::handle_hotkey_msg(false, vk) {
+                        self.hotkeys[i] = new_val;
+                        w.invalidate();
+                    }
+                    return Some(LRESULT(0));
+                }
+                if msg == WM_SYSKEYDOWN {
+                    // Let DefWindowProc handle Alt+F4, Alt+Space, F10, etc.
+                    return None;
+                }
+                if vk == 0x1B {
+                    w.close();
+                    return Some(LRESULT(0));
                 }
                 Some(LRESULT(0))
             }
+            WM_KEYUP | WM_SYSKEYUP => {
+                let vk = wp.0 as u32;
+                if let Some(i) = self.focused_hk {
+                    if let Some(new_val) = widgets::handle_hotkey_msg(true, vk) {
+                        self.hotkeys[i] = new_val;
+                        w.invalidate();
+                    }
+                    return Some(LRESULT(0));
+                }
+                None
+            }
+            WM_COMMAND => {
+                let id = (wp.0 & 0xFFFF) as u16;
+                if id == ID_NEXT {
+                    self.next(w);
+                    return Some(LRESULT(0));
+                }
+                if id == ID_TEST_PRTSC && super::headless() {
+                    self.prtsc_offer = true;
+                    self.prtsc_take = true;
+                    self.page = 1;
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
+                None
+            }
             WM_DESTROY => {
-                super::hotkey_field::resume_hotkeys();
-                // Skipped or closed: change nothing but the setup version, so setup doesn't
-                // come back at every start (it can be run again from Settings). On the first
-                // run this also writes the defaults.
+                widgets::resume_hotkeys();
                 if !self.finished && (is_first_run() || app::settings().setup_version < SETUP_VERSION) {
                     app::update_settings(|s| s.setup_version = SETUP_VERSION);
-                }
-                for f in [self.font, self.title_font] {
-                    if !f.is_invalid() {
-                        unsafe {
-                            let _ = DeleteObject(f.into());
-                        }
-                    }
                 }
                 OPEN.with(|o| o.set(0));
                 None
@@ -637,7 +967,6 @@ mod tests {
         let out = apply_hotkeys(&old, &chosen).unwrap();
         let find = |a: Action| out.iter().find(|w| w.action == a.name());
         assert_eq!(find(Action::CaptureRegion).unwrap().hotkey, "Ctrl+Shift+S");
-        // Same chord: original text and task chain kept.
         let aw = find(Action::CaptureActiveWindow).unwrap();
         assert_eq!(aw.hotkey, "Shift+PrintScreen");
         assert!(aw.tasks.unwrap().pin);
@@ -645,7 +974,6 @@ mod tests {
         assert_eq!(find(Action::RecordGif).unwrap().hotkey, "Ctrl+Alt+G");
         assert!(find(Action::CaptureFullscreen).is_none());
 
-        // Clearing removes the workflow.
         let out = apply_hotkeys(&old, &[(Action::CaptureRegion, String::new())]).unwrap();
         assert!(!out.iter().any(|w| w.action == "capture_region"));
     }
@@ -653,13 +981,16 @@ mod tests {
     #[test]
     fn setup_reappears_only_for_newer_steps() {
         let mut s = Settings::default();
-        assert!(is_due(true, &s), "first run");
-        assert!(is_due(false, &s), "settings from before setup existed");
+        assert!(is_due_with(true, &s, false), "first run");
+        assert!(is_due_with(false, &s, false), "settings from before setup existed");
         s.setup_version = SETUP_VERSION;
-        assert!(!is_due(false, &s), "bug-fix update: setup already seen");
-        s.setup_version = SETUP_VERSION + 1; // went back to an older build
-        assert!(!is_due(false, &s));
-        // "(new)" only for items added after the setup the user last saw.
+        assert!(!is_due_with(false, &s, true), "bug-fix update: setup already seen");
+        s.setup_version = SETUP_VERSION + 1;
+        assert!(!is_due_with(false, &s, true));
+        // Setup 2 only added the Print Screen option: re-show only where it helps.
+        s.setup_version = PRTSC_SINCE - 1;
+        assert!(is_due_with(false, &s, true), "Windows owns Print Screen");
+        assert!(!is_due_with(false, &s, false), "nothing new for this user");
         assert_eq!(tagged("Ruler", 3, 2), "Ruler  (new)");
         assert_eq!(tagged("Ruler", 2, 2), "Ruler");
         assert_eq!(tagged("Ruler", 3, 0), "Ruler");
@@ -669,7 +1000,6 @@ mod tests {
     fn hotkey_mistakes_are_reported() {
         let old = vec![wf("Ctrl+Alt+H", Action::OpenHistory)];
         assert!(apply_hotkeys(&old, &[(Action::CaptureRegion, "Ctrl+Nope".into())]).unwrap_err().contains("Ctrl+Nope"));
-        // Clashes with a hotkey not shown in the wizard are caught too.
         let e = apply_hotkeys(&old, &[(Action::CaptureRegion, "Ctrl+Alt+H".into())]).unwrap_err();
         assert!(e.contains("History") && e.contains("Region"), "{e}");
         let e = apply_hotkeys(&[], &[(Action::CaptureRegion, "F9".into()), (Action::RecordMp4, "F9".into())]).unwrap_err();

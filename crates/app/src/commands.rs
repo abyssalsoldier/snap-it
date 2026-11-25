@@ -136,7 +136,7 @@ pub fn run_action(a: Action, allow_delay: bool) {
         Action::ColorPicker => overlay::open(Mode::ColorPicker),
         Action::Ruler => overlay::open(Mode::Ruler),
         Action::MakeQr => crate::ui::qr_dialog::open(),
-        Action::OpenEditor => crate::ui::editor::open_from_file_or_clipboard(),
+        Action::OpenEditor => crate::ui::editor::open_blank(),
         Action::OpenHistory => crate::ui::history::open(),
         Action::OpenFolder => crate::shell::open_folder(&s.save_dir()),
         Action::OpenSettings => crate::ui::settings_window::open(),

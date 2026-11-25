@@ -618,15 +618,20 @@ impl OptionsBar {
                     // Group background, drawn once from the first cell.
                     if first {
                         let gw = SEG * s * choice_count(o) as f32;
-                        if let Some(bg) = rounded_rect(x, y + 1.0, gw, h - 2.0, 6.0 * s) {
-                            pm.fill_path(&bg, &t.raised.paint(), FillRule::Winding, id, None);
+                        if let Some(bg) = rounded_rect(x, y + 1.0, gw, h - 2.0, 7.0 * s) {
+                            pm.fill_path(&bg, &t.input_bg.paint(), FillRule::Winding, id, None);
+                            pm.stroke_path(&bg, &t.border_subtle.paint(), &thin, id, None);
                         }
                     }
                     let _ = last;
                     let on = v.choice(o) == n;
-                    if on || hovered(r) {
+                    if on {
                         if let Some(c) = rounded_rect(x + 2.0, y + 3.0, w - 4.0, h - 6.0, 5.0 * s) {
-                            pm.fill_path(&c, &(if on { t.accent } else { t.hover }).paint(), FillRule::Winding, id, None);
+                            pm.fill_path(&c, &t.accent_paint(x, y, x + w, y + h), FillRule::Winding, id, None);
+                        }
+                    } else if hovered(r) {
+                        if let Some(c) = rounded_rect(x + 2.0, y + 3.0, w - 4.0, h - 6.0, 5.0 * s) {
+                            pm.fill_path(&c, &t.hover.paint(), FillRule::Winding, id, None);
                         }
                     }
                     let fg = if on { t.accent_text } else { t.text };
@@ -636,17 +641,20 @@ impl OptionsBar {
                     }
                 }
                 Part::Toggle(o) => {
-                    if hovered(r) {
-                        if let Some(bg) = rounded_rect(x, y, w, h, 6.0 * s) {
+                    let on = v.toggled(o);
+                    if let Some(bg) = rounded_rect(x, y + 1.0, w, h - 2.0, 7.0 * s) {
+                        if on {
+                            pm.fill_path(&bg, &t.accent_soft.paint(), FillRule::Winding, id, None);
+                            pm.stroke_path(&bg, &t.accent.with_alpha(140).paint(), &thin, id, None);
+                        } else if hovered(r) {
                             pm.fill_path(&bg, &t.hover.paint(), FillRule::Winding, id, None);
                         }
                     }
                     let b = 14.0 * s;
-                    let (bx, by) = (x + 4.0 * s, y + (h - b) / 2.0);
-                    let on = v.toggled(o);
-                    if let Some(bp) = rounded_rect(bx, by, b, b, 3.0 * s) {
+                    let (bx, by) = (x + 5.0 * s, y + (h - b) / 2.0);
+                    if let Some(bp) = rounded_rect(bx, by, b, b, 4.0 * s) {
                         if on {
-                            pm.fill_path(&bp, &t.accent.paint(), FillRule::Winding, id, None);
+                            pm.fill_path(&bp, &t.accent_paint(bx, by, bx + b, by + b), FillRule::Winding, id, None);
                             let mut pb = PathBuilder::new();
                             pb.move_to(bx + b * 0.22, by + b * 0.52);
                             pb.line_to(bx + b * 0.42, by + b * 0.72);

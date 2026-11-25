@@ -259,28 +259,50 @@ impl Handler for Pill {
                 if let Some(bb) = self.bb.as_mut() {
                     let mut pm = bb.pixmap();
                     let id = Transform::identity();
-                    pm.fill(Rgba::rgb(24, 24, 27).color());
+                    let t = crate::ui::theme::current();
+                    pm.fill(t.panel.color());
+                    if let Some(border) = rounded_rect(0.5, 0.5, cw as f32 - 1.0, ch as f32 - 1.0, 8.0 * s) {
+                        pm.stroke_path(
+                            &border,
+                            &t.border.paint(),
+                            &snapit_gfx::tiny_skia::Stroke { width: 1.2, ..Default::default() },
+                            id,
+                            None,
+                        );
+                    }
                     let blink = secs % 2 == 0 || frames == 0;
-                    if let Some(dot) = PathBuilder::from_circle(16.0 * s, ch as f32 / 2.0, 6.0 * s) {
-                        pm.fill_path(&dot, &Rgba::rgb(239, 68, 68).with_alpha(if blink { 255 } else { 120 }).paint(), FillRule::Winding, id, None);
+                    if blink {
+                        if let Some(halo) = PathBuilder::from_circle(18.0 * s, ch as f32 / 2.0, 9.0 * s) {
+                            pm.fill_path(&halo, &t.danger.with_alpha(55).paint(), FillRule::Winding, id, None);
+                        }
+                    }
+                    if let Some(dot) = PathBuilder::from_circle(18.0 * s, ch as f32 / 2.0, 5.5 * s) {
+                        pm.fill_path(&dot, &t.danger.with_alpha(if blink { 255 } else { 110 }).paint(), FillRule::Winding, id, None);
                     }
                     let label = format!("{}  {:02}:{:02}", if self.kind == Kind::Gif { "GIF" } else { "REC" }, secs / 60, secs % 60);
-                    let ts = 14.0 * s;
+                    let ts = 13.5 * s;
                     let l = text::layout(&label, ts, true);
-                    text::draw(&mut pm, &label, 30.0 * s, (ch as f32 - l.height) / 2.0, ts, true, Rgba::WHITE, None);
+                    text::draw(&mut pm, &label, 33.0 * s, (ch as f32 - l.height) / 2.0, ts, true, t.text, None);
                     for (b, r) in buttons {
-                        let bg = if self.hover == Some(b) { Rgba::rgb(63, 63, 72) } else { Rgba::rgb(45, 45, 52) };
-                        if let Some(p) = rounded_rect(r.x as f32, r.y as f32, r.w as f32, r.h as f32, 6.0 * s) {
+                        let bg = if self.hover == Some(b) { t.hover } else { t.raised };
+                        if let Some(p) = rounded_rect(r.x as f32, r.y as f32, r.w as f32, r.h as f32, 7.0 * s) {
                             pm.fill_path(&p, &bg.paint(), FillRule::Winding, id, None);
+                            pm.stroke_path(
+                                &p,
+                                &t.border_subtle.paint(),
+                                &snapit_gfx::tiny_skia::Stroke { width: 1.0, ..Default::default() },
+                                id,
+                                None,
+                            );
                         }
                         let inset = r.w as f32 * 0.3;
                         match b {
                             PillBtn::Stop => {
-                                if let Some(sq) = rounded_rect(r.x as f32 + inset, r.y as f32 + inset, r.w as f32 - inset * 2.0, r.h as f32 - inset * 2.0, 2.0) {
-                                    pm.fill_path(&sq, &Rgba::rgb(239, 68, 68).paint(), FillRule::Winding, id, None);
+                                if let Some(sq) = rounded_rect(r.x as f32 + inset, r.y as f32 + inset, r.w as f32 - inset * 2.0, r.h as f32 - inset * 2.0, 2.5) {
+                                    pm.fill_path(&sq, &t.danger.paint(), FillRule::Winding, id, None);
                                 }
                             }
-                            PillBtn::Cancel => crate::ui::icons::draw(&mut pm, crate::ui::icons::Icon::Close, r.x as f32 + r.w as f32 * 0.15, r.y as f32 + r.h as f32 * 0.15, r.w as f32 * 0.7, Rgba::WHITE),
+                            PillBtn::Cancel => crate::ui::icons::draw(&mut pm, crate::ui::icons::Icon::Close, r.x as f32 + r.w as f32 * 0.15, r.y as f32 + r.h as f32 * 0.15, r.w as f32 * 0.7, t.text),
                         }
                     }
                 }

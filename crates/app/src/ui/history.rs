@@ -10,16 +10,21 @@ use snapit_gfx::tiny_skia::{FillRule, Pixmap, PixmapPaint, Stroke, Transform};
 use snapit_gfx::{text, Rect};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, MessageBoxW,
-    PostMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, IDYES, MB_ICONWARNING,
-    MB_YESNO, MF_SEPARATOR, MF_STRING, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SIZE, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, LoadCursorW,
+    MessageBoxW, PostMessageW, SetCursor, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+    HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR, MF_STRING,
+    SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
+    WS_OVERLAPPEDWINDOW,
 };
 
-use super::icons::{self, Icon};
+use super::chrome::Chrome;
+use super::icons::Icon;
 use super::theme::{self, Theme};
+use super::widgets::{self, BtnStyle};
 use super::{backbuffer, Backbuffer, Handler, Win};
 use crate::app::{self, Command};
 use crate::history::{self as hist, Entry};
@@ -39,6 +44,7 @@ struct Thumb {
 struct History {
     theme: Theme,
     scale: f32,
+    chrome: Chrome,
     entries: Vec<Entry>,
     thumbs: HashMap<usize, Option<Pixmap>>,
     requested: HashSet<usize>,
@@ -49,6 +55,8 @@ struct History {
     bb: Option<Backbuffer>,
     selected: Option<usize>,
     hover: Option<usize>,
+    hover_folder: bool,
+    folder_pressed: bool,
     folder_btn: Rect,
 }
 
@@ -67,6 +75,7 @@ pub fn open() {
     let h = History {
         theme: theme::current(),
         scale: 1.0,
+        chrome: Chrome::new(true, true, true),
         entries,
         thumbs: HashMap::new(),
         requested: HashSet::new(),
@@ -77,6 +86,8 @@ pub fn open() {
         bb: None,
         selected: None,
         hover: None,
+        hover_folder: false,
+        folder_pressed: false,
         folder_btn: Rect::default(),
     };
     let mons = snapit_capture::monitors();
@@ -86,6 +97,7 @@ pub fn open() {
     let r = Rect::new(work.x + (work.w - w) / 2, work.y + (work.h - h_) / 2, w, h_);
     match super::create("SnapItHistory", WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, "Snap It History", r, None, Box::new(h)) {
         Ok(hwnd) => {
+            Chrome::init(hwnd);
             OPEN.with(|o| o.set(hwnd.0 as isize));
             super::show(hwnd, true);
         }
@@ -116,7 +128,7 @@ fn start_worker(hwnd: HWND) -> Sender<(u32, usize, PathBuf, u32, u32)> {
 
 impl History {
     fn header_h(&self) -> f32 {
-        52.0 * self.scale
+        self.chrome.height(self.scale) as f32
     }
     fn cell(&self) -> (f32, f32) {
         (230.0 * self.scale, 204.0 * self.scale)
@@ -170,17 +182,17 @@ impl History {
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, hwnd: HWND) {
         Backbuffer::ensure(&mut self.bb, self.client.0.max(1) as u32, self.client.1.max(1) as u32);
         let Some(mut bb) = self.bb.take() else { return };
         {
             let mut pm = bb.pixmap();
-            self.draw(&mut pm);
+            self.draw(&mut pm, hwnd);
         }
         self.bb = Some(bb);
     }
 
-    fn draw(&mut self, pm: &mut snapit_gfx::tiny_skia::PixmapMut) {
+    fn draw(&mut self, pm: &mut snapit_gfx::tiny_skia::PixmapMut, hwnd: HWND) {
         let t = self.theme;
         let s = self.scale;
         let id = Transform::identity();
@@ -192,17 +204,31 @@ impl History {
                 continue;
             }
             let inner = r.inflate(-(6.0 * s) as i32);
-            let bg = if self.selected == Some(i) { t.accent.with_alpha(60) } else if self.hover == Some(i) { t.hover } else { t.panel };
-            if let Some(p) = rounded_rect(inner.x as f32, inner.y as f32, inner.w as f32, inner.h as f32, 8.0 * s) {
+            let sel = self.selected == Some(i);
+            let hov = self.hover == Some(i);
+            let bg = if sel { t.accent_soft } else if hov { t.raised } else { t.panel };
+            if let Some(p) = rounded_rect(inner.x as f32, inner.y as f32, inner.w as f32, inner.h as f32, 10.0 * s) {
                 pm.fill_path(&p, &bg.paint(), FillRule::Winding, id, None);
-                if self.selected == Some(i) {
-                    pm.stroke_path(&p, &t.accent.paint(), &Stroke { width: 2.0, ..Default::default() }, id, None);
+                if sel {
+                    pm.stroke_path(
+                        &p,
+                        &t.accent_paint(inner.x as f32, inner.y as f32, inner.right() as f32, inner.bottom() as f32),
+                        &Stroke { width: 2.0, ..Default::default() },
+                        id,
+                        None,
+                    );
+                } else {
+                    let bc = if hov { t.border } else { t.border_subtle };
+                    pm.stroke_path(&p, &bc.paint(), &Stroke { width: 1.0, ..Default::default() }, id, None);
                 }
             }
             let (tw, th) = self.thumb_size();
             let tx = inner.x as f32 + (inner.w as f32 - tw as f32) / 2.0;
             let ty = inner.y as f32 + 8.0 * s;
             let e = &self.entries[i];
+            if let Some(well) = rounded_rect(tx, ty, tw as f32, th as f32, 6.0 * s) {
+                pm.fill_path(&well, &t.input_bg.paint(), FillRule::Winding, id, None);
+            }
             match self.thumbs.get(&i) {
                 Some(Some(img)) => {
                     let ox = tx + (tw as f32 - img.width() as f32) / 2.0;
@@ -214,36 +240,42 @@ impl History {
                     let l = text::layout(msg, 12.0 * s, false);
                     text::draw(pm, msg, tx + (tw as f32 - l.width) / 2.0, ty + th as f32 / 2.0 - l.height / 2.0, 12.0 * s, false, t.subtext, None);
                 }
-                None => {
-                    if let Some(p) = rounded_rect(tx, ty, tw as f32, th as f32, 4.0 * s) {
-                        pm.fill_path(&p, &t.raised.paint(), FillRule::Winding, id, None);
-                    }
-                }
+                None => {}
             }
             let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let name = ellipsize(&name, 12.0 * s, inner.w as f32 - 16.0 * s);
-            text::draw(pm, &name, inner.x as f32 + 8.0 * s, ty + th as f32 + 8.0 * s, 12.0 * s, false, t.text, None);
-            let meta = format!("{} × {}  ·  {}", e.width, e.height, e.kind.replace('_', " "));
-            text::draw(pm, &meta, inner.x as f32 + 8.0 * s, ty + th as f32 + 26.0 * s, 11.0 * s, false, t.subtext, None);
+            text::draw(pm, &name, inner.x as f32 + 8.0 * s, ty + th as f32 + 8.0 * s, 12.0 * s, true, t.text, None);
+            let meta = format!("{} × {}", e.width, e.height);
+            text::draw(pm, &meta, inner.x as f32 + 8.0 * s, ty + th as f32 + 27.0 * s, 11.0 * s, false, t.subtext, None);
+            let kind_lbl = e.kind.strip_prefix("capture_").unwrap_or(&e.kind).replace('_', " ");
+            let kl = text::layout(&kind_lbl, 10.5 * s, true);
+            widgets::draw_badge(pm, &t, inner.right() as f32 - kl.width - 20.0 * s, ty + th as f32 + 24.0 * s, &kind_lbl, false, s);
         }
 
-        // Header on top of the scrolled grid.
-        if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, 0.0, self.client.0 as f32, self.header_h()) {
-            pm.fill_rect(r, &t.panel.paint(), id, None);
-        }
-        let title = format!("History  ·  {} captures", self.entries.len());
-        text::draw(pm, &title, 16.0 * s, 14.0 * s, 17.0 * s, true, t.text, None);
+        // Custom scrollbar.
+        let hh = self.header_h() as i32;
+        widgets::draw_scrollbar(pm, &t, Rect::new(0, hh, self.client.0, (self.client.1 - hh).max(1)), self.scroll, self.content_h(), s);
+
+        // Integrated custom titlebar with count badge and Open folder button.
+        let count_badge = format!("{} captures", self.entries.len());
+        let bw = (132.0 * s) as i32;
+        // Keep the title and badge clear of the Open folder button.
+        self.chrome.reserve_right = bw + (12.0 * s) as i32;
+        self.chrome.draw(pm, &t, hwnd, self.client.0, s, "History", Some(&count_badge), None);
+
+        let bh = (28.0 * s) as i32;
+        let bx = self.chrome.buttons_left(self.client.0, s) - bw - (12.0 * s) as i32;
+        let by = (hh - bh) / 2;
+        self.folder_btn = Rect::new(bx, by, bw, bh);
+        widgets::draw_button(pm, &t, self.folder_btn, "Open folder", Some(Icon::Folder), BtnStyle::Secondary, self.hover_folder, false, s);
+
         let hint = "Double-click to edit · right-click for more";
-        let hl = text::layout(hint, 12.0 * s, false);
-        let bw = 150.0 * s;
-        self.folder_btn = Rect::new((self.client.0 as f32 - bw - 12.0 * s) as i32, (10.0 * s) as i32, bw as i32, (32.0 * s) as i32);
-        text::draw(pm, hint, self.folder_btn.x as f32 - hl.width - 16.0 * s, 18.0 * s, 12.0 * s, false, t.subtext, None);
-        let fb = self.folder_btn;
-        if let Some(p) = rounded_rect(fb.x as f32, fb.y as f32, fb.w as f32, fb.h as f32, 6.0 * s) {
-            pm.fill_path(&p, &t.raised.paint(), FillRule::Winding, id, None);
+        let hl = text::layout(hint, 11.5 * s, false);
+        let hx = self.folder_btn.x as f32 - hl.width - 14.0 * s;
+        if hx > 240.0 * s {
+            text::draw(pm, hint, hx, (hh as f32 - hl.height) / 2.0, 11.5 * s, false, t.subtext, None);
         }
-        icons::draw(pm, Icon::Folder, fb.x as f32 + 8.0 * s, fb.y as f32 + 6.0 * s, 20.0 * s, t.text);
-        text::draw(pm, "Open folder", fb.x as f32 + 34.0 * s, fb.y as f32 + 7.0 * s, 13.0 * s, false, t.text, None);
+
         if self.entries.is_empty() {
             let msg = "No captures yet. Saved screenshots will appear here.";
             let l = text::layout(msg, 14.0 * s, false);
@@ -349,7 +381,15 @@ impl Handler for History {
         if msg == super::WM_SNAPIT_THEME {
             self.theme = super::theme::current();
         }
+        if let Some((r, dirty)) = self.chrome.nc_message(w.hwnd, msg, wp) {
+            if dirty {
+                w.invalidate();
+            }
+            return Some(r);
+        }
         match msg {
+            WM_NCCALCSIZE => Chrome::handle_nccalcsize(w.hwnd, wp, lp),
+            WM_NCHITTEST => Some(self.chrome.hit_test(w.hwnd, lp, self.scale, &[self.folder_btn])),
             WM_SIZE => {
                 let mut rc = Default::default();
                 unsafe {
@@ -364,11 +404,20 @@ impl Handler for History {
                 Some(LRESULT(0))
             }
             WM_PAINT => {
-                self.render();
+                self.render(w.hwnd);
                 backbuffer::paint(w.hwnd, self.bb.as_ref());
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)),
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let cur = if self.hover_folder || self.chrome.hover.is_some() || self.hover.is_some() { IDC_HAND } else { IDC_ARROW };
+                unsafe {
+                    if let Ok(c) = LoadCursorW(None, cur) {
+                        SetCursor(Some(c));
+                    }
+                }
+                Some(LRESULT(1))
+            }
             WM_THUMB => {
                 let th = unsafe { Box::from_raw(lp.0 as *mut Thumb) };
                 if th.gen == self.gen && th.idx < self.entries.len() {
@@ -386,21 +435,49 @@ impl Handler for History {
             }
             WM_MOUSEMOVE => {
                 let (x, y) = super::lparam_xy(lp);
+                let mut dirty = self.chrome.set_hover(w.hwnd, self.client.0, self.scale, x, y);
+                let hf = self.folder_btn.contains(x, y);
+                if hf != self.hover_folder {
+                    self.hover_folder = hf;
+                    dirty = true;
+                }
                 let h = self.index_at(x, y);
                 if h != self.hover {
                     self.hover = h;
+                    dirty = true;
+                }
+                if dirty {
                     w.invalidate();
                 }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
                 let (x, y) = super::lparam_xy(lp);
-                if self.folder_btn.contains(x, y) {
-                    crate::shell::open_folder(&app::settings().save_dir());
-                } else {
+                self.chrome.press(self.client.0, self.scale, x, y);
+                self.folder_pressed = self.folder_btn.contains(x, y);
+                if (y as f32) >= self.header_h() {
                     self.selected = self.index_at(x, y);
                     w.invalidate();
                 }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = super::lparam_xy(lp);
+                let folder_pressed = std::mem::take(&mut self.folder_pressed);
+                if self.chrome.release(w.hwnd, self.client.0, self.scale, x, y) {
+                    w.invalidate();
+                    return Some(LRESULT(0));
+                }
+                if folder_pressed && self.folder_btn.contains(x, y) {
+                    crate::shell::open_folder(&app::settings().save_dir());
+                }
+                Some(LRESULT(0))
+            }
+            WM_MOUSELEAVE => {
+                self.chrome.mouse_leave();
+                self.hover_folder = false;
+                self.hover = None;
+                w.invalidate();
                 Some(LRESULT(0))
             }
             WM_LBUTTONDBLCLK => {

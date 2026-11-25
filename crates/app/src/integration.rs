@@ -16,8 +16,8 @@ use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Registry::{
-    RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE,
-    REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD,
 };
 use windows::Win32::UI::Shell::{IShellLinkW, SHGetKnownFolderPath, ShellLink, FOLDERID_Startup, KF_FLAG_DEFAULT};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -110,6 +110,41 @@ fn create_key(path: &str) -> Result<HKEY, String> {
     let mut key = HKEY::default();
     let r = unsafe { RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), None, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut key, None) };
     r.ok().map(|_| key).map_err(|e| e.to_string())
+}
+
+const KEYBOARD_KEY: &str = "Control Panel\\Keyboard";
+const PRTSC_SNIPPING: &str = "PrintScreenKeyForSnippingEnabled";
+
+/// Windows' own "Use the Print Screen key to open screen capture" setting (Settings >
+/// Accessibility > Keyboard): `Some(true)` on, `Some(false)` off, `None` when the user has
+/// never changed it (the default then depends on the Windows build).
+pub fn print_screen_opens_snipping() -> Option<bool> {
+    let mut v: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(KEYBOARD_KEY),
+            &HSTRING::from(PRTSC_SNIPPING),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut _),
+            Some(&mut len),
+        )
+    };
+    r.is_ok().then_some(v != 0)
+}
+
+/// Turns Windows' Print Screen → screen capture setting on or off, for this user only.
+/// Only called when the user opts in during setup; Snap It never changes it on its own.
+pub fn set_print_screen_opens_snipping(on: bool) -> Result<(), String> {
+    let k = create_key(KEYBOARD_KEY)?;
+    let v: u32 = on as u32;
+    let r = unsafe { RegSetValueExW(k, &HSTRING::from(PRTSC_SNIPPING), None, REG_DWORD, Some(&v.to_le_bytes())) };
+    unsafe {
+        let _ = windows::Win32::System::Registry::RegCloseKey(k);
+    }
+    r.ok().map_err(|e| e.to_string())
 }
 
 pub fn set_context_menu(on: bool) -> Result<(), String> {

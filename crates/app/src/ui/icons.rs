@@ -39,6 +39,17 @@ pub enum Icon {
     ZoomFit,
     Folder,
     Spotlight,
+    Minimize,
+    Maximize,
+    Restore,
+    Settings,
+    Camera,
+    Bolt,
+    Keyboard,
+    Video,
+    Plug,
+    ChevronLeft,
+    ChevronRight,
 }
 
 struct Pen<'a, 'b> {
@@ -264,5 +275,46 @@ pub fn draw(pm: &mut PixmapMut, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) 
             p.poly(&[(0.36, 0.82), (0.18, 0.82), (0.18, 0.64)], false);
         }
         Icon::Folder => p.poly(&[(0.14, 0.3), (0.38, 0.3), (0.46, 0.38), (0.86, 0.38), (0.86, 0.78), (0.14, 0.78)], true),
+        Icon::Minimize => p.poly(&[(0.24, 0.52), (0.76, 0.52)], false),
+        Icon::Maximize => p.rect(0.24, 0.24, 0.76, 0.76, 0.06, false),
+        Icon::Restore => {
+            p.rect(0.22, 0.34, 0.66, 0.78, 0.05, false);
+            p.poly(&[(0.34, 0.34), (0.34, 0.22), (0.78, 0.22), (0.78, 0.66), (0.66, 0.66)], false);
+        }
+        Icon::Settings => {
+            p.circle(0.5, 0.5, 0.16, false);
+            p.circle(0.5, 0.5, 0.33, false);
+            for i in 0..4 {
+                let a = (i as f32) * std::f32::consts::FRAC_PI_4;
+                let (dx, dy) = (a.cos(), a.sin());
+                p.poly(&[(0.5 + dx * 0.31, 0.5 + dy * 0.31), (0.5 + dx * 0.43, 0.5 + dy * 0.43)], false);
+                p.poly(&[(0.5 - dx * 0.31, 0.5 - dy * 0.31), (0.5 - dx * 0.43, 0.5 - dy * 0.43)], false);
+            }
+        }
+        Icon::Camera => {
+            p.rect(0.14, 0.3, 0.86, 0.78, 0.09, false);
+            p.poly(&[(0.34, 0.3), (0.4, 0.2), (0.6, 0.2), (0.66, 0.3)], false);
+            p.circle(0.5, 0.54, 0.14, false);
+        }
+        Icon::Bolt => p.poly(&[(0.56, 0.14), (0.24, 0.54), (0.48, 0.54), (0.42, 0.86), (0.76, 0.44), (0.52, 0.44)], true),
+        Icon::Keyboard => {
+            p.rect(0.12, 0.26, 0.88, 0.74, 0.08, false);
+            for kx in [0.24, 0.4, 0.56, 0.72] {
+                p.poly(&[(kx, 0.42), (kx + 0.05, 0.42)], false);
+            }
+            p.poly(&[(0.3, 0.6), (0.7, 0.6)], false);
+        }
+        Icon::Video => {
+            p.rect(0.14, 0.28, 0.64, 0.72, 0.08, false);
+            p.poly(&[(0.64, 0.44), (0.86, 0.3), (0.86, 0.7), (0.64, 0.56)], true);
+        }
+        Icon::Plug => {
+            p.poly(&[(0.34, 0.18), (0.34, 0.38)], false);
+            p.poly(&[(0.66, 0.18), (0.66, 0.38)], false);
+            p.rect(0.24, 0.38, 0.76, 0.64, 0.08, false);
+            p.poly(&[(0.5, 0.64), (0.5, 0.84)], false);
+        }
+        Icon::ChevronLeft => p.poly(&[(0.62, 0.24), (0.36, 0.5), (0.62, 0.76)], false),
+        Icon::ChevronRight => p.poly(&[(0.38, 0.24), (0.64, 0.5), (0.38, 0.76)], false),
     }
 }

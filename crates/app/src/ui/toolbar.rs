@@ -135,10 +135,11 @@ impl<B: Copy + PartialEq> Toolbar<B> {
     pub fn draw(&self, pm: &mut PixmapMut, t: &Theme, active: impl Fn(B) -> bool, swatch: Option<(B, Rgba, f32)>) {
         let s = self.scale;
         let (w, h) = self.size();
-        if let Some(bg) = rounded_rect(self.x, self.y, w, h, 9.0 * s) {
-            // soft shadow
-            if let Some(sh) = rounded_rect(self.x + 1.0, self.y + 3.0 * s, w, h, 9.0 * s) {
-                pm.fill_path(&sh, &Rgba::new(0, 0, 0, 60).paint(), FillRule::Winding, Transform::identity(), None);
+        let rad = 11.0 * s;
+        if let Some(bg) = rounded_rect(self.x, self.y, w, h, rad) {
+            // Soft elevated shadow
+            if let Some(sh) = rounded_rect(self.x, self.y + 3.0 * s, w, h, rad) {
+                pm.fill_path(&sh, &t.shadow.paint(), FillRule::Winding, Transform::identity(), None);
             }
             pm.fill_path(&bg, &t.panel.paint(), FillRule::Winding, Transform::identity(), None);
             pm.stroke_path(&bg, &t.border.paint(), &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
@@ -146,22 +147,31 @@ impl<B: Copy + PartialEq> Toolbar<B> {
         for (i, btn) in self.buttons.iter().enumerate() {
             let (bx, by, sz) = self.button_rect(i);
             if btn.sep_before && !(btn.row_before && !self.vertical) && i > 0 {
-                let sx = bx - SEP * s / 2.0;
                 let mut pb = PathBuilder::new();
-                pb.move_to(sx, by + sz * 0.2);
-                pb.line_to(sx, by + sz * 0.8);
+                if self.vertical {
+                    let sy = by - SEP * s / 2.0;
+                    pb.move_to(bx + sz * 0.2, sy);
+                    pb.line_to(bx + sz * 0.8, sy);
+                } else {
+                    let sx = bx - SEP * s / 2.0;
+                    pb.move_to(sx, by + sz * 0.22);
+                    pb.line_to(sx, by + sz * 0.78);
+                }
                 if let Some(p) = pb.finish() {
-                    pm.stroke_path(&p, &t.border.paint(), &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
+                    pm.stroke_path(&p, &t.border_subtle.paint(), &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
                 }
             }
             let on = active(btn.id);
-            let fill = if on { Some(t.accent) } else if self.hover == Some(i) { Some(t.hover) } else { None };
-            if let Some(f) = fill {
-                if let Some(p) = rounded_rect(bx + 1.0, by + 1.0, sz - 2.0, sz - 2.0, 6.0 * s) {
-                    pm.fill_path(&p, &f.paint(), FillRule::Winding, Transform::identity(), None);
+            if on {
+                if let Some(p) = rounded_rect(bx + 1.0, by + 1.0, sz - 2.0, sz - 2.0, 7.0 * s) {
+                    pm.fill_path(&p, &t.accent_paint(bx, by, bx + sz, by + sz), FillRule::Winding, Transform::identity(), None);
+                }
+            } else if self.hover == Some(i) {
+                if let Some(p) = rounded_rect(bx + 1.0, by + 1.0, sz - 2.0, sz - 2.0, 7.0 * s) {
+                    pm.fill_path(&p, &t.hover.paint(), FillRule::Winding, Transform::identity(), None);
                 }
             }
-            let fg = if on { t.accent_text } else { t.text };
+            let fg = if on { t.accent_text } else if self.hover == Some(i) { t.text } else { t.text.with_alpha(230) };
             match swatch {
                 Some((id, c, width)) if id == btn.id => {
                     let r = (sz * 0.18 + width.min(16.0) * 0.6 * s).min(sz * 0.36);
@@ -183,7 +193,7 @@ impl<B: Copy + PartialEq> Toolbar<B> {
             let tip = self.buttons[i].tip;
             if self.vertical {
                 let l = text::layout(tip, 12.5 * s, false);
-                let w = l.width + 12.0 * s;
+                let w = l.width + 14.0 * s;
                 draw_tip(pm, t, tip, bx + sz + PAD * s + 8.0 * s + w / 2.0, by + sz * 0.2, s);
             } else {
                 // Below the whole bar, so a tip never covers a lower row.
@@ -195,13 +205,17 @@ impl<B: Copy + PartialEq> Toolbar<B> {
 
 /// A small label bubble centred horizontally on `cx`, top at `y`.
 pub fn draw_tip(pm: &mut PixmapMut, t: &Theme, tip: &str, cx: f32, y: f32, s: f32) {
-    let size = 12.5 * s;
+    let size = 12.0 * s;
     let l = text::layout(tip, size, false);
-    let pad = 6.0 * s;
+    let pad = 7.0 * s;
     let (w, h) = (l.width + pad * 2.0, l.height + pad);
     let x = (cx - w / 2.0).max(2.0);
-    if let Some(p) = rounded_rect(x, y, w, h, 5.0 * s) {
+    if let Some(sh) = rounded_rect(x, y + 2.0 * s, w, h, 6.0 * s) {
+        pm.fill_path(&sh, &t.shadow.paint(), FillRule::Winding, Transform::identity(), None);
+    }
+    if let Some(p) = rounded_rect(x, y, w, h, 6.0 * s) {
         pm.fill_path(&p, &t.raised.paint(), FillRule::Winding, Transform::identity(), None);
+        pm.stroke_path(&p, &t.border.paint(), &Stroke { width: 1.0, ..Default::default() }, Transform::identity(), None);
     }
     text::draw(pm, tip, x + pad, y + pad / 2.0, size, false, t.text, None);
 }

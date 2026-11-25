@@ -7,11 +7,10 @@
 //! via [`Win::close`]; the window is destroyed only after the handler returns.
 
 pub mod backbuffer;
+pub mod chrome;
 pub mod dialogs;
 pub mod editor;
 pub mod history;
-pub mod hotkey_field;
-pub mod native_theme;
 pub mod icons;
 pub mod overlay;
 pub mod pin;
@@ -21,6 +20,7 @@ pub mod theme;
 pub mod tool_options;
 pub mod toolbar;
 pub mod welcome;
+pub mod widgets;
 
 use std::cell::RefCell;
 use std::collections::HashSet;

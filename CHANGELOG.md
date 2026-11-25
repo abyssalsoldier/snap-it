@@ -5,6 +5,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Use Print Screen for Snap It (setup wizard).** When Windows gives the Print Screen key to its
+  own screen capture, the Hotkeys step offers to turn that Windows setting off for you (opt-in,
+  your account only). If Windows doesn't let go of the key straight away, setup tells you to sign
+  out and back in. Setup re-appears once after updating only if this applies to you.
+
+### Changed
+- **New look for every window.** Settings, the setup wizard, History, the QR code maker and the
+  editor now share one custom-drawn design: an integrated title bar with Snap It's icon, a
+  sidebar in Settings, cards, toggle switches, segmented choices, keycap-style hotkey boxes and
+  a cyan-to-indigo accent. Windows 11 rounded corners, Snap Layouts on the maximize button and
+  Aero Snap keep working. The editor's title bar shows the file name; size and zoom stay in the
+  status bar.
+- **Image editor opens on a blank canvas.** Tools > "Image editor…" (and its hotkey) now opens
+  the editor straight away instead of a file picker. Paste an image (Ctrl+V) or open one
+  (Ctrl+O, or the Image button) and the canvas takes that image's size; once the canvas has
+  content, pasted images are added on top as before, and Ctrl+O opens a new editor window.
 
 ## [0.4.0] - 2026-11-25
 ### Added
