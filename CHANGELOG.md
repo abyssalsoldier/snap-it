@@ -6,6 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
 ### Added
 - Versioning: `CHANGELOG.md`, `scripts/bump-version.ps1`, a `snapit --version` flag, and the
   version in the tray tooltip.
@@ -64,5 +65,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.1.0...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.2.0...dev
+[0.2.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/abyssalsoldier/snap-it/releases/tag/v0.1.0
