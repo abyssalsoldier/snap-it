@@ -115,11 +115,18 @@ pub fn run_action(a: Action, allow_delay: bool) {
         Action::CaptureRegion => overlay::open(Mode::Region),
         Action::CaptureWindow => overlay::open(Mode::Window),
         Action::CaptureScrolling => {
-            if s.scrolling_capture {
-                overlay::open(Mode::Scrolling)
-            } else {
-                notify("Scrolling capture is off", "Turn it on in Settings > Capture first.");
+            // A tray balloon is easy to miss (and Windows often hides it), so ask directly.
+            if !s.scrolling_capture {
+                let ok = crate::ui::dialogs::confirm(
+                    "Scrolling capture is off.\n\nIt scrolls the area you select by sending mouse-wheel input to that window. \
+                     Turn it on now? (You can change this later in Settings > Capture.)",
+                );
+                if !ok {
+                    return;
+                }
+                app::update_settings(|s| s.scrolling_capture = true);
             }
+            overlay::open(Mode::Scrolling)
         }
         Action::RecordMp4 => crate::record_ui::toggle(crate::record_ui::Kind::Mp4),
         Action::RecordGif => crate::record_ui::toggle(crate::record_ui::Kind::Gif),
