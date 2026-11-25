@@ -481,7 +481,8 @@ impl SettingsWin {
                 let theme_changed = prev.theme != next.theme;
                 app::with(|st| st.settings = std::rc::Rc::new(next));
                 app::post(Command::ReloadSettings);
-                if theme_changed {
+                // The saved setting now matches the preview; re-theme against it.
+                if theme::end_preview() || theme_changed {
                     super::broadcast_theme();
                 }
                 if !errors.is_empty() {
@@ -1092,7 +1093,12 @@ impl SettingsWin {
             }
             Hit::Text(_) | Hit::Hotkey(_) => {}
             Hit::Seg(SEG_FORMAT, i) => self.format = i.min(SEG_COUNT - 1),
-            Hit::Seg(SEG_THEME, i) => self.theme_pref = i.min(SEG_COUNT - 1),
+            Hit::Seg(SEG_THEME, i) => {
+                // Preview the choice in every window right away; undone if Settings closes unsaved.
+                self.theme_pref = i.min(SEG_COUNT - 1);
+                let pref = [PrefTheme::System, PrefTheme::Light, PrefTheme::Dark][self.theme_pref];
+                theme::set_preview((pref != app::settings().theme).then_some(pref));
+            }
             Hit::Seg(..) => {}
             Hit::Toggle(id) => {
                 if let Some(b) = self.toggle_field(id) {
@@ -1418,6 +1424,8 @@ impl Handler for SettingsWin {
                 None
             }
             WM_DESTROY => {
+                // Closed without saving: put every window back on the saved theme.
+                theme::set_preview(None);
                 widgets::resume_hotkeys();
                 OPEN.with(|o| o.set(0));
                 None

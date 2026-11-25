@@ -12,6 +12,8 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE, WS_CAPTION};
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::settings::Theme as Pref;
 
 #[derive(Clone, Copy, Debug)]
@@ -153,8 +155,36 @@ fn system_is_dark() -> bool {
     ok.is_ok() && v == 0
 }
 
+/// Unsaved theme choice being previewed from Settings (0 = none, else `Pref` index + 1).
+static PREVIEW: AtomicU8 = AtomicU8::new(0);
+
+const PREFS: [Pref; 3] = [Pref::System, Pref::Light, Pref::Dark];
+
+/// Shows `pref` in every window until [`end_preview`]; pass `None` to stop previewing.
+/// Re-themes all windows when the effective choice changes.
+pub fn set_preview(pref: Option<Pref>) {
+    let v = pref.map_or(0, |p| PREFS.iter().position(|x| *x == p).map_or(0, |i| i as u8 + 1));
+    if PREVIEW.swap(v, Ordering::Relaxed) != v {
+        super::broadcast_theme();
+    }
+}
+
+/// Drops any preview without re-theming (the caller broadcasts once the real setting is in place).
+pub fn end_preview() -> bool {
+    PREVIEW.swap(0, Ordering::Relaxed) != 0
+}
+
 pub fn current() -> Theme {
-    match crate::app::settings().theme {
+    let pref = match PREVIEW.load(Ordering::Relaxed) {
+        0 => crate::app::settings().theme,
+        i => PREFS[(i as usize - 1).min(2)],
+    };
+    resolve(pref)
+}
+
+/// The colours a theme preference stands for right now (e.g. to preview an unsaved choice).
+pub fn resolve(pref: Pref) -> Theme {
+    match pref {
         Pref::Dark => DARK,
         Pref::Light => LIGHT,
         Pref::System => {
