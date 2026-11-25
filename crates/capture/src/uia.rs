@@ -19,7 +19,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, TreeScope_Subtree, UIA_BoundingRectanglePropertyId,
-    UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_TextControlTypeId,
+    UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_TextControlTypeId, UIA_TitleBarControlTypeId,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -35,6 +35,8 @@ pub struct Element {
     /// A text label or a tiny part that usually sits inside the control you want
     /// (a button's caption, an icon glyph). Reachable, but not the default target.
     pub fine: bool,
+    /// A title bar (apps that draw their own frame expose it here).
+    pub title: bool,
 }
 
 /// Elements smaller than this on either side count as fine.
@@ -125,8 +127,10 @@ unsafe fn elements_of(uia: &IUIAutomation, hwnd: isize) -> Option<Vec<Element>> 
         let Ok(r) = e.CachedBoundingRectangle() else { continue };
         let r = Rect::from_ltrb(r.left, r.top, r.right, r.bottom);
         if r.w > 4 && r.h > 4 {
-            let text = e.CachedControlType().is_ok_and(|t| t == UIA_TextControlTypeId);
-            out.push(Element { rect: r, fine: text || r.w < FINE_SIDE || r.h < FINE_SIDE });
+            let ty = e.CachedControlType().ok();
+            let text = ty == Some(UIA_TextControlTypeId);
+            let title = ty == Some(UIA_TitleBarControlTypeId);
+            out.push(Element { rect: r, fine: text || r.w < FINE_SIDE || r.h < FINE_SIDE, title });
         }
     }
     out.sort_by_key(|e| e.rect.area());

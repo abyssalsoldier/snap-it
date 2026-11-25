@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, Se
 use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, SetCursor, HTCLIENT, IDC_ARROW, IDC_CROSS,
     IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
     WM_SETCURSOR, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -55,7 +55,7 @@ pub enum Mode {
 impl Mode {
     fn hint(self) -> &'static str {
         match self {
-            Mode::Region => "Drag to select · Click a window or control · Scroll to widen or narrow · Esc to cancel",
+            Mode::Region => "Drag to select · Click a control, or hold Ctrl for the whole window · Scroll to widen or narrow · Esc to cancel",
             Mode::Window => "Click a window to capture it · Esc to cancel",
             Mode::SetCustomRegion => "Drag to set your custom region · Esc to cancel",
             Mode::Scrolling => "Select the scrolling area · Esc cancels · once it scrolls, Esc or a right-click stops it",
@@ -128,6 +128,9 @@ struct Overlay {
     hover_step: i32,
     /// Default snap target the steps count from; moving onto another resets them.
     hover_base: Option<Rect>,
+    /// Scrolled out to the outermost target (the window): stay there while the
+    /// cursor moves to other windows, until scrolled back in.
+    hover_outer: bool,
     /// UI Automation element fetcher (started on the first message, once the window exists).
     uia: Option<Fetcher>,
     drag: Drag,
@@ -199,6 +202,7 @@ pub fn open(mode: Mode) {
             .into_iter()
             .map(|mut w| {
                 w.rect = to_client(w.rect);
+                w.client = to_client(w.client);
                 w.children = w.children.into_iter().map(to_client).collect();
                 if !s.region.detect_controls || mode == Mode::Window {
                     w.children.clear();
@@ -235,6 +239,7 @@ pub fn open(mode: Mode) {
         hover: None,
         hover_step: 0,
         hover_base: None,
+        hover_outer: false,
         uia: None,
         drag: Drag::None,
         items: Vec::new(),
@@ -394,6 +399,9 @@ impl Overlay {
     /// "Fine" targets (text labels, tiny parts, a box cut off by a divider) sit
     /// below the default and are reached by scrolling down, so hovering a button's
     /// caption picks the button and hovering half a card picks the card.
+    ///
+    /// The whole window is the default instead while Ctrl is held, or over its
+    /// title bar or frame; scrolling down still reaches the parts inside.
     fn candidates(&self, x: i32, y: i32) -> (Vec<Rect>, usize) {
         if !self.mode.detects_windows() {
             return (Vec::new(), 0);
@@ -404,12 +412,15 @@ impl Overlay {
         };
         // (rect, fine)
         let mut out: Vec<(Rect, bool)> = Vec::new();
+        let mut whole = super::ctrl() || (!w.client.is_empty() && !w.client.contains(x, y));
         if self.snaps_controls() {
             // A "control" that is (nearly) the whole window adds nothing.
             let part = |r: &Rect| r.contains(x, y) && r.area() * 100 < w.rect.area() * 95;
             if let Some(Fetch::Ready(els)) = self.uia.as_ref().map(|f| f.get(w.hwnd)) {
                 for e in els.iter() {
                     let r = e.rect.offset(-self.origin.0, -self.origin.1);
+                    // A title bar the app draws itself (inside its client area).
+                    whole |= e.title && r.contains(x, y);
                     if part(&r) {
                         out.extend(r.intersect(w.rect).map(|r| (r, e.fine)));
                     }
@@ -430,8 +441,14 @@ impl Overlay {
         // Same rect from two sources: it is fine only if both say so.
         v.sort_by_key(|(r, f)| (r.area(), r.x, r.y, r.w, *f));
         v.dedup_by(|b, a| a.0 == b.0);
-        let default = v.iter().position(|(_, f)| !f).unwrap_or(0);
+        // Largest last: everything was clipped to the window, so that is the window.
+        let default = if whole { v.len().saturating_sub(1) } else { v.iter().position(|(_, f)| !f).unwrap_or(0) };
         (v.into_iter().map(|(r, _)| r).collect(), default)
+    }
+
+    /// Choosing a target (nothing selected or being dragged yet).
+    fn choosing(&self) -> bool {
+        !self.annotating && self.sel.is_none() && matches!(self.drag, Drag::None)
     }
 
     fn detect(&self, x: i32, y: i32) -> Option<Rect> {
@@ -439,7 +456,8 @@ impl Overlay {
         c.get(d).copied()
     }
 
-    fn update_hover(&mut self, x: i32, y: i32) {
+    /// Re-picks the hovered target; returns whether it is the outermost one.
+    fn update_hover(&mut self, x: i32, y: i32) -> bool {
         let (c, d) = self.candidates(x, y);
         let base = c.get(d).copied();
         if base != self.hover_base {
@@ -450,11 +468,16 @@ impl Overlay {
             // Nothing to snap to (snapping off, or no window under the cursor).
             self.hover = None;
             self.hover_step = 0;
-            return;
+            return false;
         }
-        let i = (d as i32 + self.hover_step).clamp(0, c.len() as i32 - 1);
+        let last = c.len() as i32 - 1;
+        if self.hover_outer {
+            self.hover_step = last - d as i32;
+        }
+        let i = (d as i32 + self.hover_step).clamp(0, last);
         self.hover_step = i - d as i32;
         self.hover = c.get(i as usize).copied();
+        i == last
     }
 
     // ---------- selection & toolbar ----------
@@ -1141,6 +1164,11 @@ impl Overlay {
                 }
             }
             0x0D if self.annotating || self.sel.is_some() => self.finish(w, Finish::Tasks),
+            // Ctrl held: snap to whole windows (see `candidates`).
+            0x11 if self.choosing() => {
+                let (x, y) = self.cursor;
+                self.update_hover(x, y);
+            }
             0x43 if ctrl && self.sel.is_some() => self.finish(w, Finish::Copy),
             0x53 if ctrl && self.sel.is_some() => self.finish(w, Finish::Save),
             0x5A if ctrl => {
@@ -1220,9 +1248,18 @@ impl Overlay {
         if !self.annotating {
             // While choosing: step out to the enclosing element, or back in.
             if matches!(self.drag, Drag::None) && self.sel.is_none() {
-                self.hover_step += if delta > 0 { 1 } else { -1 };
+                if delta > 0 {
+                    self.hover_step += 1;
+                } else {
+                    self.hover_outer = false;
+                    self.hover_step -= 1;
+                }
                 let (x, y) = self.cursor;
-                self.update_hover(x, y);
+                let outermost = self.update_hover(x, y);
+                // Scrolled all the way out: keep picking whole windows as the cursor moves.
+                if delta > 0 && outermost {
+                    self.hover_outer = true;
+                }
             }
             return;
         }
@@ -1851,6 +1888,14 @@ impl Handler for Overlay {
             WM_KEYDOWN => {
                 self.key_down(w, wp.0 as u16);
                 self.redraw(w);
+                Some(LRESULT(0))
+            }
+            WM_KEYUP => {
+                if wp.0 == 0x11 && self.choosing() {
+                    let (x, y) = self.cursor;
+                    self.update_hover(x, y);
+                    self.redraw(w);
+                }
                 Some(LRESULT(0))
             }
             WM_CHAR => {

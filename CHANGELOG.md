@@ -5,6 +5,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Easier whole-window capture in Region mode.** Hold Ctrl while hovering to highlight the
+  whole window instead of the control under the cursor, then click to capture it. Hovering a
+  window's title bar or border also picks the whole window, including apps that draw their own
+  title bar (Chrome, Electron, Windows Store apps). Dragging a region and clicking a control work
+  as before, and scrolling down still steps into the parts of the window.
+
+### Changed
+- **Scrolling out to a whole window now stays there.** Once you scroll out to the window level,
+  moving onto other windows keeps highlighting whole windows until you scroll back in.
 
 ## [0.6.0] - 2026-11-25
 ### Added

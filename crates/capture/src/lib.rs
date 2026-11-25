@@ -10,16 +10,17 @@
 
 use snapit_gfx::{io::from_bgra_opaque, tiny_skia::Pixmap, Rect};
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors,
+    BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors,
     GetDC, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CAPTUREBLT, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, EnumChildWindows, EnumWindows, GetClassNameW, GetCursorInfo, GetForegroundWindow,
+    DrawIconEx, EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetCursorInfo,
+    GetForegroundWindow,
     GetIconInfo, GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindowVisible, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -184,6 +185,9 @@ pub struct WindowInfo {
     pub hwnd: isize,
     pub rect: Rect,
     pub title: String,
+    /// The client area (screen coordinates). Inside `rect` but outside this is
+    /// the title bar and frame. Empty when unknown.
+    pub client: Rect,
     /// Visible child-control rectangles, used for control-level snapping.
     pub children: Vec<Rect>,
 }
@@ -199,6 +203,18 @@ fn text_of(h: HWND, class: bool) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { if class { GetClassNameW(h, &mut buf) } else { GetWindowTextW(h, &mut buf) } };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// A window's client area in screen coordinates (empty on failure).
+fn client_rect(h: HWND) -> Rect {
+    let mut r = RECT::default();
+    let mut p = POINT::default();
+    unsafe {
+        if GetClientRect(h, &mut r).is_err() || !ClientToScreen(h, &mut p).as_bool() {
+            return Rect::new(0, 0, 0, 0);
+        }
+    }
+    Rect::new(p.x, p.y, r.right - r.left, r.bottom - r.top)
 }
 
 /// Visible top-level windows in z-order (topmost first), excluding this process's own windows.
@@ -243,7 +259,7 @@ pub fn visible_windows() -> Vec<WindowInfo> {
         let _ = EnumChildWindows(Some(h), Some(child_cb), LPARAM(&mut children as *mut _ as isize));
         // Smallest first so hit-testing finds the most specific control.
         children.sort_by_key(|r: &Rect| r.area());
-        ctx.out.push(WindowInfo { hwnd: h.0 as isize, rect, title: text_of(h, false), children });
+        ctx.out.push(WindowInfo { hwnd: h.0 as isize, rect, title: text_of(h, false), client: client_rect(h), children });
         TRUE
     }
     let mut ctx = Ctx { out: Vec::new(), own_pid: std::process::id() };
@@ -292,6 +308,7 @@ mod tests {
             hwnd: 1,
             rect: Rect::new(0, 0, 100, 100),
             title: String::new(),
+            client: Rect::new(0, 0, 100, 100),
             children: vec![Rect::new(10, 10, 20, 20)],
         };
         let wins = [w];
