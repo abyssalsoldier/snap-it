@@ -5,6 +5,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **First-launch setup.** The first time Snap It starts (usually from the installer's
+  "Launch Snap It"), a short wizard walks through the key features, lets you choose hotkeys
+  (and checks whether another app already uses them, with a pointer to the Windows 11 Print
+  Screen setting), turn on opt-in features such as scrolling capture, update checks, start at
+  sign-in and the Explorer menu, and pick what happens after a capture. Your current settings
+  are always filled in and kept unless you change them. It comes back once after an update
+  that adds new setup options (new items are marked "(new)"), never after bug-fix releases.
+  Run it again any time from Settings > General, or with `snapit --welcome`.
+- **Text outline colour and width.** The text tool's outline now has its own colour (or "No
+  outline") and size in the options strip, in the editor and in quick annotate. Before, it was
+  a fixed contrast colour.
 
 ## [0.3.6] - 2026-11-25
 ### Changed
