@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-25
+### Fixed
+- **Scrolling capture stopped after one scroll** on most real pages: each new screen had to
+  match the previous one almost exactly, so a moving scrollbar thumb, a blinking caret, a
+  hover highlight or an unfinished smooth scroll ended it. Rows are now compared in strips,
+  strips that do not scroll with the page (scrollbar, fixed sidebar) are ignored, a screen
+  that does not line up is checked once more before stopping, and small areas are scrolled
+  less so consecutive screens still overlap.
+- When scrolling capture fails, stops early, finds that nothing scrolled, or is stopped by
+  the mouse before the first scroll, a dialog now says why instead of a tray balloon that
+  Windows may hide.
+
 ## [0.3.4] - 2026-11-25
 ### Fixed
 - The scrolling capture hotkey seemed to do nothing while the feature was off (it is off by
@@ -137,7 +149,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.4...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.5...dev
+[0.3.5]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/abyssalsoldier/snap-it/compare/v0.3.1...v0.3.2
