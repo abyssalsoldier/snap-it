@@ -101,6 +101,7 @@ const ID_UPDATE: u16 = 702;
 const ID_REPO: u16 = 703;
 const ID_CHECK_NOW: u16 = 704;
 const ID_OPEN_CONFIG: u16 = 705;
+const ID_WELCOME: u16 = 207;
 
 struct SettingsWin {
     settings: Settings,
@@ -304,6 +305,8 @@ impl SettingsWin {
         y += 40;
         let mode = if crate::paths::portable() { "Portable mode: settings are stored next to snapit.exe." } else { "Settings are stored in %APPDATA%\\SnapIt. Put a file named \"portable\" next to snapit.exe for portable mode." };
         self.label(hwnd, 0, mode, x0, y, cw - 60);
+        y += 44;
+        self.button(hwnd, Some(0), ID_WELCOME, "Run first-launch setup…", x0, y, 200, false);
 
         // Capture
         let mut y = 50;
@@ -602,6 +605,11 @@ impl Handler for SettingsWin {
                         let repo = self.text_of(ID_REPO);
                         app::update_settings(|s| s.integration.update_repo = repo);
                         crate::integration::check_for_updates(true);
+                    }
+                    ID_WELCOME => {
+                        // Setup edits the saved settings, so leave Settings (unsaved) first.
+                        app::post(Command::OpenWelcome);
+                        w.close();
                     }
                     ID_OPEN_CONFIG => crate::shell::open_folder(&crate::paths::config_dir()),
                     _ => {}

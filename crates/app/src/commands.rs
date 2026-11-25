@@ -31,6 +31,7 @@ pub fn dispatch(cmd: Command) {
                 notify("Some hotkeys could not be registered", &failed.join(", "));
             }
         }
+        Command::OpenWelcome => crate::ui::welcome::open(),
         Command::OverlayClosed => app::with(|s| s.overlay_open = false),
     }
 }

@@ -20,6 +20,7 @@ pub mod settings_window;
 pub mod theme;
 pub mod tool_options;
 pub mod toolbar;
+pub mod welcome;
 
 use std::cell::RefCell;
 use std::collections::HashSet;

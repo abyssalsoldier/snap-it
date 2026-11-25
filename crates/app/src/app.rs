@@ -55,6 +55,8 @@ pub enum Command {
     Notify { title: String, body: String },
     OpenLastCapture,
     ReloadSettings,
+    /// Open the first-launch setup wizard.
+    OpenWelcome,
     OverlayClosed,
 }
 
@@ -62,6 +64,8 @@ pub enum Command {
 pub enum Click {
     Url(String),
     ShowFile(PathBuf),
+    /// Open the first-launch setup (it has new steps since this user last saw it).
+    OpenWelcome,
 }
 
 pub struct State {

@@ -143,7 +143,7 @@ fn action_for_hotkey(id: u16) -> Option<Action> {
 /// Start in the tray without opening Settings (used by the Start-with-Windows shortcut).
 pub const BACKGROUND_ARG: &str = "--background";
 
-const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>] [--background] [--quit]\n\
+const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>] [--background] [--welcome] [--quit]\n\
 actions: region, window, active_window, monitor, fullscreen, last_region, custom_region, scrolling,\n\
          record_mp4, record_gif, ocr, scan_qr, color_picker, ruler, open_editor, open_history, open_settings";
 
@@ -169,6 +169,7 @@ fn handle_args(args: &[String]) {
                     Err(e) => app::post(Command::Notify { title: "Could not open image".into(), body: e }),
                 }
             }
+            "--welcome" => app::post(Command::OpenWelcome),
             BACKGROUND_ARG => {}
             "--help" | "-h" | "/?" => log(USAGE),
             "--version" | "-V" => log(concat!("Snap It ", env!("CARGO_PKG_VERSION"))),
@@ -253,6 +254,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Checked before anything saves settings: no settings file yet means first launch.
+    let first_run = ui::welcome::is_first_run();
+
     // COM (apartment-threaded) for the shell link, file and folder dialogs.
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
@@ -292,8 +296,15 @@ fn main() -> Result<()> {
     }
     // Started by the user (Start menu, desktop, installer): show a window, not just a tray icon.
     // Started at sign-in (`--background`) or to run a command: stay in the tray.
+    // The first start, and the first start after an update that added setup steps (usually
+    // from the installer's "Launch Snap It"), open setup instead of Settings. Started at
+    // sign-in, a notification offers it instead of popping a window up.
+    let setup_due = ui::welcome::is_due(first_run, &app::settings());
     if args.is_empty() {
-        app::post(Command::Run(Action::OpenSettings));
+        app::post(if setup_due { Command::OpenWelcome } else { Command::Run(Action::OpenSettings) });
+    } else if setup_due && args.iter().any(|a| a == BACKGROUND_ARG) {
+        app::with(|s| s.pending_click = Some(app::Click::OpenWelcome));
+        app::post(Command::Notify { title: "Snap It has new features".into(), body: "Click here to set them up.".into() });
     }
     integration::upgrade_startup_link();
 
@@ -348,6 +359,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 tray::NIN_BALLOONUSERCLICK => match app::with(|s| s.pending_click.take()) {
                     Some(app::Click::Url(url)) => shell::open_url(&url),
                     Some(app::Click::ShowFile(p)) => shell::show_in_folder(&p),
+                    Some(app::Click::OpenWelcome) => app::post(Command::OpenWelcome),
                     None => app::post(Command::OpenLastCapture),
                 },
                 _ => {}

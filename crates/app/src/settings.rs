@@ -227,6 +227,9 @@ pub struct Settings {
     pub last_region: Option<Rect>,
     pub history_limit: usize,
     pub workflows: Vec<Workflow>,
+    /// The first-launch setup this user last finished or skipped (`ui::welcome::SETUP_VERSION`).
+    /// 0 = never (including settings from before the setup existed).
+    pub setup_version: u32,
 }
 
 impl Default for Settings {
@@ -255,6 +258,7 @@ impl Default for Settings {
                 Workflow::new("Shift+PrintScreen", Action::CaptureActiveWindow),
                 Workflow::new("Ctrl+Shift+PrintScreen", Action::RecordMp4),
             ],
+            setup_version: 0,
         }
     }
 }

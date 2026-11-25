@@ -391,6 +391,28 @@ pub fn run(dir: &Path) -> i32 {
         pump(50);
     }
 
+    // --- First-launch setup: build every step, click Next through to Finish without changes ---
+    // (Finishing records the setup version; nothing else may change.)
+    let mut before = (*app::settings()).clone();
+    before.setup_version = crate::ui::welcome::SETUP_VERSION;
+    crate::ui::welcome::open();
+    if let Some(ww) = find("SnapItWelcome") {
+        send(ww, WM_SHOWWINDOW, 1, 0);
+        for _ in 0..4 {
+            send(ww, WM_COMMAND, crate::ui::welcome::ID_NEXT as usize, 0);
+        }
+        r.check("setup wizard stays open until the last step", find("SnapItWelcome").is_some(), "");
+        send(ww, WM_COMMAND, crate::ui::welcome::ID_NEXT as usize, 0);
+        pump(50);
+        let after = Settings::load();
+        let (a, b) = (toml::to_string_pretty(&before).unwrap_or_default(), toml::to_string_pretty(&after).unwrap_or_default());
+        let diff: Vec<String> = a.lines().zip(b.lines()).filter(|(x, y)| x != y).map(|(x, y)| format!("{x}  ->  {y}")).collect();
+        r.check("setup wizard round-trips every value", after == before, &diff.join(" | "));
+        r.check("setup wizard closes on Finish", find("SnapItWelcome").is_none(), "");
+    } else {
+        r.check("setup wizard opens", false, "");
+    }
+
     // --- Settings: build every control, then Save without changes ---
     let before = (*app::settings()).clone();
     crate::ui::settings_window::open();

@@ -37,6 +37,14 @@ pub fn show_in_folder(file: &Path) {
     }
 }
 
+/// Opens Windows Settings > Accessibility > Keyboard (where the Print Screen key can be
+/// taken back from the Snipping Tool). A fixed URI; nothing user-supplied is passed.
+pub fn open_keyboard_settings() {
+    unsafe {
+        ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from("ms-settings:easeofaccess-keyboard"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 /// Opens an https URL in the default browser. Anything else is refused.
 pub fn open_url(url: &str) {
     if !url.starts_with("https://") {
