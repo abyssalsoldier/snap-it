@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, FillRect, GetSysColor, GetSysColorBrush, SetBkColor,
-    COLOR_WINDOW, HBRUSH, HDC, HFONT,
+    CreateFontIndirectW, DeleteObject, HDC, HFONT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Controls::{
@@ -23,7 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
     CB_GETCURSEL, CB_SETCURSEL, ES_AUTOHSCROLL, ES_NUMBER, HMENU, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
+    WINDOW_STYLE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_ERASEBKGND,
     WM_NOTIFY, WM_SETFONT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
     WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
@@ -110,6 +110,8 @@ struct SettingsWin {
     pages: Vec<Vec<HWND>>,
     ctl: HashMap<u16, HWND>,
     built: bool,
+    /// Light/dark colours and brushes for the standard controls.
+    nt: super::native_theme::NativeTheme,
 }
 
 pub fn open() {
@@ -117,7 +119,9 @@ pub fn open() {
     if existing != 0 {
         unsafe {
             let h = HWND(existing as *mut _);
-            let _ = ShowWindow(h, SW_SHOW);
+            // Restore it if minimised, then bring it to the front.
+            let minimised = windows::Win32::UI::WindowsAndMessaging::IsIconic(h).as_bool();
+            let _ = ShowWindow(h, if minimised { windows::Win32::UI::WindowsAndMessaging::SW_RESTORE } else { SW_SHOW });
             let _ = SetForegroundWindow(h);
         }
         return;
@@ -126,7 +130,7 @@ pub fn open() {
         let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_TAB_CLASSES | ICC_STANDARD_CLASSES };
         let _ = InitCommonControlsEx(&icc);
     }
-    let sw = SettingsWin { settings: (*app::settings()).clone(), font: HFONT::default(), scale: 1.0, tab: HWND::default(), pages: Vec::new(), ctl: HashMap::new(), built: false };
+    let sw = SettingsWin { settings: (*app::settings()).clone(), font: HFONT::default(), scale: 1.0, tab: HWND::default(), pages: Vec::new(), ctl: HashMap::new(), built: false, nt: super::native_theme::NativeTheme::new() };
     let mons = snapit_capture::monitors();
     let m = mons.iter().find(|m| m.primary).or(mons.first());
     let (work, sc) = m.map(|m| (m.work, m.scale())).unwrap_or((snapit_gfx::Rect::new(0, 0, 1280, 800), 1.0));
@@ -359,7 +363,7 @@ impl SettingsWin {
 
         // Hotkeys
         let mut y = 46;
-        self.label(hwnd, 3, "Type a hotkey such as Ctrl+Shift+PrintScreen or Alt+F1. Leave empty for none.", x0, y, cw - 60);
+        self.label(hwnd, 3, "Click a box and press the keys (for example Ctrl+Shift+PrintScreen). Backspace clears it.", x0, y, cw - 60);
         y += 26;
         for (i, a) in HOTKEY_ACTIONS.iter().enumerate() {
             let cur = s.hotkey_for(*a).unwrap_or_default();
@@ -371,6 +375,9 @@ impl SettingsWin {
             };
             self.label(hwnd, 3, label.trim_end_matches('…'), x0, y, 200);
             self.edit(hwnd, 3, ID_HOTKEY0 + i as u16, &cur, 240, y, 220, false);
+            if let Some(&h) = self.ctl.get(&(ID_HOTKEY0 + i as u16)) {
+                super::hotkey_field::attach(h);
+            }
             y += 28;
         }
 
@@ -531,8 +538,12 @@ impl SettingsWin {
                     super::dialogs::info(Some(w.hwnd), "Snap It", &format!("Could not save settings.\n{e}"));
                     return;
                 }
+                let theme_changed = prev.theme != next.theme;
                 app::with(|st| st.settings = std::rc::Rc::new(next));
                 app::post(Command::ReloadSettings);
+                if theme_changed {
+                    super::broadcast_theme();
+                }
                 if !errors.is_empty() {
                     super::dialogs::info(Some(w.hwnd), "Snap It", &errors.join("\n"));
                 }
@@ -547,23 +558,25 @@ impl Handler for SettingsWin {
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if !self.built && msg == windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW {
             self.build(w.hwnd);
-            super::theme::apply_titlebar(w.hwnd, &super::theme::LIGHT);
+            self.nt.style_children(w.hwnd);
+            super::native_theme::hook_tabs(self.tab);
+        }
+        if msg == super::WM_SNAPIT_THEME {
+            self.nt.refresh();
+            self.nt.style_children(w.hwnd);
+            return None;
         }
         match msg {
             WM_ERASEBKGND => {
-                let mut rc = RECT::default();
-                unsafe {
-                    let _ = GetClientRect(w.hwnd, &mut rc);
-                    FillRect(HDC(wp.0 as *mut _), &rc, GetSysColorBrush(COLOR_WINDOW));
-                }
+                self.nt.erase(w.hwnd, HDC(wp.0 as *mut _));
                 Some(LRESULT(1))
             }
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => unsafe {
-                SetBkColor(HDC(wp.0 as *mut _), windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOW)));
-                let b: HBRUSH = GetSysColorBrush(COLOR_WINDOW);
-                Some(LRESULT(b.0 as isize))
-            },
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => self.nt.ctlcolor(msg, wp),
             WM_NOTIFY => {
+                // Dark checkboxes: readable labels.
+                if let Some(r) = self.nt.custom_draw(lp) {
+                    return Some(r);
+                }
                 let hdr = unsafe { &*(lp.0 as *const NMHDR) };
                 if hdr.idFrom == ID_TAB as usize && hdr.code == TCN_SELCHANGE {
                     let page = unsafe { SendMessageW(self.tab, TCM_GETCURSEL, None, None).0.max(0) as usize };
@@ -596,6 +609,8 @@ impl Handler for SettingsWin {
                 Some(LRESULT(0))
             }
             WM_DESTROY => {
+                // If a hotkey box still had focus, its global hotkeys are paused.
+                super::hotkey_field::resume_hotkeys();
                 if !self.font.is_invalid() {
                     unsafe {
                         let _ = DeleteObject(self.font.into());

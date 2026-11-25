@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SetCursor, SetForegroundWindow, SetWindowTextW, TrackPopupMenu,
     HTCLIENT, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENWSE,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MINMAXINFO, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+    WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_SIZE, WS_EX_APPWINDOW,
     WS_OVERLAPPEDWINDOW,
@@ -766,78 +766,36 @@ impl Editor {
 
     /// The style a new item of `tool` gets from the current options.
     fn item_style(&self, tool: Tool) -> Style {
-        let o = &self.opts;
-        let mut st = Style {
-            fill: false,
-            fill_color: o.fill_color,
-            corner_radius: o.corner_radius,
-            dash: o.dash,
-            shadow: o.shadow,
-            heads: o.heads,
-            step_type: o.step_type,
-            strength: 0.0,
-            ..self.style
-        };
-        match tool {
-            Tool::Rect | Tool::Ellipse => st.fill = o.fill,
-            // A text item's `fill` is its background.
-            Tool::Text => st.fill = o.text_background,
-            Tool::Highlight => st.color = self.marker,
-            Tool::Blur => st.strength = o.blur_radius,
-            Tool::Pixelate => st.strength = o.pixel_size,
-            Tool::Spotlight => st.strength = o.spot_dim,
-            _ => {}
-        }
-        st
+        self.values().item_style(tool)
     }
 
     /// Options that live in the shape rather than the style.
     fn finish_new_item(&self, it: &mut Item) {
-        match &mut it.shape {
-            Shape::Magnify { zoom, .. } => *zoom = self.opts.zoom,
-            Shape::Spotlight { ellipse, .. } => *ellipse = self.opts.spot_ellipse,
-            _ => {}
-        }
+        self.values().finish_new_item(it)
+    }
+
+    fn put_values(&mut self, v: Values) {
+        self.style = v.style;
+        self.opts = v.opts;
+        self.marker = v.marker;
     }
 
     /// Selecting an item shows its options (as ShareX does), so editing them restyles it.
     fn load_from_item(&mut self, i: usize) {
         let Some(it) = self.items.get(i) else { return };
-        let st = it.style;
-        let o = &mut self.opts;
-        match &it.shape {
-            Shape::Highlight(_) => self.marker = st.color,
-            Shape::Blur(_) => o.blur_radius = if st.strength > 0.0 { st.strength } else { o.blur_radius },
-            Shape::Pixelate(_) => o.pixel_size = if st.strength > 0.0 { st.strength } else { o.pixel_size },
-            Shape::Spotlight { dim, ellipse, .. } => {
-                o.spot_dim = (*dim as f32 / 2.55).round();
-                o.spot_ellipse = *ellipse;
-            }
-            Shape::Text { background, .. } => {
-                o.text_background = *background;
-                self.style.color = st.color;
-                self.style.font_size = st.font_size;
-                o.shadow = st.shadow;
-            }
-            Shape::Image { .. } | Shape::Sticker { .. } | Shape::Eraser(..) => {}
-            shape => {
-                self.style.color = st.color;
-                self.style.width = st.width;
-                self.style.font_size = st.font_size;
-                if matches!(shape, Shape::Rect(_) | Shape::Ellipse(_)) {
-                    o.fill = st.fill;
-                    o.fill_color = st.fill_color;
-                }
-                o.corner_radius = st.corner_radius;
-                o.dash = st.dash;
-                o.shadow = st.shadow;
-                o.heads = st.heads;
-                o.step_type = st.step_type;
-                if let Shape::Magnify { zoom, .. } = shape {
-                    o.zoom = *zoom;
-                }
-            }
+        let mut v = self.values();
+        v.load_from_item(it);
+        self.put_values(v);
+    }
+
+    /// Picks up options changed elsewhere (quick edit or another editor window).
+    fn reload_saved_options(&mut self) {
+        if self.editing.or(self.selected).is_some() {
+            return;
         }
+        let mut v = self.values();
+        v.take_saved(&app::settings().annotate);
+        self.put_values(v);
     }
 
     fn select(&mut self, i: Option<usize>) {
@@ -852,59 +810,11 @@ impl Editor {
         if v == self.values() {
             return;
         }
-        self.style = v.style;
-        self.opts = v.opts;
-        self.marker = v.marker;
-        let (st, opts, mk) = (self.style, self.opts, self.marker);
-        app::update_settings(|s| {
-            s.annotate.color = st.color;
-            s.annotate.highlight = mk;
-            s.annotate.width = st.width;
-            s.annotate.font_size = st.font_size;
-            s.annotate.tools = opts;
-        });
+        self.put_values(v);
+        v.save();
         let Some(i) = self.editing.or(self.selected).filter(|&i| i < self.items.len()) else { return };
-        let Some(tool) = self.items[i].tool() else { return };
         let before = self.items.clone();
-        let new = self.item_style(tool);
-        let it = &mut self.items[i];
-        match changed {
-            Opt::Color => it.style.color = new.color,
-            Opt::Highlight => it.style.color = mk,
-            Opt::FillColor => {
-                it.style.fill = new.fill;
-                it.style.fill_color = new.fill_color;
-            }
-            Opt::Width => it.style.width = new.width,
-            Opt::FontSize => it.style.font_size = new.font_size,
-            Opt::Radius => it.style.corner_radius = new.corner_radius,
-            Opt::Dash => it.style.dash = new.dash,
-            Opt::Shadow => it.style.shadow = new.shadow,
-            Opt::Heads => it.style.heads = new.heads,
-            Opt::StepType => it.style.step_type = new.step_type,
-            Opt::Blur | Opt::Pixel => it.style.strength = new.strength,
-            Opt::Background => {
-                it.style.fill = opts.text_background;
-                if let Shape::Text { background, .. } = &mut it.shape {
-                    *background = opts.text_background;
-                }
-            }
-            Opt::Zoom => {
-                if let Shape::Magnify { zoom, .. } = &mut it.shape {
-                    *zoom = opts.zoom;
-                }
-            }
-            Opt::Dim => {
-                if let Shape::Spotlight { dim, .. } = &mut it.shape {
-                    *dim = (opts.spot_dim * 2.55).clamp(0.0, 255.0) as u8;
-                }
-            }
-            Opt::SpotShape => {
-                if let Shape::Spotlight { ellipse, .. } = &mut it.shape {
-                    *ellipse = opts.spot_ellipse;
-                }
-            }
-        }
+        v.apply_to_item(changed, &mut self.items[i]);
         if self.items != before {
             if self.editing.is_none() {
                 self.push_items(before);
@@ -1505,6 +1415,14 @@ impl Handler for Editor {
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if msg == super::WM_SNAPIT_THEME {
+            self.theme = super::theme::current();
+        }
+        if msg == WM_ACTIVATE && (wp.0 & 0xFFFF) != 0 {
+            // Quick edit (or another editor) may have changed the shared tool options.
+            self.reload_saved_options();
+            w.invalidate();
+        }
         let r = match msg {
             WM_SIZE => {
                 let mut rc = Default::default();

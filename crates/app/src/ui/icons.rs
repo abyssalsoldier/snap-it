@@ -36,7 +36,6 @@ pub enum Icon {
     Editor,
     Close,
     Done,
-    Fill,
     ZoomFit,
     Folder,
     Spotlight,
@@ -258,7 +257,6 @@ pub fn draw(pm: &mut PixmapMut, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) 
             p.poly(&[(0.72, 0.28), (0.28, 0.72)], false);
         }
         Icon::Done => p.poly(&[(0.22, 0.52), (0.42, 0.72), (0.8, 0.3)], false),
-        Icon::Fill => p.rect(0.22, 0.26, 0.78, 0.74, 0.06, true),
         Icon::ZoomFit => {
             p.poly(&[(0.18, 0.36), (0.18, 0.18), (0.36, 0.18)], false);
             p.poly(&[(0.64, 0.18), (0.82, 0.18), (0.82, 0.36)], false);

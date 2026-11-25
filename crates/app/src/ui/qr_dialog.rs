@@ -38,6 +38,7 @@ struct QrDialog {
     bb: Option<Backbuffer>,
     built: bool,
     font: HFONT,
+    nt: super::native_theme::NativeTheme,
 }
 
 pub fn open() {
@@ -53,7 +54,7 @@ pub fn open() {
     let (work, sc) = m.map(|m| (m.work, m.scale())).unwrap_or((Rect::new(0, 0, 1280, 800), 1.0));
     let (w, h) = ((460.0 * sc) as i32, (640.0 * sc) as i32);
     let r = Rect::new(work.x + (work.w - w) / 2, work.y + (work.h - h) / 2, w, h.min(work.h));
-    let d = QrDialog { theme: theme::LIGHT, scale: sc, edit: HWND::default(), code: None, bb: None, built: false, font: HFONT::default() };
+    let d = QrDialog { theme: theme::current(), scale: sc, edit: HWND::default(), code: None, bb: None, built: false, font: HFONT::default(), nt: super::native_theme::NativeTheme::new() };
     if let Ok(hwnd) = super::create("SnapItQr", WINDOW_EX_STYLE(0), WS_CAPTION | WS_SYSMENU, "Make QR code", r, None, Box::new(d)) {
         OPEN.with(|o| o.set(hwnd.0 as isize));
         super::show(hwnd, true);
@@ -118,11 +119,21 @@ impl Handler for QrDialog {
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, _lp: LPARAM) -> Option<LRESULT> {
+        if msg == super::WM_SNAPIT_THEME {
+            self.theme = super::theme::current();
+            self.nt.refresh();
+            self.nt.style_children(w.hwnd);
+        }
         match msg {
             WM_SHOWWINDOW if !self.built => {
                 self.build(w.hwnd);
+                self.nt.style_children(w.hwnd);
                 None
             }
+            // The text box and buttons are standard controls.
+            m @ (windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+            | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN) => self.nt.ctlcolor(m, wp),
             WM_ERASEBKGND => Some(LRESULT(1)),
             WM_PAINT => {
                 let mut rc = RECT::default();

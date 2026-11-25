@@ -10,6 +10,8 @@ pub mod backbuffer;
 pub mod dialogs;
 pub mod editor;
 pub mod history;
+pub mod hotkey_field;
+pub mod native_theme;
 pub mod icons;
 pub mod overlay;
 pub mod pin;
@@ -63,6 +65,25 @@ pub trait Handler {
 
 /// Self-test: `lparam` is a `Box<PathBuf>`; the window saves its last frame there.
 pub const WM_SNAPIT_DUMP: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 90;
+
+/// Light/dark changed (Windows setting or Snap It's own). Every window gets it: the
+/// title bar is updated here, then the handler re-reads [`theme::current`].
+pub const WM_SNAPIT_THEME: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 94;
+
+/// Tells every Snap It window (all live on this thread) that the theme changed.
+pub fn broadcast_theme() {
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, PostMessageW};
+    unsafe extern "system" fn post(h: HWND, _: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_SNAPIT_THEME, WPARAM(0), LPARAM(0));
+        }
+        windows::core::BOOL(1)
+    }
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(post), LPARAM(0));
+    }
+}
 
 thread_local! {
     static HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -150,6 +171,9 @@ pub fn create(
             Some(slot as *const _),
         )
     };
+    if let Ok(h) = res {
+        theme::apply_titlebar(h, &theme::current());
+    }
     if res.is_err() {
         // WM_NCCREATE may not have run; if it did, WM_NCDESTROY already freed the slot.
         // CreateWindowEx failing before NCCREATE is the only path that reaches here
@@ -173,6 +197,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         let ok = (*ptr).try_borrow().ok().and_then(|h| h.snapshot()).map(|pm| snapit_gfx::io::save(&pm, &path, snapit_gfx::io::Format::Png, 100).is_ok()).unwrap_or(false);
         return LRESULT(ok as isize);
     }
+    if msg == WM_SNAPIT_THEME {
+        theme::apply_titlebar(hwnd, &theme::current());
+    }
     let mut want_close = false;
     let result = match (*ptr).try_borrow_mut() {
         Ok(mut h) => {
@@ -192,6 +219,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
     if want_close {
         let _ = DestroyWindow(hwnd);
+        return result.unwrap_or(LRESULT(0));
+    }
+    if msg == WM_SNAPIT_THEME {
+        // Repaint everything (frame, client and child controls) in the new colours.
+        use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE};
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         return result.unwrap_or(LRESULT(0));
     }
     result.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))

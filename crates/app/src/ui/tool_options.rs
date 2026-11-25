@@ -2,7 +2,7 @@
 //! only the options of the current tool (or of the selected item's tool), and a
 //! change applies to new items and to the selected one.
 
-use snapit_annotate::{ArrowHeads, Dash, StepType, Style, Tool};
+use snapit_annotate::{ArrowHeads, Dash, Item, Shape, StepType, Style, Tool};
 use snapit_gfx::effects::rounded_rect;
 use snapit_gfx::text;
 use snapit_gfx::tiny_skia::{FillRule, LineCap, PathBuilder, PixmapMut, Stroke, StrokeDash, Transform};
@@ -205,6 +205,148 @@ impl Values {
             Opt::Shadow => self.opts.shadow = !self.opts.shadow,
             Opt::Background => self.opts.text_background = !self.opts.text_background,
             _ => {}
+        }
+    }
+}
+
+impl Values {
+    /// Saves these options, so the editor and quick edit both start from them.
+    pub fn save(&self) {
+        let v = *self;
+        crate::app::update_settings(|s| {
+            s.annotate.color = v.style.color;
+            s.annotate.highlight = v.marker;
+            s.annotate.width = v.style.width;
+            s.annotate.font_size = v.style.font_size;
+            s.annotate.tools = v.opts;
+        });
+    }
+
+    /// Copies the shared, saved options into `self`, keeping the rest of the style.
+    pub fn take_saved(&mut self, a: &crate::settings::Annotate) {
+        self.style.color = a.color;
+        self.style.width = a.width;
+        self.style.font_size = a.font_size;
+        self.opts = a.tools;
+        self.marker = a.highlight;
+    }
+
+    /// The style a new item of `tool` gets from these options.
+    pub fn item_style(&self, tool: Tool) -> Style {
+        let o = &self.opts;
+        let mut st = Style {
+            fill: false,
+            fill_color: o.fill_color,
+            corner_radius: o.corner_radius,
+            dash: o.dash,
+            shadow: o.shadow,
+            heads: o.heads,
+            step_type: o.step_type,
+            strength: 0.0,
+            ..self.style
+        };
+        match tool {
+            Tool::Rect | Tool::Ellipse => st.fill = o.fill,
+            // A text item's `fill` is its background.
+            Tool::Text => st.fill = o.text_background,
+            Tool::Highlight => st.color = self.marker,
+            Tool::Blur => st.strength = o.blur_radius,
+            Tool::Pixelate => st.strength = o.pixel_size,
+            Tool::Spotlight => st.strength = o.spot_dim,
+            _ => {}
+        }
+        st
+    }
+
+    /// Options that live in the shape rather than the style, for a just-created item.
+    pub fn finish_new_item(&self, it: &mut Item) {
+        match &mut it.shape {
+            Shape::Magnify { zoom, .. } => *zoom = self.opts.zoom,
+            Shape::Spotlight { ellipse, .. } => *ellipse = self.opts.spot_ellipse,
+            _ => {}
+        }
+    }
+
+    /// Takes the options from an item, so selecting it shows (and edits) its own options.
+    pub fn load_from_item(&mut self, it: &Item) {
+        let st = it.style;
+        let o = &mut self.opts;
+        match &it.shape {
+            Shape::Highlight(_) => self.marker = st.color,
+            Shape::Blur(_) => o.blur_radius = if st.strength > 0.0 { st.strength } else { o.blur_radius },
+            Shape::Pixelate(_) => o.pixel_size = if st.strength > 0.0 { st.strength } else { o.pixel_size },
+            Shape::Spotlight { dim, ellipse, .. } => {
+                o.spot_dim = (*dim as f32 / 2.55).round();
+                o.spot_ellipse = *ellipse;
+            }
+            Shape::Text { background, .. } => {
+                o.text_background = *background;
+                self.style.color = st.color;
+                self.style.font_size = st.font_size;
+                o.shadow = st.shadow;
+            }
+            Shape::Image { .. } | Shape::Sticker { .. } | Shape::Eraser(..) => {}
+            shape => {
+                self.style.color = st.color;
+                self.style.width = st.width;
+                self.style.font_size = st.font_size;
+                if matches!(shape, Shape::Rect(_) | Shape::Ellipse(_)) {
+                    o.fill = st.fill;
+                    o.fill_color = st.fill_color;
+                }
+                o.corner_radius = st.corner_radius;
+                o.dash = st.dash;
+                o.shadow = st.shadow;
+                o.heads = st.heads;
+                o.step_type = st.step_type;
+                if let Shape::Magnify { zoom, .. } = shape {
+                    o.zoom = *zoom;
+                }
+            }
+        }
+    }
+
+    /// Applies one changed option to an existing item.
+    pub fn apply_to_item(&self, changed: Opt, it: &mut Item) {
+        let Some(tool) = it.tool() else { return };
+        let new = self.item_style(tool);
+        let opts = self.opts;
+        match changed {
+            Opt::Color => it.style.color = new.color,
+            Opt::Highlight => it.style.color = self.marker,
+            Opt::FillColor => {
+                it.style.fill = new.fill;
+                it.style.fill_color = new.fill_color;
+            }
+            Opt::Width => it.style.width = new.width,
+            Opt::FontSize => it.style.font_size = new.font_size,
+            Opt::Radius => it.style.corner_radius = new.corner_radius,
+            Opt::Dash => it.style.dash = new.dash,
+            Opt::Shadow => it.style.shadow = new.shadow,
+            Opt::Heads => it.style.heads = new.heads,
+            Opt::StepType => it.style.step_type = new.step_type,
+            Opt::Blur | Opt::Pixel => it.style.strength = new.strength,
+            Opt::Background => {
+                it.style.fill = opts.text_background;
+                if let Shape::Text { background, .. } = &mut it.shape {
+                    *background = opts.text_background;
+                }
+            }
+            Opt::Zoom => {
+                if let Shape::Magnify { zoom, .. } = &mut it.shape {
+                    *zoom = opts.zoom;
+                }
+            }
+            Opt::Dim => {
+                if let Shape::Spotlight { dim, .. } = &mut it.shape {
+                    *dim = (opts.spot_dim * 2.55).clamp(0.0, 255.0) as u8;
+                }
+            }
+            Opt::SpotShape => {
+                if let Shape::Spotlight { ellipse, .. } = &mut it.shape {
+                    *ellipse = opts.spot_ellipse;
+                }
+            }
         }
     }
 }

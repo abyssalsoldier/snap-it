@@ -106,6 +106,14 @@ pub fn create_main_window() -> Result<HWND> {
     Ok(hwnd)
 }
 
+/// Unregisters every global hotkey until [`reregister_hotkeys`] (used while recording a
+/// hotkey in Settings, so pressing it doesn't trigger it).
+pub fn suspend_hotkeys() {
+    let hwnd = app::main_hwnd();
+    let old = app::with(|s| std::mem::take(&mut s.bindings));
+    hotkeys::unregister_all(hwnd, &old);
+}
+
 /// (Re)registers hotkeys from the current workflows. Returns chords that failed.
 pub fn reregister_hotkeys() -> Vec<String> {
     let hwnd = app::main_hwnd();
@@ -132,7 +140,10 @@ fn action_for_hotkey(id: u16) -> Option<Action> {
     app::settings().workflows.get(i)?.resolve().map(|(_, a)| a)
 }
 
-const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>] [--quit]\n\
+/// Start in the tray without opening Settings (used by the Start-with-Windows shortcut).
+pub const BACKGROUND_ARG: &str = "--background";
+
+const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>] [--background] [--quit]\n\
 actions: region, window, active_window, monitor, fullscreen, last_region, custom_region, scrolling,\n\
          record_mp4, record_gif, ocr, scan_qr, color_picker, ruler, open_editor, open_history, open_settings";
 
@@ -158,6 +169,7 @@ fn handle_args(args: &[String]) {
                     Err(e) => app::post(Command::Notify { title: "Could not open image".into(), body: e }),
                 }
             }
+            BACKGROUND_ARG => {}
             "--help" | "-h" | "/?" => log(USAGE),
             "--version" | "-V" => log(concat!("Snap It ", env!("CARGO_PKG_VERSION"))),
             other => log(&format!("ignoring argument '{other}'")),
@@ -278,6 +290,12 @@ fn main() -> Result<()> {
     if let Some(old) = updated_from {
         app::post(Command::Notify { title: format!("Snap It updated to {}", env!("CARGO_PKG_VERSION")), body: format!("The running copy ({old}) was closed and replaced.") });
     }
+    // Started by the user (Start menu, desktop, installer): show a window, not just a tray icon.
+    // Started at sign-in (`--background`) or to run a command: stay in the tray.
+    if args.is_empty() {
+        app::post(Command::Run(Action::OpenSettings));
+    }
+    integration::upgrade_startup_link();
 
     if app::settings().integration.update_check {
         integration::check_for_updates(false);
@@ -379,6 +397,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         // files: agree, then exit straight away. Ignoring WM_ENDSESSION made Windows wait for
         // its hung-app timeout (about 100 s in the MSI upgrade) before terminating Snap It.
         WM_QUERYENDSESSION => LRESULT(1),
+        // Windows switched between light and dark ("ImmersiveColorSet"): re-theme every window.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE => {
+            if lparam.0 != 0 {
+                let s = unsafe { windows::core::PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
+                if s == "ImmersiveColorSet" {
+                    ui::broadcast_theme();
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 request_exit();
@@ -390,11 +418,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         instance::WM_APP_ACTIVATE => {
-            // Someone started Snap It again while it was already running.
-            app::post(Command::Notify {
-                title: "Snap It is already running".into(),
-                body: "Use your capture hotkey (Print Screen by default), or right-click the Snap It icon in the tray.".into(),
-            });
+            // Someone started Snap It again while it was already running: show its window.
+            app::post(Command::Run(Action::OpenSettings));
             LRESULT(0)
         }
         WM_COPYDATA => {

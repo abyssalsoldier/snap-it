@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- **Starting Snap It opens Settings** (from the Start menu, a shortcut or the installer), and
+  starting it again while it runs brings Settings to the front. Started at sign-in it stays in
+  the tray: the "Start with Windows" shortcut now passes `--background` (an existing shortcut
+  is updated once).
+- **Record hotkeys by pressing them:** click a box on the Hotkeys tab and press the keys
+  (PrintScreen and Alt/Win combinations included). Backspace clears a box, Esc leaves it
+  unchanged. Snap It's own hotkeys pause while a box is active.
+- **Quick edit has the editor's tool options** in a strip under its toolbar (replacing the
+  Style popup).
+
+### Changed
+- **Snap It follows the Windows light/dark setting everywhere,** and switches live when it
+  changes: Settings and the QR dialog (standard Windows controls, now with dark styles and
+  readable dark-mode checkboxes), every window's title bar, and the region overlay (which
+  was always dark). Settings > General > Theme can still force light or dark.
+
 ### Fixed
 - Upgrading with the MSI while Snap It was running sat at "Validating install" for about
   100 seconds. Snap It ignored Windows' "session ending" request (also sent by Restart

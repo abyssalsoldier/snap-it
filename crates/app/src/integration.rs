@@ -57,6 +57,8 @@ pub fn set_start_with_windows(on: bool) -> Result<(), String> {
             let _ = sl.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()));
         }
         let _ = sl.SetDescription(w!("Snap It screenshot tool"));
+        // Started at sign-in: stay in the tray instead of opening Settings.
+        let _ = sl.SetArguments(&HSTRING::from(crate::BACKGROUND_ARG));
         let pf: IPersistFile = sl.cast().map_err(|e| e.to_string())?;
         pf.Save(&HSTRING::from(link.as_os_str()), true).map_err(|e| e.to_string())
     }
@@ -64,6 +66,34 @@ pub fn set_start_with_windows(on: bool) -> Result<(), String> {
 
 pub fn start_with_windows_enabled() -> bool {
     startup_link().is_some_and(|l| l.exists())
+}
+
+/// One-time migration: a Startup shortcut made before 0.3.2 has no `--background`, so
+/// sign-in would open Settings. Rewritten only if it lacks the flag and points at this
+/// exe, so the Startup folder is not written on every launch (a persistence-style write
+/// EDR tools watch for).
+pub fn upgrade_startup_link() {
+    let Some(link) = startup_link().filter(|l| l.exists()) else { return };
+    let current = unsafe {
+        (|| -> Option<(String, String)> {
+            let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+            let pf: IPersistFile = sl.cast().ok()?;
+            pf.Load(&HSTRING::from(link.as_os_str()), windows::Win32::System::Com::STGM_READ).ok()?;
+            let mut path = [0u16; 1024];
+            sl.GetPath(&mut path, std::ptr::null_mut(), 0).ok()?;
+            let mut args = [0u16; 1024];
+            sl.GetArguments(&mut args).ok()?;
+            let s = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
+            Some((s(&path), s(&args)))
+        })()
+    };
+    let Some((target, args)) = current else { return };
+    let ours = target.eq_ignore_ascii_case(&exe().to_string_lossy());
+    if ours && !args.contains(crate::BACKGROUND_ARG) {
+        if let Err(e) = set_start_with_windows(true) {
+            crate::log(&format!("startup shortcut: {e}"));
+        }
+    }
 }
 
 const VERBS_ROOT: &str = "Software\\Classes\\SystemFileAssociations\\image\\shell";

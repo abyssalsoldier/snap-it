@@ -30,11 +30,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::theme::{self, Theme};
-use super::toolbar::{self, StickerPopup, StyleHit, StylePopup, Toolbar};
+use super::tool_options::{options_for, ColorHit, ColorPopup, Opt, OptHit, OptionsBar, Values};
+use super::toolbar::{self, StickerPopup, Toolbar};
 use super::{backbuffer, icons::Icon, Backbuffer, Handler, Win};
 use crate::actions::Action;
 use crate::app::{self, Capture, Command, Finish};
-use crate::settings::Settings;
+use crate::settings::{Settings, ToolOptions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -77,7 +78,6 @@ impl Mode {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Btn {
     Tool(Tool),
-    Style,
     Stickers,
     Undo,
     Redo,
@@ -92,7 +92,7 @@ enum Btn {
 #[derive(Clone, Copy, PartialEq)]
 enum Popup {
     None,
-    Style,
+    Color(Opt),
     Stickers,
 }
 
@@ -154,7 +154,10 @@ struct Overlay {
     /// Areas to recompose at the next WM_PAINT.
     pending: Vec<Rect>,
     first_paint: bool,
-    style_changed: bool,
+    /// The rest of the tool options (fill, shadow, dashes, blur radius…), shared with the editor.
+    opts: ToolOptions,
+    /// Mouse position for hover effects in the options strip.
+    opt_hover: Option<(i32, i32)>,
     /// Highlighter colour (separate from the pen colour).
     marker: Rgba,
 }
@@ -212,7 +215,7 @@ pub fn open(mode: Mode) {
 
     let ov = Overlay {
         mode,
-        theme: theme::DARK,
+        theme: theme::current(),
         origin: (vs.x, vs.y),
         bb: Backbuffer::new(shot.width(), shot.height()),
         comp: shot.clone(),
@@ -246,7 +249,8 @@ pub fn open(mode: Mode) {
         prev_frame: None,
         pending: Vec::new(),
         first_paint: true,
-        style_changed: false,
+        opts: a.tools,
+        opt_hover: None,
         marker: s.annotate.highlight,
         settings: s,
     };
@@ -294,6 +298,9 @@ const MAG_CELL: f32 = 8.0;
 
 /// Quick-edit button size: about 25% bigger than the editor's.
 const QUICK_BTN: f32 = 42.0;
+/// Padding around the options strip inside its panel (unscaled).
+const OPT_PAD_X: f32 = 10.0;
+const OPT_PAD_Y: f32 = 6.0;
 
 /// Two rows: drawing tools on top, style and actions underneath.
 fn tool_buttons() -> Vec<toolbar::Button<Btn>> {
@@ -315,8 +322,7 @@ fn tool_buttons() -> Vec<toolbar::Button<Btn>> {
         b(Btn::Tool(Tool::Magnify), Icon::Magnify, "Magnify  (M)"),
         b(Btn::Tool(Tool::Spotlight), Icon::Spotlight, "Spotlight: dim everything else  (S)"),
         b(Btn::Stickers, Icon::Sticker, "Stickers  (I)"),
-        row(Btn::Style, Icon::Fill, "Colour, width & text size"),
-        sep(Btn::Undo, Icon::Undo, "Undo  (Ctrl+Z)"),
+        row(Btn::Undo, Icon::Undo, "Undo  (Ctrl+Z)"),
         b(Btn::Redo, Icon::Redo, "Redo  (Ctrl+Y)"),
         sep(Btn::Copy, Icon::Copy, "Copy  (Ctrl+C)"),
         b(Btn::Save, Icon::Save, "Save  (Ctrl+S)"),
@@ -474,9 +480,137 @@ impl Overlay {
         if below + ph < mon.bottom() as f32 { (r.x as f32, below) } else { (r.x as f32, r.y as f32 - ph - 6.0 * self.scale) }
     }
 
-    fn style_popup(&self) -> StylePopup {
-        let (x, y) = self.popup_origin();
-        StylePopup { x, y, scale: self.scale, palette: self.settings.annotate.palette.clone() }
+    /// The tool whose options the strip shows: the selected item's, else the current
+    /// tool's. `None` when that tool has no options (pointer, eraser, stickers).
+    fn opt_tool(&self) -> Option<Tool> {
+        let t = self.editing.or(self.selected).and_then(|i| self.items.get(i)).and_then(|it| it.tool()).unwrap_or(self.tool);
+        (!options_for(t).is_empty()).then_some(t)
+    }
+
+    /// The panel holding the options strip, beside the toolbar on the side away from
+    /// the selection (or wherever it fits on the monitor).
+    fn options_panel(&self) -> Option<Rect> {
+        if !self.annotating {
+            return None;
+        }
+        let tool = self.opt_tool()?;
+        let s = self.scale;
+        let strip = OptionsBar { x: 0.0, y: 0.0, scale: s, tool: Some(tool), hover: None }.width();
+        let (w, h) = (strip + OPT_PAD_X * 2.0 * s, (28.0 + OPT_PAD_Y * 2.0) * s);
+        let bar = self.bar.rect();
+        let mon = self.monitor_at(bar.x, bar.y);
+        let gap = 6.0 * s;
+        let below = bar.bottom() as f32 + gap;
+        let above = bar.y as f32 - gap - h;
+        let bar_above_sel = self.sel.is_some_and(|sel| bar.bottom() <= sel.y);
+        let fits_below = below + h <= mon.bottom() as f32 - 4.0;
+        let y = if (bar_above_sel || !fits_below) && above >= mon.y as f32 + 4.0 { above } else { below };
+        let x = (bar.x as f32).clamp(mon.x as f32 + 4.0, (mon.right() as f32 - w - 4.0).max(mon.x as f32));
+        Some(Rect::new(x as i32, y as i32, w.ceil() as i32, h.ceil() as i32))
+    }
+
+    fn options_bar(&self) -> OptionsBar {
+        let s = self.scale;
+        let (x, y, tool) = match self.options_panel() {
+            Some(p) => (p.x as f32 + OPT_PAD_X * s, p.y as f32 + OPT_PAD_Y * s, self.opt_tool()),
+            None => (0.0, 0.0, None),
+        };
+        OptionsBar { x, y, scale: s, tool, hover: self.opt_hover }
+    }
+
+    fn values(&self) -> Values {
+        Values { style: self.style, opts: self.opts, marker: self.marker }
+    }
+
+    /// Stores new option values (shared with the editor) and restyles the selected item.
+    fn set_values(&mut self, v: Values, changed: Opt) {
+        if v == self.values() {
+            return;
+        }
+        self.style = v.style;
+        self.opts = v.opts;
+        self.marker = v.marker;
+        v.save();
+        let Some(i) = self.editing.or(self.selected).filter(|&i| i < self.items.len()) else { return };
+        let before = self.items.clone();
+        v.apply_to_item(changed, &mut self.items[i]);
+        if self.items != before {
+            if self.editing.is_none() {
+                self.history.push(before);
+            }
+            self.comp_dirty = true;
+        }
+    }
+
+    /// Selecting an item shows its options, so editing them restyles it.
+    fn select(&mut self, i: Option<usize>) {
+        self.selected = i;
+        if let Some(it) = i.and_then(|i| self.items.get(i)) {
+            let mut v = self.values();
+            v.load_from_item(it);
+            self.style = v.style;
+            self.opts = v.opts;
+            self.marker = v.marker;
+        }
+    }
+
+    fn on_option(&mut self, h: OptHit) {
+        let Some(tool) = self.opt_tool() else { return };
+        let mut v = self.values();
+        let o = match h {
+            OptHit::Swatch(o) => {
+                self.popup = if self.popup == Popup::Color(o) { Popup::None } else { Popup::Color(o) };
+                return;
+            }
+            OptHit::Step(o, d) => {
+                v.step(o, d, tool);
+                o
+            }
+            OptHit::Choice(o, i) => {
+                v.choose(o, i);
+                o
+            }
+            OptHit::Toggle(o) => {
+                v.toggle(o);
+                o
+            }
+        };
+        self.set_values(v, o);
+    }
+
+    fn on_color(&mut self, w: &mut Win, o: Opt, h: ColorHit) {
+        self.popup = Popup::None;
+        let mut v = self.values();
+        let c = match h {
+            ColorHit::Color(c) => Some(c),
+            ColorHit::None => None,
+            ColorHit::Custom => match super::dialogs::choose_color(w.hwnd, v.swatch(o).unwrap_or(Rgba::WHITE)) {
+                Some(c) => Some(c),
+                None => return,
+            },
+        };
+        v.set_swatch(o, c);
+        self.set_values(v, o);
+    }
+
+    /// Colour choices under (or, with the strip above the toolbar, over) a swatch.
+    fn color_popup(&self, o: Opt) -> ColorPopup {
+        let s = self.scale;
+        let r = self.options_bar().swatch_rect(o).unwrap_or_default();
+        let mut p = ColorPopup {
+            x: (r.x as f32 - 8.0 * s).max(0.0),
+            y: r.bottom() as f32 + 10.0 * s,
+            scale: s,
+            palette: self.settings.annotate.palette.clone(),
+            allow_none: o == Opt::FillColor,
+            current: self.values().swatch(o),
+        };
+        let above = self.options_panel().is_some_and(|pr| pr.bottom() <= self.bar.rect().y);
+        let mon = self.monitor_at(r.x, r.y);
+        if above || p.rect().bottom() > mon.bottom() {
+            p.y = r.y as f32 - 10.0 * s - p.rect().h as f32;
+        }
+        p
     }
 
     fn sticker_popup(&self) -> StickerPopup {
@@ -488,7 +622,7 @@ impl Overlay {
     fn popup_rect(&self) -> Option<Rect> {
         match self.popup {
             Popup::None => None,
-            Popup::Style => Some(self.style_popup().rect()),
+            Popup::Color(o) => Some(self.color_popup(o).rect()),
             Popup::Stickers => Some(self.sticker_popup().rect()),
         }
     }
@@ -590,22 +724,10 @@ impl Overlay {
         self.comp_dirty = true;
     }
 
+    /// Tool options are saved as they change; this keeps the last region.
     fn remember(&self) {
-        let sel = self.sel.map(|r| self.screen_rect(r));
-        let style = self.style;
-        let marker = self.marker;
-        let changed = self.style_changed;
-        app::update_settings(|s| {
-            if sel.is_some() {
-                s.last_region = sel;
-            }
-            if changed {
-                s.annotate.color = style.color;
-                s.annotate.width = style.width;
-                s.annotate.font_size = style.font_size;
-                s.annotate.highlight = marker;
-            }
-        });
+        let Some(sel) = self.sel.map(|r| self.screen_rect(r)) else { return };
+        app::update_settings(|s| s.last_region = Some(sel));
     }
 
     fn finish(&mut self, w: &mut Win, how: Finish) {
@@ -693,7 +815,6 @@ impl Overlay {
                 self.popup = if self.popup == Popup::Stickers { Popup::None } else { Popup::Stickers };
                 self.tool = Tool::Sticker(self.sticker);
             }
-            Btn::Style => self.popup = if self.popup == Popup::Style { Popup::None } else { Popup::Style },
             Btn::Undo => self.undo(),
             Btn::Redo => self.redo(),
             Btn::Copy => self.finish(w, Finish::Copy),
@@ -722,53 +843,14 @@ impl Overlay {
         }
     }
 
-    /// True when colour changes should go to the highlighter's own colour.
-    fn marker_context(&self) -> bool {
-        self.tool == Tool::Highlight || self.selected.and_then(|i| self.items.get(i)).is_some_and(|it| matches!(it.shape, Shape::Highlight(_)))
-    }
-
-    /// The colour shown on the style button and preselected in the popup.
-    fn shown_color(&self) -> Rgba {
-        if self.marker_context() { self.marker } else { self.style.color }
-    }
-
-    fn apply_style(&mut self, h: StyleHit) {
-        let marker = self.marker_context();
-        match h {
-            StyleHit::Color(c) if marker => self.marker = c,
-            StyleHit::Color(c) => self.style.color = c,
-            StyleHit::Width(v) => self.style.width = v,
-            StyleHit::FontSize(v) => self.style.font_size = v,
-            StyleHit::ToggleFill => self.style.fill = !self.style.fill,
-        }
-        self.style_changed = true;
-        // Restyle the selected or edited item too.
-        if let Some(i) = self.editing.or(self.selected) {
-            if i < self.items.len() {
-                if self.editing.is_none() {
-                    self.history.push(self.items.clone());
-                }
-                let marker_color = self.marker;
-                let it = &mut self.items[i];
-                let color = if matches!(it.shape, Shape::Highlight(_)) { marker_color } else { self.style.color };
-                // Quick edit fills shapes in their own colour.
-                it.style = Style { fill: it.style.fill, color, fill_color: color, strength: it.style.strength, ..self.style };
-                if let (StyleHit::ToggleFill, Shape::Text { background, .. }) = (h, &mut it.shape) {
-                    *background = !*background;
-                }
-                self.comp_dirty = true;
-            }
-        }
-    }
-
     fn mouse_down(&mut self, w: &mut Win, x: i32, y: i32) {
-        // Popups and toolbar first.
+        // Popups, the options strip and the toolbar first.
         if let Some(pr) = self.popup_rect() {
             if pr.contains(x, y) {
                 match self.popup {
-                    Popup::Style => {
-                        if let Some(h) = self.style_popup().hit(x, y) {
-                            self.apply_style(h);
+                    Popup::Color(o) => {
+                        if let Some(h) = self.color_popup(o).hit(x, y) {
+                            self.on_color(w, o, h);
                         }
                     }
                     Popup::Stickers => {
@@ -782,9 +864,23 @@ impl Overlay {
                 }
                 return;
             }
+            let was = self.popup;
             self.popup = Popup::None;
+            // A click on the swatch that opened the popup just closes it.
+            if let (Popup::Color(o), Some(OptHit::Swatch(o2))) = (was, self.options_bar().hit(x, y)) {
+                if o == o2 {
+                    return;
+                }
+            }
         }
         if self.annotating {
+            if let Some(p) = self.options_panel().filter(|p| p.contains(x, y)) {
+                let _ = p;
+                if let Some(h) = self.options_bar().hit(x, y) {
+                    self.on_option(h);
+                }
+                return;
+            }
             if let Some(b) = self.bar.hit(x, y) {
                 return self.on_button(w, b);
             }
@@ -820,7 +916,7 @@ impl Overlay {
         }
         if self.tool == Tool::Pointer {
             if let Some(i) = ann::hit_test(&self.items, p) {
-                self.selected = Some(i);
+                self.select(Some(i));
                 self.drag = Drag::MoveItem { idx: i, last: p, before: Some(self.items.clone()) };
             } else if sel.contains(x, y) {
                 self.selected = None;
@@ -834,12 +930,10 @@ impl Overlay {
             return self.restart_selection(x, y);
         }
         let sample = pixel_at(&self.shot, x, y).unwrap_or(Rgba::WHITE);
-        let mut style = if self.tool == Tool::Text { Style { fill: self.style.fill, ..self.style } } else { Style { fill: self.style.fill && matches!(self.tool, Tool::Rect | Tool::Ellipse), ..self.style } };
-        if self.tool == Tool::Highlight {
-            style.color = self.marker;
-        }
-        style.fill_color = style.color;
-        if let Some(item) = Item::begin(self.tool, p, style, &self.items, sample) {
+        let v = self.values();
+        let style = v.item_style(self.tool);
+        if let Some(mut item) = Item::begin(self.tool, p, style, &self.items, sample) {
+            v.finish_new_item(&mut item);
             let before = self.items.clone();
             self.items.push(item);
             self.selected = None;
@@ -867,6 +961,7 @@ impl Overlay {
         if self.annotating {
             self.bar.set_hover(x, y);
         }
+        self.opt_hover = (self.annotating && matches!(self.drag, Drag::None)).then_some((x, y));
         let shift = super::shift();
         match &mut self.drag {
             Drag::None => {
@@ -1100,19 +1195,26 @@ impl Overlay {
             }
             return;
         }
-        let up = delta > 0;
-        if matches!(self.tool, Tool::Text | Tool::Balloon | Tool::Step) {
-            self.style.font_size = (self.style.font_size + if up { 2.0 } else { -2.0 }).clamp(10.0, 120.0);
-        } else {
-            self.style.width = (self.style.width + if up { 1.0 } else { -1.0 }).clamp(1.0, 40.0);
+        let Some(tool) = self.opt_tool() else { return };
+        // Over a number in the options strip the wheel changes it; elsewhere it
+        // changes the tool's size (text size for text tools, else width).
+        let (x, y) = self.cursor;
+        let o = self.options_bar().stepper_at(x, y).or_else(|| {
+            let opts = options_for(tool);
+            [Opt::FontSize, Opt::Width].into_iter().find(|o| opts.contains(o))
+        });
+        let Some(o) = o else { return };
+        let mut v = self.values();
+        if v.step(o, if delta > 0 { 1 } else { -1 }, tool) {
+            self.set_values(v, o);
         }
-        self.style_changed = true;
     }
 
     fn cursor_shape(&self) -> windows::core::PCWSTR {
         let (x, y) = self.cursor;
         if self.annotating {
-            if self.bar.rect().contains(x, y) || self.popup_rect().is_some_and(|r| r.contains(x, y)) {
+            let over = |r: Option<Rect>| r.is_some_and(|r| r.contains(x, y));
+            if self.bar.rect().contains(x, y) || over(self.popup_rect()) || over(self.options_panel()) {
                 return IDC_ARROW;
             }
             if let Some(h) = self.handle_at(x, y) {
@@ -1229,6 +1331,11 @@ impl Overlay {
         }
         if self.annotating {
             v.push(self.bar.paint_bounds());
+            if let Some(p) = self.options_panel() {
+                // Room for the strip's tooltips, which hang below it.
+                let (tip_w, tip_h) = ((120.0 * s) as i32, (40.0 * s) as i32);
+                v.push(Rect::new(p.x - tip_w, p.y - 4, p.w + tip_w * 2, p.h + tip_h + 8));
+            }
             if let Some(p) = self.popup_rect() {
                 v.push(p.inflate(4));
             }
@@ -1373,19 +1480,30 @@ impl Overlay {
         if self.annotating {
             let tool = self.tool;
             let popup = self.popup;
+            // The options panel first, so the toolbar's tooltips draw over it.
+            if let Some(p) = self.options_panel() {
+                let (x, y, pw, ph) = (p.x as f32, p.y as f32, p.w as f32, p.h as f32);
+                if let Some(sh) = rounded_rect(x + 1.0, y + 3.0 * s, pw, ph, 9.0 * s) {
+                    pm.fill_path(&sh, &Rgba::new(0, 0, 0, 60).paint(), FillRule::Winding, id, None);
+                }
+                if let Some(bg) = rounded_rect(x, y, pw, ph, 9.0 * s) {
+                    pm.fill_path(&bg, &t.panel.paint(), FillRule::Winding, id, None);
+                    pm.stroke_path(&bg, &t.border.paint(), &thin, id, None);
+                }
+                self.options_bar().draw(pm, t, &self.values());
+            }
             self.bar.draw(
                 pm,
                 t,
                 |b| match b {
                     Btn::Tool(x) => x == tool,
                     Btn::Stickers => matches!(tool, Tool::Sticker(_)) || popup == Popup::Stickers,
-                    Btn::Style => popup == Popup::Style,
                     _ => false,
                 },
-                Some((Btn::Style, self.shown_color(), self.style.width)),
+                None,
             );
             match self.popup {
-                Popup::Style => self.style_popup().draw(pm, t, self.shown_color(), self.style.width, self.style.font_size, self.style.fill),
+                Popup::Color(o) => self.color_popup(o).draw(pm, t),
                 Popup::Stickers => self.sticker_popup().draw(pm, t, Some(self.sticker)),
                 Popup::None => {}
             }
@@ -1584,6 +1702,10 @@ impl Handler for Overlay {
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if msg == super::WM_SNAPIT_THEME {
+            self.theme = super::theme::current();
+            self.pending = vec![self.full()];
+        }
         if self.uia.is_none() && self.wants_uia() {
             let f = Fetcher::new(w.hwnd.0 as isize, WM_OVERLAY_UIA);
             // Start with the window under the cursor so it is likely ready by the first hover.
@@ -1706,9 +1828,6 @@ impl Handler for Overlay {
                 Some(LRESULT(0))
             }
             WM_DESTROY => {
-                if self.style_changed && self.sel.is_none() {
-                    self.remember();
-                }
                 app::post(Command::OverlayClosed);
                 None
             }

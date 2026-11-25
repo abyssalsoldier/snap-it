@@ -255,6 +255,11 @@ pub fn run(dir: &Path) -> i32 {
     key(ov, 0x2E);
     r.dump(ov, "04_overlay_after_delete");
     consistent(&mut r, ov, "after_delete");
+    // A drawing tool shows its options strip beside the quick-edit toolbar.
+    key(ov, b'R');
+    r.dump(ov, "04b_overlay_tool_options");
+    consistent(&mut r, ov, "tool_options");
+    key(ov, b'V');
     // Move the selection with the pointer tool, then undo via right-click reset paths.
     drag(ov, (500, 600), (560, 640));
     consistent(&mut r, ov, "moved_selection");

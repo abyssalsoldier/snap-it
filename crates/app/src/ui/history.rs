@@ -346,6 +346,9 @@ impl Handler for History {
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if msg == super::WM_SNAPIT_THEME {
+            self.theme = super::theme::current();
+        }
         match msg {
             WM_SIZE => {
                 let mut rc = Default::default();

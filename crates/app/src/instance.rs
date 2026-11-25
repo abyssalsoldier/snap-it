@@ -41,8 +41,13 @@ pub fn signal_quit() -> bool {
     signal(QUIT_EVENT)
 }
 
-/// Tells the running copy that the user started Snap It again.
+/// Tells the running copy that the user started Snap It again (it shows Settings).
 pub fn signal_activate() -> bool {
+    // This launch came from the user, so it may bring a window to the front; pass that
+    // right on, or the running copy's Settings window would only flash in the taskbar.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
+    }
     signal(ACTIVATE_EVENT)
 }
 
