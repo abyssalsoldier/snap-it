@@ -191,6 +191,6 @@ pub fn choose_color(owner: HWND, initial: Rgba) -> Option<Rgba> {
 
 pub fn info(owner: Option<HWND>, title: &str, body: &str) {
     unsafe {
-        MessageBoxW(owner, &HSTRING::from(body), &HSTRING::from(title), MB_OK | MB_ICONINFORMATION | MESSAGEBOX_STYLE(0));
+        MessageBoxW(owner, &HSTRING::from(body), &HSTRING::from(title), MB_OK | MB_ICONINFORMATION | MESSAGEBOX_STYLE(0x0001_0000)); // MB_SETFOREGROUND: Snap It usually has no window in front
     }
 }
