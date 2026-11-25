@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use snapit_gfx::effects;
 use snapit_gfx::text;
+use serde::{Deserialize, Serialize};
 use snapit_gfx::tiny_skia::{
-    BlendMode, FillRule, FilterQuality, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap,
-    PixmapMut, SpreadMode, Stroke, Transform,
+    BlendMode, FillRule, FilterQuality, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pattern,
+    Pixmap, PixmapMut, PixmapPaint, SpreadMode, Stroke, StrokeDash, Transform,
 };
 use snapit_gfx::{PointF, Rect, Rgba};
 
@@ -58,19 +59,173 @@ impl Bx {
     }
 }
 
+/// Outline pattern for strokes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Dash {
+    #[default]
+    Solid,
+    Dash,
+    Dot,
+    DashDot,
+}
+
+impl Dash {
+    pub const ALL: [Dash; 4] = [Dash::Solid, Dash::Dash, Dash::Dot, Dash::DashDot];
+    pub fn name(self) -> &'static str {
+        match self {
+            Dash::Solid => "Solid",
+            Dash::Dash => "Dashed",
+            Dash::Dot => "Dotted",
+            Dash::DashDot => "Dash-dot",
+        }
+    }
+    /// The on/off pattern for a stroke of `width`.
+    fn pattern(self, width: f32) -> Option<Vec<f32>> {
+        let w = width.max(1.0);
+        // Dots are zero-length dashes drawn with round caps.
+        let dot = 0.01;
+        match self {
+            Dash::Solid => None,
+            Dash::Dash => Some(vec![w * 3.0, w * 2.0]),
+            Dash::Dot => Some(vec![dot, w * 2.0]),
+            Dash::DashDot => Some(vec![w * 3.0, w * 2.0, dot, w * 2.0]),
+        }
+    }
+}
+
+/// Which ends of an arrow get a head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArrowHeads {
+    #[default]
+    End,
+    Start,
+    Both,
+}
+
+impl ArrowHeads {
+    pub const ALL: [ArrowHeads; 3] = [ArrowHeads::End, ArrowHeads::Start, ArrowHeads::Both];
+    pub fn name(self) -> &'static str {
+        match self {
+            ArrowHeads::End => "Head at end",
+            ArrowHeads::Start => "Head at start",
+            ArrowHeads::Both => "Heads at both ends",
+        }
+    }
+}
+
+/// How step markers count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StepType {
+    #[default]
+    Numbers,
+    Upper,
+    Lower,
+    RomanUpper,
+    RomanLower,
+}
+
+impl StepType {
+    pub const ALL: [StepType; 5] = [StepType::Numbers, StepType::Upper, StepType::Lower, StepType::RomanUpper, StepType::RomanLower];
+    /// Short sample shown on the option button.
+    pub fn sample(self) -> &'static str {
+        match self {
+            StepType::Numbers => "1",
+            StepType::Upper => "A",
+            StepType::Lower => "a",
+            StepType::RomanUpper => "I",
+            StepType::RomanLower => "i",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            StepType::Numbers => "Numbers",
+            StepType::Upper => "Letters (A, B, C)",
+            StepType::Lower => "Letters (a, b, c)",
+            StepType::RomanUpper => "Roman numerals (I, II, III)",
+            StepType::RomanLower => "Roman numerals (i, ii, iii)",
+        }
+    }
+    pub fn label(self, n: u32) -> String {
+        let letters = |n: u32, base: u8| {
+            // 1 → A, 26 → Z, 27 → AA (spreadsheet-style).
+            let mut n = n.max(1);
+            let mut s = Vec::new();
+            while n > 0 {
+                n -= 1;
+                s.push(base + (n % 26) as u8);
+                n /= 26;
+            }
+            s.reverse();
+            String::from_utf8(s).unwrap_or_default()
+        };
+        let roman = |mut n: u32| {
+            const R: [(u32, &str); 13] = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")];
+            let mut s = String::new();
+            for (v, r) in R {
+                while n >= v {
+                    s.push_str(r);
+                    n -= v;
+                }
+            }
+            s
+        };
+        match self {
+            StepType::Numbers => n.to_string(),
+            StepType::Upper => letters(n, b'A'),
+            StepType::Lower => letters(n, b'a'),
+            StepType::RomanUpper => roman(n.clamp(1, 3999)),
+            StepType::RomanLower => roman(n.clamp(1, 3999)).to_lowercase(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Style {
+    /// Border / stroke / text colour (the body colour for steps and balloons).
     pub color: Rgba,
+    /// Border size.
     pub width: f32,
     pub font_size: f32,
+    /// Rectangles and ellipses are filled with `fill_color`.
     pub fill: bool,
+    pub fill_color: Rgba,
+    /// Rectangle corner radius.
+    pub corner_radius: f32,
+    pub dash: Dash,
+    /// Soft drop shadow under the item.
+    pub shadow: bool,
+    pub heads: ArrowHeads,
+    pub step_type: StepType,
+    /// Blur radius, pixelate block size or spotlight dim (%). 0 derives it from `width`.
+    pub strength: f32,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color: Rgba::RED, width: 4.0, font_size: 22.0, fill: false }
+        Style {
+            color: Rgba::RED,
+            width: 4.0,
+            font_size: 22.0,
+            fill: false,
+            fill_color: Rgba::RED,
+            corner_radius: 0.0,
+            dash: Dash::Solid,
+            shadow: false,
+            heads: ArrowHeads::End,
+            step_type: StepType::Numbers,
+            strength: 0.0,
+        }
     }
 }
+
+/// Shadow offset and spread, in document pixels.
+const SHADOW_DX: f32 = 1.0;
+const SHADOW_DY: f32 = 2.5;
+const SHADOW_BLUR: u32 = 3;
+const SHADOW_ALPHA: u32 = 120;
+/// Spotlights dim the whole canvas, so their bounds are "everything".
+const EVERYWHERE: f32 = 1.0e7;
+pub const SPOTLIGHT_DIM: u8 = 55;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
@@ -90,6 +245,8 @@ pub enum Shape {
     Magnify { r: Bx, zoom: f32 },
     Image { r: Bx, img: Arc<Pixmap> },
     Sticker { r: Bx, kind: Sticker },
+    /// Dims everything outside its box (all spotlights share one dimmed layer).
+    Spotlight { r: Bx, dim: u8, ellipse: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +272,7 @@ pub enum Tool {
     Text,
     Balloon,
     Magnify,
+    Spotlight,
     Sticker(Sticker),
 }
 
@@ -165,9 +323,43 @@ impl Item {
             Tool::Text => Shape::Text { at: p, text: String::new(), background: style.fill },
             Tool::Balloon => Shape::Balloon { r: b, tail: p, text: String::new() },
             Tool::Magnify => Shape::Magnify { r: b, zoom: 2.0 },
+            Tool::Spotlight => {
+                let dim = if style.strength > 0.0 { (style.strength * 2.55).clamp(0.0, 255.0) as u8 } else { (SPOTLIGHT_DIM as f32 * 2.55) as u8 };
+                Shape::Spotlight { r: b, dim, ellipse: false }
+            }
             Tool::Sticker(kind) => Shape::Sticker { r: b, kind },
         };
         Some(Item { shape, style })
+    }
+
+    /// The tool that makes this kind of item (for showing its options).
+    pub fn tool(&self) -> Option<Tool> {
+        Some(match &self.shape {
+            Shape::Rect(_) => Tool::Rect,
+            Shape::Ellipse(_) => Tool::Ellipse,
+            Shape::Line(..) => Tool::Line,
+            Shape::Arrow(..) => Tool::Arrow,
+            Shape::Pen(_) => Tool::Pen,
+            Shape::Highlight(_) => Tool::Highlight,
+            Shape::Blur(_) => Tool::Blur,
+            Shape::Pixelate(_) => Tool::Pixelate,
+            Shape::Eraser(..) => Tool::Eraser,
+            Shape::Step { .. } => Tool::Step,
+            Shape::Text { .. } => Tool::Text,
+            Shape::Balloon { .. } => Tool::Balloon,
+            Shape::Magnify { .. } => Tool::Magnify,
+            Shape::Spotlight { .. } => Tool::Spotlight,
+            Shape::Sticker { kind, .. } => Tool::Sticker(*kind),
+            Shape::Image { .. } => return None,
+        })
+    }
+
+    /// The box to outline when the item is selected (a spotlight's bounds are the whole canvas).
+    pub fn outline(&self) -> Bx {
+        match &self.shape {
+            Shape::Spotlight { r, .. } => r.norm(),
+            _ => self.bounds(),
+        }
     }
 
     /// Updates the item while the mouse drags from its start to `p`.
@@ -194,7 +386,7 @@ impl Item {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Blur(b) | Shape::Pixelate(b) | Shape::Eraser(b, _) => {
                 *b = Bx::new(start, boxed(p))
             }
-            Shape::Magnify { r, .. } | Shape::Sticker { r, .. } => *r = Bx::new(start, boxed(p)),
+            Shape::Magnify { r, .. } | Shape::Sticker { r, .. } | Shape::Spotlight { r, .. } => *r = Bx::new(start, boxed(p)),
             Shape::Balloon { r, tail, .. } => {
                 *r = Bx::new(start, p);
                 let n = r.norm();
@@ -215,7 +407,7 @@ impl Item {
     pub fn is_degenerate(&self) -> bool {
         match &self.shape {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Blur(b) | Shape::Pixelate(b) | Shape::Eraser(b, _) => b.w() < 3.0 || b.h() < 3.0,
-            Shape::Magnify { r, .. } | Shape::Sticker { r, .. } | Shape::Image { r, .. } => r.w() < 6.0 || r.h() < 6.0,
+            Shape::Magnify { r, .. } | Shape::Sticker { r, .. } | Shape::Image { r, .. } | Shape::Spotlight { r, .. } => r.w() < 6.0 || r.h() < 6.0,
             Shape::Line(a, b) | Shape::Arrow(a, b) => a.dist(*b) < 4.0,
             Shape::Pen(p) => p.len() < 2,
             Shape::Text { text, .. } => text.trim().is_empty(),
@@ -227,7 +419,7 @@ impl Item {
     pub fn boxed_mut(&mut self) -> Option<&mut Bx> {
         match &mut self.shape {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Blur(b) | Shape::Pixelate(b) | Shape::Eraser(b, _) => Some(b),
-            Shape::Magnify { r, .. } | Shape::Image { r, .. } | Shape::Sticker { r, .. } => Some(r),
+            Shape::Magnify { r, .. } | Shape::Image { r, .. } | Shape::Sticker { r, .. } | Shape::Spotlight { r, .. } => Some(r),
             _ => None,
         }
     }
@@ -247,7 +439,7 @@ impl Item {
         let mv = |p: &mut PointF| *p = p.offset(dx, dy);
         match &mut self.shape {
             Shape::Rect(b) | Shape::Ellipse(b) | Shape::Highlight(b) | Shape::Blur(b) | Shape::Pixelate(b) | Shape::Eraser(b, _) => *b = b.offset(dx, dy),
-            Shape::Magnify { r, .. } | Shape::Image { r, .. } | Shape::Sticker { r, .. } => *r = r.offset(dx, dy),
+            Shape::Magnify { r, .. } | Shape::Image { r, .. } | Shape::Sticker { r, .. } | Shape::Spotlight { r, .. } => *r = r.offset(dx, dy),
             Shape::Balloon { r, tail, .. } => {
                 *r = r.offset(dx, dy);
                 mv(tail);
@@ -272,8 +464,26 @@ impl Item {
         Bx { x0: n.x0, y0: n.y0, x1: n.x0 + n.w().max(l.width + pad * 2.0), y1: n.y0 + n.h().max(l.height + pad * 2.0) }
     }
 
-    /// Bounding box in document space, including stroke width and decorations.
+    /// Whether this kind of item can cast a drop shadow.
+    fn casts_shadow(&self) -> bool {
+        matches!(
+            self.shape,
+            Shape::Rect(_) | Shape::Ellipse(_) | Shape::Line(..) | Shape::Arrow(..) | Shape::Pen(_) | Shape::Step { .. } | Shape::Text { .. } | Shape::Balloon { .. } | Shape::Magnify { .. }
+        )
+    }
+
+    /// Bounding box in document space, including stroke width, decorations and shadow.
     pub fn bounds(&self) -> Bx {
+        let b = self.shape_bounds();
+        if self.style.shadow && self.casts_shadow() {
+            let d = SHADOW_BLUR as f32 + 1.0;
+            Bx { x0: b.x0 - d, y0: b.y0 - d, x1: b.x1 + SHADOW_DX + d, y1: b.y1 + SHADOW_DY + d }
+        } else {
+            b
+        }
+    }
+
+    fn shape_bounds(&self) -> Bx {
         let w = self.style.width;
         let grow = |b: Bx, d: f32| {
             let n = b.norm();
@@ -282,7 +492,9 @@ impl Item {
         match &self.shape {
             Shape::Rect(b) | Shape::Ellipse(b) => grow(*b, w),
             Shape::Highlight(b) | Shape::Blur(b) | Shape::Pixelate(b) | Shape::Eraser(b, _) => grow(*b, 1.0),
-            Shape::Magnify { r, .. } | Shape::Image { r, .. } | Shape::Sticker { r, .. } => grow(*r, 2.0),
+            Shape::Magnify { r, .. } => grow(*r, w.clamp(2.0, 6.0)),
+            Shape::Image { r, .. } | Shape::Sticker { r, .. } => grow(*r, 2.0),
+            Shape::Spotlight { .. } => Bx { x0: -EVERYWHERE, y0: -EVERYWHERE, x1: EVERYWHERE, y1: EVERYWHERE },
             Shape::Line(a, b) => grow(Bx::new(*a, *b), w),
             Shape::Arrow(a, b) => grow(Bx::new(*a, *b), w * 4.0 + 12.0),
             Shape::Pen(pts) => {
@@ -324,7 +536,8 @@ impl Item {
                 let in_y = p.y >= n.y0 - tol && p.y <= n.y1 + tol;
                 (near_x && in_y) || (near_y && in_x)
             }
-            _ => self.bounds().contains(p),
+            Shape::Spotlight { r, .. } => r.norm().contains(p),
+            _ => self.shape_bounds().contains(p),
         }
     }
 }
@@ -348,35 +561,110 @@ fn stroke(width: f32) -> Stroke {
     Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() }
 }
 
+/// A stroke in the item's border size and dash pattern.
+fn styled_stroke(st: &Style, join: LineJoin) -> Stroke {
+    let dash = st.dash.pattern(st.width).and_then(|p| StrokeDash::new(p, 0.0));
+    // Butt caps keep mitred rectangle corners crisp; dots need round caps.
+    let cap = if join == LineJoin::Miter && st.dash == Dash::Solid { LineCap::Butt } else { LineCap::Round };
+    Stroke { width: st.width, line_cap: cap, line_join: join, dash, ..Default::default() }
+}
+
+fn rect_path(b: Bx, radius: f32) -> Option<Path> {
+    let n = b.norm();
+    let r = radius.min(n.w() / 2.0).min(n.h() / 2.0);
+    if r > 0.5 {
+        effects::rounded_rect(n.x0, n.y0, n.w(), n.h(), r)
+    } else {
+        n.skia().map(PathBuilder::from_rect)
+    }
+}
+
 /// Draws all items. Item coordinates plus `(ox, oy)` give pixmap coordinates.
+///
+/// All spotlights are drawn together, as one dimmed layer with holes, at the
+/// position of the first one: items before it are dimmed, items after it are not.
 pub fn render(pm: &mut PixmapMut, items: &[Item], ox: f32, oy: f32) {
+    let mut spotlit = false;
     for it in items {
+        if matches!(it.shape, Shape::Spotlight { .. }) {
+            if !spotlit {
+                draw_spotlights(pm, items, ox, oy);
+                spotlit = true;
+            }
+            continue;
+        }
         render_item(pm, it, ox, oy);
     }
 }
 
+fn draw_spotlights(pm: &mut PixmapMut, items: &[Item], ox: f32, oy: f32) {
+    let spots: Vec<(Bx, u8, bool)> = items.iter().filter_map(|i| if let Shape::Spotlight { r, dim, ellipse } = i.shape { Some((r, dim, ellipse)) } else { None }).collect();
+    let Some(&(_, dim, _)) = spots.first() else { return };
+    let (w, h) = (pm.width(), pm.height());
+    let Some(mut mask) = Mask::new(w, h) else { return };
+    let t = Transform::from_translate(ox, oy);
+    for (r, _, ellipse) in &spots {
+        let path = if *ellipse { r.norm().skia().and_then(PathBuilder::from_oval) } else { r.norm().skia().map(PathBuilder::from_rect) };
+        if let Some(p) = path {
+            mask.fill_path(&p, FillRule::Winding, true, t);
+        }
+    }
+    mask.invert();
+    if let Some(all) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, h as f32) {
+        pm.fill_rect(all, &Rgba::new(0, 0, 0, dim).paint(), Transform::identity(), Some(&mask));
+    }
+}
+
+/// Draws the item's silhouette, softened and offset, as its drop shadow.
+fn draw_shadow(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
+    let mut ghost = it.clone();
+    ghost.style.shadow = false;
+    // A lens shows the pixels under it; its shadow is the whole disc.
+    if let Shape::Magnify { r, .. } = ghost.shape {
+        ghost.shape = Shape::Ellipse(r);
+        ghost.style.fill = true;
+    }
+    let b = it.shape_bounds().offset(ox, oy).to_rect().inflate(SHADOW_BLUR as i32 + 2);
+    let Some(r) = b.intersect(Rect::new(-(SHADOW_DX.ceil() as i32), -(SHADOW_DY.ceil() as i32), pm.width() as i32 + 4, pm.height() as i32 + 4)) else { return };
+    let Some(mut tmp) = Pixmap::new(r.w.max(1) as u32, r.h.max(1) as u32) else { return };
+    render_item(&mut tmp.as_mut(), &ghost, ox - r.x as f32, oy - r.y as f32);
+    for px in tmp.data_mut().as_chunks_mut::<4>().0 {
+        // Premultiplied black at a fraction of the item's coverage.
+        let a = px[3] as u32 * SHADOW_ALPHA / 255;
+        *px = [0, 0, 0, a as u8];
+    }
+    let full = Rect::new(0, 0, r.w, r.h);
+    effects::blur(&mut tmp.as_mut(), full, SHADOW_BLUR);
+    let paint = PixmapPaint::default();
+    pm.draw_pixmap(0, 0, tmp.as_ref(), &paint, Transform::from_translate(r.x as f32 + SHADOW_DX, r.y as f32 + SHADOW_DY), None);
+}
+
 pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
+    if it.style.shadow && it.casts_shadow() {
+        draw_shadow(pm, it, ox, oy);
+    }
     let t = Transform::from_translate(ox, oy);
     let st = &it.style;
     let paint = st.color.paint();
     match &it.shape {
         Shape::Rect(b) => {
-            if let Some(r) = b.skia() {
-                let path = PathBuilder::from_rect(r);
+            if let Some(path) = rect_path(*b, st.corner_radius) {
                 if st.fill {
-                    pm.fill_path(&path, &paint, FillRule::Winding, t, None);
-                } else {
-                    let s = Stroke { width: st.width, line_join: LineJoin::Miter, ..Default::default() };
-                    pm.stroke_path(&path, &paint, &s, t, None);
+                    pm.fill_path(&path, &st.fill_color.paint(), FillRule::Winding, t, None);
+                }
+                if st.width > 0.0 && !(st.fill && st.fill_color == st.color && st.dash == Dash::Solid && st.corner_radius <= 0.5) {
+                    let join = if st.corner_radius > 0.5 { LineJoin::Round } else { LineJoin::Miter };
+                    pm.stroke_path(&path, &paint, &styled_stroke(st, join), t, None);
                 }
             }
         }
         Shape::Ellipse(b) => {
             if let Some(path) = b.skia().and_then(PathBuilder::from_oval) {
                 if st.fill {
-                    pm.fill_path(&path, &paint, FillRule::Winding, t, None);
-                } else {
-                    pm.stroke_path(&path, &paint, &stroke(st.width), t, None);
+                    pm.fill_path(&path, &st.fill_color.paint(), FillRule::Winding, t, None);
+                }
+                if st.width > 0.0 && !(st.fill && st.fill_color == st.color && st.dash == Dash::Solid) {
+                    pm.stroke_path(&path, &paint, &styled_stroke(st, LineJoin::Round), t, None);
                 }
             }
         }
@@ -385,7 +673,7 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
             pb.move_to(a.x, a.y);
             pb.line_to(b.x, b.y);
             if let Some(p) = pb.finish() {
-                pm.stroke_path(&p, &paint, &stroke(st.width), t, None);
+                pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
             }
         }
         Shape::Arrow(a, b) => draw_arrow(pm, *a, *b, st, t),
@@ -403,7 +691,7 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
                 pb.line_to(l.x, l.y);
             }
             if let Some(p) = pb.finish() {
-                pm.stroke_path(&p, &paint, &stroke(st.width), t, None);
+                pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
             }
         }
         Shape::Highlight(b) => {
@@ -413,8 +701,15 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
                 pm.fill_rect(r, &p, t, None);
             }
         }
-        Shape::Blur(b) => effects::blur(pm, b.offset(ox, oy).to_rect(), (st.width * 2.5).max(4.0) as u32),
-        Shape::Pixelate(b) => effects::pixelate(pm, b.offset(ox, oy).to_rect(), (st.width * 3.0).max(6.0) as u32),
+        Shape::Blur(b) => {
+            let radius = if st.strength > 0.0 { st.strength } else { (st.width * 2.5).max(4.0) };
+            effects::blur(pm, b.offset(ox, oy).to_rect(), radius.max(1.0) as u32)
+        }
+        Shape::Pixelate(b) => {
+            let block = if st.strength > 0.0 { st.strength } else { (st.width * 3.0).max(6.0) };
+            effects::pixelate(pm, b.offset(ox, oy).to_rect(), block.max(2.0) as u32)
+        }
+        Shape::Spotlight { .. } => draw_spotlights(pm, std::slice::from_ref(it), ox, oy),
         Shape::Eraser(b, c) => {
             if let Some(r) = b.skia() {
                 let mut p = c.paint();
@@ -428,9 +723,14 @@ pub fn render_item(pm: &mut PixmapMut, it: &Item, ox: f32, oy: f32) {
                 pm.fill_path(&c, &paint, FillRule::Winding, t, None);
                 pm.stroke_path(&c, &contrast(st.color).with_alpha(200).paint(), &stroke(2.0), t, None);
             }
-            let label = n.to_string();
-            let size = r * 1.15;
-            let l = text::layout(&label, size, true);
+            let label = st.step_type.label(*n);
+            // Longer labels (XVIII, AA) shrink to stay inside the disc.
+            let mut size = r * 1.15;
+            let mut l = text::layout(&label, size, true);
+            if l.width > r * 1.6 {
+                size *= r * 1.6 / l.width;
+                l = text::layout(&label, size, true);
+            }
             text::draw(pm, &label, ox + at.x - l.width / 2.0, oy + at.y - l.height / 2.0, size, true, contrast(st.color), None);
         }
         Shape::Text { at, text: s, background } => {
@@ -487,26 +787,42 @@ fn draw_arrow(pm: &mut PixmapMut, a: PointF, b: PointF, st: &Style, t: Transform
         return;
     }
     let (ux, uy) = (dx / len, dy / len);
-    let head = (st.width * 3.5 + 8.0).min(len * 0.6);
+    let (at_start, at_end) = match st.heads {
+        ArrowHeads::End => (false, true),
+        ArrowHeads::Start => (true, false),
+        ArrowHeads::Both => (true, true),
+    };
+    let heads = if at_start && at_end { 2.0 } else { 1.0 };
+    let head = (st.width * 3.5 + 8.0).min(len * 0.6 / heads);
     let half = head * 0.6;
-    let base = PointF::new(b.x - ux * head, b.y - uy * head);
-    let shaft_end = PointF::new(b.x - ux * head * 0.7, b.y - uy * head * 0.7);
     let paint = st.color.paint();
+    // The shaft stops inside each head so its round cap does not poke out of the tip.
+    let s0 = if at_start { PointF::new(a.x + ux * head * 0.7, a.y + uy * head * 0.7) } else { a };
+    let s1 = if at_end { PointF::new(b.x - ux * head * 0.7, b.y - uy * head * 0.7) } else { b };
     let mut pb = PathBuilder::new();
-    pb.move_to(a.x, a.y);
-    pb.line_to(shaft_end.x, shaft_end.y);
+    pb.move_to(s0.x, s0.y);
+    pb.line_to(s1.x, s1.y);
     if let Some(p) = pb.finish() {
-        pm.stroke_path(&p, &paint, &stroke(st.width), t, None);
+        pm.stroke_path(&p, &paint, &styled_stroke(st, LineJoin::Round), t, None);
     }
-    let mut pb = PathBuilder::new();
-    pb.move_to(b.x, b.y);
-    pb.line_to(base.x - uy * half, base.y + ux * half);
-    pb.line_to(base.x + uy * half, base.y - ux * half);
-    pb.close();
-    if let Some(p) = pb.finish() {
-        pm.fill_path(&p, &paint, FillRule::Winding, t, None);
-        let s = Stroke { width: 1.5, line_join: LineJoin::Round, ..Default::default() };
-        pm.stroke_path(&p, &paint, &s, t, None);
+    let mut draw_head = |tip: PointF, ux: f32, uy: f32| {
+        let base = PointF::new(tip.x - ux * head, tip.y - uy * head);
+        let mut pb = PathBuilder::new();
+        pb.move_to(tip.x, tip.y);
+        pb.line_to(base.x - uy * half, base.y + ux * half);
+        pb.line_to(base.x + uy * half, base.y - ux * half);
+        pb.close();
+        if let Some(p) = pb.finish() {
+            pm.fill_path(&p, &paint, FillRule::Winding, t, None);
+            let s = Stroke { width: 1.5, line_join: LineJoin::Round, ..Default::default() };
+            pm.stroke_path(&p, &paint, &s, t, None);
+        }
+    };
+    if at_end {
+        draw_head(b, ux, uy);
+    }
+    if at_start {
+        draw_head(a, -ux, -uy);
     }
 }
 
@@ -527,7 +843,8 @@ fn draw_magnify(pm: &mut PixmapMut, r: Bx, zoom: f32, st: &Style, ox: f32, oy: f
         ..Default::default()
     };
     pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
-    pm.stroke_path(&path, &st.color.paint(), &stroke(st.width.clamp(2.0, 6.0)), Transform::identity(), None);
+    let ring = Style { width: st.width.clamp(2.0, 6.0), ..*st };
+    pm.stroke_path(&path, &st.color.paint(), &styled_stroke(&ring, LineJoin::Round), Transform::identity(), None);
 }
 
 pub fn draw_image(pm: &mut PixmapMut, img: &Pixmap, r: Bx, t: Transform) {
@@ -661,6 +978,62 @@ mod tests {
         assert_eq!(cur, vec![1]);
         assert_eq!(h.redo(cur).unwrap(), vec![1, 2]);
         assert!(h.can_undo() && !h.can_redo());
+    }
+
+    #[test]
+    fn spotlights_share_one_dim_layer() {
+        let s = Style::default();
+        let mut a = Item::begin(Tool::Spotlight, PointF::new(10.0, 10.0), s, &[], Rgba::WHITE).unwrap();
+        a.drag(PointF::new(10.0, 10.0), PointF::new(50.0, 50.0), false);
+        let mut b = a.clone();
+        b.translate(100.0, 0.0);
+        assert_eq!(a.outline(), Bx { x0: 10.0, y0: 10.0, x1: 50.0, y1: 50.0 });
+        assert!(a.hit(PointF::new(30.0, 30.0)) && !a.hit(PointF::new(80.0, 30.0)));
+        let mut pm = canvas();
+        render(&mut pm.as_mut(), &[a, b], 0.0, 0.0);
+        // Inside either spotlight: untouched. Outside both: dimmed once (not twice).
+        assert_eq!(pixel_at(&pm, 30, 30), Some(Rgba::WHITE));
+        assert_eq!(pixel_at(&pm, 130, 30), Some(Rgba::WHITE));
+        let out = pixel_at(&pm, 80, 90).unwrap();
+        let once = 255 - (255.0 * SPOTLIGHT_DIM as f32 / 100.0) as u8;
+        assert!(out.r.abs_diff(once) <= 3, "{out:?}");
+    }
+
+    #[test]
+    fn step_labels() {
+        assert_eq!(StepType::Numbers.label(12), "12");
+        assert_eq!(StepType::Upper.label(1), "A");
+        assert_eq!(StepType::Upper.label(27), "AA");
+        assert_eq!(StepType::Lower.label(3), "c");
+        assert_eq!(StepType::RomanUpper.label(14), "XIV");
+        assert_eq!(StepType::RomanLower.label(9), "ix");
+    }
+
+    #[test]
+    fn shadow_falls_below_and_fill_uses_fill_colour() {
+        let st = Style { fill: true, fill_color: Rgba::rgb(0, 0, 255), shadow: true, corner_radius: 6.0, ..Style::default() };
+        let mut it = Item::begin(Tool::Rect, PointF::new(20.0, 20.0), st, &[], Rgba::WHITE).unwrap();
+        it.drag(PointF::new(20.0, 20.0), PointF::new(80.0, 60.0), false);
+        let mut pm = canvas();
+        render(&mut pm.as_mut(), &[it.clone()], 0.0, 0.0);
+        assert_eq!(pixel_at(&pm, 50, 40), Some(Rgba::rgb(0, 0, 255)));
+        // Just below the bottom border: shadowed (darker than the white canvas).
+        let below = pixel_at(&pm, 50, 64).unwrap();
+        assert!(below.r < 250, "{below:?}");
+        assert!(it.bounds().y1 > it.shape_bounds().y1);
+    }
+
+    #[test]
+    fn arrows_can_have_two_heads() {
+        let st = Style { heads: ArrowHeads::Both, width: 3.0, ..Style::default() };
+        let mut it = Item::begin(Tool::Arrow, PointF::new(20.0, 60.0), st, &[], Rgba::WHITE).unwrap();
+        it.drag(PointF::new(20.0, 60.0), PointF::new(180.0, 60.0), false);
+        let mut pm = canvas();
+        render(&mut pm.as_mut(), &[it], 0.0, 0.0);
+        // Heads are much wider than the 3 px shaft, at both ends.
+        assert_eq!(pixel_at(&pm, 34, 65), Some(Rgba::RED));
+        assert_eq!(pixel_at(&pm, 166, 65), Some(Rgba::RED));
+        assert_eq!(pixel_at(&pm, 100, 65), Some(Rgba::WHITE));
     }
 
     #[test]

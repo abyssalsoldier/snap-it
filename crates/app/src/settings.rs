@@ -52,6 +52,9 @@ pub struct Region {
     pub quick_annotate: bool,
     pub detect_windows: bool,
     pub detect_controls: bool,
+    /// Ask UI Automation for control bounds in apps without child windows
+    /// (Chromium/Electron, WPF, WinUI). Off: only image edges are used.
+    pub uia_controls: bool,
     pub magnifier: bool,
     pub crosshair: bool,
     pub dim_opacity: u8,
@@ -59,7 +62,7 @@ pub struct Region {
 
 impl Default for Region {
     fn default() -> Self {
-        Self { quick_annotate: true, detect_windows: true, detect_controls: true, magnifier: true, crosshair: false, dim_opacity: 110 }
+        Self { quick_annotate: true, detect_windows: true, detect_controls: true, uia_controls: true, magnifier: true, crosshair: false, dim_opacity: 110 }
     }
 }
 
@@ -72,6 +75,50 @@ pub struct Annotate {
     pub width: f32,
     pub font_size: f32,
     pub palette: Vec<Rgba>,
+    /// The editor's per-tool options (border, fill, shadow…), remembered between sessions.
+    pub tools: ToolOptions,
+}
+
+/// Editor tool options, modelled on ShareX's annotation options. Shared options
+/// (border style, shadow…) apply to every tool that has them, as in ShareX.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOptions {
+    pub fill: bool,
+    pub fill_color: Rgba,
+    pub corner_radius: f32,
+    pub dash: snapit_annotate::Dash,
+    pub shadow: bool,
+    pub heads: snapit_annotate::ArrowHeads,
+    pub step_type: snapit_annotate::StepType,
+    pub text_background: bool,
+    pub blur_radius: f32,
+    pub pixel_size: f32,
+    /// Magnify zoom, as a factor (2.0 = 200%).
+    pub zoom: f32,
+    /// Spotlight dim, percent.
+    pub spot_dim: f32,
+    pub spot_ellipse: bool,
+}
+
+impl Default for ToolOptions {
+    fn default() -> Self {
+        Self {
+            fill: false,
+            fill_color: Rgba::WHITE,
+            corner_radius: 0.0,
+            dash: snapit_annotate::Dash::Solid,
+            shadow: false,
+            heads: snapit_annotate::ArrowHeads::End,
+            step_type: snapit_annotate::StepType::Numbers,
+            text_background: false,
+            blur_radius: 12.0,
+            pixel_size: 12.0,
+            zoom: 2.0,
+            spot_dim: snapit_annotate::SPOTLIGHT_DIM as f32,
+            spot_ellipse: false,
+        }
+    }
 }
 
 impl Default for Annotate {
@@ -93,6 +140,7 @@ impl Default for Annotate {
                 Rgba::rgb(107, 114, 128),
                 Rgba::BLACK,
             ],
+            tools: ToolOptions::default(),
         }
     }
 }

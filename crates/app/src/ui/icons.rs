@@ -39,6 +39,7 @@ pub enum Icon {
     Fill,
     ZoomFit,
     Folder,
+    Spotlight,
 }
 
 struct Pen<'a, 'b> {
@@ -188,6 +189,16 @@ pub fn draw(pm: &mut PixmapMut, icon: Icon, x: f32, y: f32, size: f32, c: Rgba) 
         Icon::Balloon => {
             p.rect(0.16, 0.2, 0.84, 0.64, 0.12, false);
             p.poly(&[(0.32, 0.64), (0.28, 0.84), (0.48, 0.64)], false);
+        }
+        Icon::Spotlight => {
+            // A dimmed frame with a bright hole in it.
+            p.c = c.with_alpha(110);
+            p.rect(0.14, 0.2, 0.86, 0.8, 0.06, true);
+            p.c = c;
+            p.rect(0.14, 0.2, 0.86, 0.8, 0.06, false);
+            if let Some(o) = snapit_gfx::tiny_skia::Rect::from_xywh(x + size * 0.32, y + size * 0.34, size * 0.36, size * 0.32).and_then(PathBuilder::from_oval) {
+                p.pm.fill_path(&o, &c.paint(), FillRule::Winding, Transform::identity(), None);
+            }
         }
         Icon::Magnify => {
             p.circle(0.44, 0.44, 0.22, false);

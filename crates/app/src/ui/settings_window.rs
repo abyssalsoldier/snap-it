@@ -82,6 +82,7 @@ const ID_CROSSHAIR: u16 = 306;
 const ID_DIM: u16 = 307;
 const ID_SCROLLING: u16 = 308;
 const ID_CLEAR_CUSTOM: u16 = 309;
+const ID_UIA: u16 = 310;
 const ID_T_COPY: u16 = 400;
 const ID_T_SAVE: u16 = 401;
 const ID_T_EDITOR: u16 = 402;
@@ -317,6 +318,8 @@ impl SettingsWin {
         y += 26;
         self.check(hwnd, 1, ID_DETECT_CTL, "Snap to controls inside windows (buttons, panels…)", s.region.detect_controls, x0 + 10, y, cw - 70);
         y += 26;
+        self.check(hwnd, 1, ID_UIA, "Use UI Automation to find controls in modern apps (browsers, VS Code…)", s.region.uia_controls, x0 + 28, y, cw - 88);
+        y += 26;
         self.check(hwnd, 1, ID_MAGNIFIER, "Show the magnifier", s.region.magnifier, x0 + 10, y, cw - 70);
         y += 26;
         self.check(hwnd, 1, ID_CROSSHAIR, "Show full-screen crosshair lines", s.region.crosshair, x0 + 10, y, cw - 70);
@@ -456,6 +459,7 @@ impl SettingsWin {
         s.region.quick_annotate = self.is_checked(ID_QUICK);
         s.region.detect_windows = self.is_checked(ID_DETECT_WIN);
         s.region.detect_controls = self.is_checked(ID_DETECT_CTL);
+        s.region.uia_controls = self.is_checked(ID_UIA);
         s.region.magnifier = self.is_checked(ID_MAGNIFIER);
         s.region.crosshair = self.is_checked(ID_CROSSHAIR);
         s.region.dim_opacity = self.num(ID_DIM, 110, 0, 230) as u8;

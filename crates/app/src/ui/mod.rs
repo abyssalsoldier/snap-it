@@ -16,6 +16,7 @@ pub mod pin;
 pub mod qr_dialog;
 pub mod settings_window;
 pub mod theme;
+pub mod tool_options;
 pub mod toolbar;
 
 use std::cell::RefCell;

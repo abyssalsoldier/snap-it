@@ -15,9 +15,10 @@ use std::rc::Rc;
 
 use snapit_annotate::{self as ann, History, Item, Shape, Sticker, Style, Tool};
 use snapit_capture as cap;
+use snapit_capture::uia::{Fetch, Fetcher};
 use snapit_gfx::effects::rounded_rect;
 use snapit_gfx::tiny_skia::{FillRule, FilterQuality, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Stroke, StrokeDash, Transform};
-use snapit_gfx::{blit_rect, crop, pixel_at, text, PointF, Rect, Rgba};
+use snapit_gfx::{blit_rect, crop, edges, pixel_at, text, PointF, Rect, Rgba};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -53,7 +54,7 @@ pub enum Mode {
 impl Mode {
     fn hint(self) -> &'static str {
         match self {
-            Mode::Region => "Drag to select · Click a window or control · Esc to cancel",
+            Mode::Region => "Drag to select · Click a window or control · Scroll to widen or narrow · Esc to cancel",
             Mode::Window => "Click a window to capture it · Esc to cancel",
             Mode::SetCustomRegion => "Drag to set your custom region · Esc to cancel",
             Mode::Scrolling => "Select the scrolling area · Esc to cancel",
@@ -120,6 +121,13 @@ struct Overlay {
     annotating: bool,
     sel: Option<Rect>,
     hover: Option<Rect>,
+    /// Scroll-wheel steps from the default snap target under the cursor
+    /// (positive: enclosing elements, negative: finer parts).
+    hover_step: i32,
+    /// Default snap target the steps count from; moving onto another resets them.
+    hover_base: Option<Rect>,
+    /// UI Automation element fetcher (started on the first message, once the window exists).
+    uia: Option<Fetcher>,
     drag: Drag,
     items: Vec<Item>,
     history: History<Vec<Item>>,
@@ -199,7 +207,7 @@ pub fn open(mode: Mode) {
     let mons: Vec<Rect> = cap::monitors().into_iter().map(|m| to_client(m.rect)).collect();
     let dim = if mode.dims() { dimmed(&shot, s.region.dim_opacity) } else { shot.clone() };
     let a = &s.annotate;
-    let style = Style { color: a.color, width: a.width, font_size: a.font_size, fill: false };
+    let style = Style { color: a.color, width: a.width, font_size: a.font_size, ..Style::default() };
     let cursor = cursor_client(vs);
 
     let ov = Overlay {
@@ -217,6 +225,9 @@ pub fn open(mode: Mode) {
         annotating: false,
         sel: None,
         hover: None,
+        hover_step: 0,
+        hover_base: None,
+        uia: None,
         drag: Drag::None,
         items: Vec::new(),
         history: History::new(),
@@ -275,12 +286,18 @@ fn dimmed(src: &Pixmap, amount: u8) -> Pixmap {
 
 /// Self-test: recompose the whole frame from scratch.
 pub const WM_OVERLAY_TEST_FULL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 92;
+/// Posted by the UIA worker when a window's elements are ready (wparam = window handle).
+const WM_OVERLAY_UIA: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 93;
 const HANDLE: f32 = 9.0;
 const MAG_CELLS: i32 = 17;
 const MAG_CELL: f32 = 8.0;
 
+/// Quick-edit button size: about 25% bigger than the editor's.
+const QUICK_BTN: f32 = 42.0;
+
+/// Two rows: drawing tools on top, style and actions underneath.
 fn tool_buttons() -> Vec<toolbar::Button<Btn>> {
-    use toolbar::{b, sep};
+    use toolbar::{b, row, sep};
     vec![
         b(Btn::Tool(Tool::Pointer), Icon::Pointer, "Select / move  (V)"),
         sep(Btn::Tool(Tool::Rect), Icon::Rect, "Rectangle  (R)"),
@@ -296,8 +313,9 @@ fn tool_buttons() -> Vec<toolbar::Button<Btn>> {
         b(Btn::Tool(Tool::Pixelate), Icon::Pixelate, "Pixelate  (X)"),
         b(Btn::Tool(Tool::Eraser), Icon::Eraser, "Smart eraser  (G)"),
         b(Btn::Tool(Tool::Magnify), Icon::Magnify, "Magnify  (M)"),
+        b(Btn::Tool(Tool::Spotlight), Icon::Spotlight, "Spotlight: dim everything else  (S)"),
         b(Btn::Stickers, Icon::Sticker, "Stickers  (I)"),
-        sep(Btn::Style, Icon::Fill, "Colour, width & text size"),
+        row(Btn::Style, Icon::Fill, "Colour, width & text size"),
         sep(Btn::Undo, Icon::Undo, "Undo  (Ctrl+Z)"),
         b(Btn::Redo, Icon::Redo, "Redo  (Ctrl+Y)"),
         sep(Btn::Copy, Icon::Copy, "Copy  (Ctrl+C)"),
@@ -325,6 +343,7 @@ fn tool_for_key(k: u8) -> Option<Tool> {
         b'X' => Tool::Pixelate,
         b'G' => Tool::Eraser,
         b'M' => Tool::Magnify,
+        b'S' => Tool::Spotlight,
         _ => return None,
     })
 }
@@ -344,13 +363,85 @@ impl Overlay {
         self.mons.iter().copied().find(|m| m.contains(x, y)).or_else(|| self.mons.first().copied()).unwrap_or(self.full())
     }
 
-    fn detect(&self, x: i32, y: i32) -> Option<Rect> {
+    fn snaps_controls(&self) -> bool {
+        self.settings.region.detect_controls && self.mode != Mode::Window
+    }
+
+    fn wants_uia(&self) -> bool {
+        self.mode.detects_windows() && self.snaps_controls() && self.settings.region.uia_controls && !self.wins.is_empty()
+    }
+
+    /// Snap targets under (x, y), innermost first, ending with the window (or
+    /// monitor), and the index of the default one.
+    ///
+    /// Inside a window: UI Automation elements when the app exposes them; otherwise
+    /// boxes found from the screenshot's edges plus any child window (legacy Win32
+    /// controls). All local: the UIA data was fetched in the background.
+    ///
+    /// "Fine" targets (text labels, tiny parts, a box cut off by a divider) sit
+    /// below the default and are reached by scrolling down, so hovering a button's
+    /// caption picks the button and hovering half a card picks the card.
+    fn candidates(&self, x: i32, y: i32) -> (Vec<Rect>, usize) {
         if !self.mode.detects_windows() {
-            return None;
+            return (Vec::new(), 0);
         }
-        let r = cap::pick_at(&self.wins, x, y, self.settings.region.detect_controls && self.mode != Mode::Window);
-        let r = r.or_else(|| (self.mode != Mode::Window).then(|| self.monitor_at(x, y)))?;
-        r.intersect(self.full())
+        let full = self.full();
+        let Some(w) = self.wins.iter().find(|w| w.rect.contains(x, y)) else {
+            return if self.mode == Mode::Window { (Vec::new(), 0) } else { (self.monitor_at(x, y).intersect(full).into_iter().collect(), 0) };
+        };
+        // (rect, fine)
+        let mut out: Vec<(Rect, bool)> = Vec::new();
+        if self.snaps_controls() {
+            // A "control" that is (nearly) the whole window adds nothing.
+            let part = |r: &Rect| r.contains(x, y) && r.area() * 100 < w.rect.area() * 95;
+            if let Some(Fetch::Ready(els)) = self.uia.as_ref().map(|f| f.get(w.hwnd)) {
+                for e in els.iter() {
+                    let r = e.rect.offset(-self.origin.0, -self.origin.1);
+                    if part(&r) {
+                        out.extend(r.intersect(w.rect).map(|r| (r, e.fine)));
+                    }
+                }
+            }
+            if out.is_empty() {
+                let child = w.children.iter().find(|c| part(c)).and_then(|c| c.intersect(w.rect));
+                let bounds = child.unwrap_or(w.rect);
+                let outer = edges::outer_box_at(&self.shot, x, y, bounds);
+                let inner = edges::box_at(&self.shot, x, y, bounds);
+                out.extend(outer.map(|r| (r, false)));
+                out.extend(inner.filter(|i| Some(*i) != outer).map(|r| (r, true)));
+                out.extend(child.map(|r| (r, false)));
+            }
+        }
+        out.push((w.rect, false));
+        let mut v: Vec<(Rect, bool)> = out.into_iter().filter_map(|(r, f)| r.intersect(full).map(|r| (r, f))).filter(|(r, _)| r.w >= 2 && r.h >= 2).collect();
+        // Same rect from two sources: it is fine only if both say so.
+        v.sort_by_key(|(r, f)| (r.area(), r.x, r.y, r.w, *f));
+        v.dedup_by(|b, a| a.0 == b.0);
+        let default = v.iter().position(|(_, f)| !f).unwrap_or(0);
+        (v.into_iter().map(|(r, _)| r).collect(), default)
+    }
+
+    fn detect(&self, x: i32, y: i32) -> Option<Rect> {
+        let (c, d) = self.candidates(x, y);
+        c.get(d).copied()
+    }
+
+    fn update_hover(&mut self, x: i32, y: i32) {
+        let (c, d) = self.candidates(x, y);
+        let base = c.get(d).copied();
+        if base != self.hover_base {
+            self.hover_base = base;
+            self.hover_step = 0;
+        }
+        if c.is_empty() {
+            // Nothing to snap to (snapping off, or no window under the cursor).
+            self.hover = None;
+            self.hover_step = 0;
+            return;
+        }
+        let i = (d as i32 + self.hover_step).clamp(0, c.len() as i32 - 1);
+        self.hover_step = i - d as i32;
+        self.hover = c.get(i as usize).copied();
     }
 
     // ---------- selection & toolbar ----------
@@ -406,6 +497,7 @@ impl Overlay {
         self.annotating = true;
         self.scale = w.dpi_scale();
         self.bar = Toolbar::new(tool_buttons(), self.scale);
+        self.bar.btn = QUICK_BTN;
         self.comp_dirty = true;
         self.place_toolbar();
     }
@@ -659,7 +751,8 @@ impl Overlay {
                 let marker_color = self.marker;
                 let it = &mut self.items[i];
                 let color = if matches!(it.shape, Shape::Highlight(_)) { marker_color } else { self.style.color };
-                it.style = Style { fill: it.style.fill, color, ..self.style };
+                // Quick edit fills shapes in their own colour.
+                it.style = Style { fill: it.style.fill, color, fill_color: color, strength: it.style.strength, ..self.style };
                 if let (StyleHit::ToggleFill, Shape::Text { background, .. }) = (h, &mut it.shape) {
                     *background = !*background;
                 }
@@ -707,7 +800,7 @@ impl Overlay {
                 return;
             }
             Mode::Window => {
-                if let Some(r) = self.detect(x, y) {
+                if let Some(r) = self.hover.filter(|h| h.contains(x, y)).or_else(|| self.detect(x, y)) {
                     self.on_selected(w, r);
                 }
                 return;
@@ -745,6 +838,7 @@ impl Overlay {
         if self.tool == Tool::Highlight {
             style.color = self.marker;
         }
+        style.fill_color = style.color;
         if let Some(item) = Item::begin(self.tool, p, style, &self.items, sample) {
             let before = self.items.clone();
             self.items.push(item);
@@ -777,7 +871,7 @@ impl Overlay {
         match &mut self.drag {
             Drag::None => {
                 if !self.annotating {
-                    self.hover = self.detect(x, y);
+                    self.update_hover(x, y);
                 }
             }
             Drag::NewSel { x0, y0, moved } => {
@@ -850,7 +944,7 @@ impl Overlay {
                 if moved {
                     let r = Rect::from_points(x0, y0, x, y);
                     self.on_selected(w, Rect::new(r.x, r.y, r.w + 1, r.h + 1));
-                } else if let Some(h) = self.detect(x, y) {
+                } else if let Some(h) = self.hover.filter(|h| h.contains(x, y)).or_else(|| self.detect(x, y)) {
                     self.on_selected(w, h);
                 }
             }
@@ -998,6 +1092,12 @@ impl Overlay {
 
     fn wheel(&mut self, delta: i16) {
         if !self.annotating {
+            // While choosing: step out to the enclosing element, or back in.
+            if matches!(self.drag, Drag::None) && self.sel.is_none() {
+                self.hover_step += if delta > 0 { 1 } else { -1 };
+                let (x, y) = self.cursor;
+                self.update_hover(x, y);
+            }
             return;
         }
         let up = delta > 0;
@@ -1109,7 +1209,7 @@ impl Overlay {
             }
             for i in self.selected.iter().chain(self.editing.iter()) {
                 if let Some(it) = self.items.get(*i) {
-                    v.push(it.bounds().to_rect().inflate((4.0 * s) as i32 + 4));
+                    v.push(it.outline().to_rect().inflate((4.0 * s) as i32 + 4));
                 }
             }
         }
@@ -1235,7 +1335,7 @@ impl Overlay {
             text::draw(pm, &label, lr.x as f32 + 8.0 * s, lr.y as f32 + (lr.h as f32 - l.height) / 2.0, size, false, Rgba::WHITE, None);
 
             if let Some(it) = self.selected.and_then(|i| self.items.get(i)) {
-                let b = it.bounds();
+                let b = it.outline();
                 if let Some(p) = b.skia().map(PathBuilder::from_rect) {
                     let dash = Stroke { width: 1.0 * s, dash: StrokeDash::new(vec![4.0 * s, 3.0 * s], 0.0), ..Default::default() };
                     pm.stroke_path(&p, &Rgba::WHITE.paint(), &dash, id, None);
@@ -1382,6 +1482,8 @@ fn item_sig(it: &Item) -> u64 {
     (f(b.x0), f(b.y0), f(b.x1), f(b.y1)).hash(&mut h);
     let st = &it.style;
     (st.color.r, st.color.g, st.color.b, st.color.a, f(st.width), f(st.font_size), st.fill).hash(&mut h);
+    let fc = st.fill_color;
+    (fc.r, fc.g, fc.b, fc.a, f(st.corner_radius), st.dash, st.shadow, st.heads, st.step_type, f(st.strength)).hash(&mut h);
     std::mem::discriminant(&it.shape).hash(&mut h);
     match &it.shape {
         Shape::Line(a, b) | Shape::Arrow(a, b) => (f(a.x), f(a.y), f(b.x), f(b.y)).hash(&mut h),
@@ -1398,6 +1500,7 @@ fn item_sig(it: &Item) -> u64 {
         Shape::Sticker { kind, .. } => kind.hash(&mut h),
         Shape::Image { img, .. } => (std::sync::Arc::as_ptr(img) as usize).hash(&mut h),
         Shape::Magnify { zoom, .. } => f(*zoom).hash(&mut h),
+        Shape::Spotlight { r, dim, ellipse } => (f(r.x0), f(r.y0), f(r.x1), f(r.y1), dim, ellipse).hash(&mut h),
         _ => {}
     }
     h.finish()
@@ -1481,7 +1584,25 @@ impl Handler for Overlay {
     }
 
     fn message(&mut self, w: &mut Win, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if self.uia.is_none() && self.wants_uia() {
+            let f = Fetcher::new(w.hwnd.0 as isize, WM_OVERLAY_UIA);
+            // Start with the window under the cursor so it is likely ready by the first hover.
+            let (x, y) = self.cursor;
+            if let Some(win) = self.wins.iter().find(|wi| wi.rect.contains(x, y)) {
+                f.get(win.hwnd);
+            }
+            self.uia = Some(f);
+        }
         match msg {
+            WM_OVERLAY_UIA => {
+                let (x, y) = self.cursor;
+                let under = self.wins.iter().find(|wi| wi.rect.contains(x, y)).map(|wi| wi.hwnd);
+                if under == Some(wp.0 as isize) && !self.annotating && self.sel.is_none() && matches!(self.drag, Drag::None) {
+                    self.update_hover(x, y);
+                    self.redraw(w);
+                }
+                Some(LRESULT(0))
+            }
             WM_PAINT => {
                 if self.first_paint {
                     // First paint: compose everything once.
@@ -1562,7 +1683,7 @@ impl Handler for Overlay {
                     self.selected = None;
                     self.popup = Popup::None;
                     let (x, y) = self.cursor;
-                    self.hover = self.detect(x, y);
+                    self.update_hover(x, y);
                 } else {
                     w.close();
                 }

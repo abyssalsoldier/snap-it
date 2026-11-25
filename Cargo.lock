@@ -769,6 +769,7 @@ dependencies = [
 name = "snapit-annotate"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "snapit-gfx",
 ]
 

@@ -131,7 +131,7 @@ fn action_for_hotkey(id: u16) -> Option<Action> {
     app::settings().workflows.get(i)?.resolve().map(|(_, a)| a)
 }
 
-const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>]\n\
+const USAGE: &str = "snapit [--capture <action>] [--edit <image>] [--pin <image>] [--quit]\n\
 actions: region, window, active_window, monitor, fullscreen, last_region, custom_region, scrolling,\n\
          record_mp4, record_gif, ocr, scan_qr, color_picker, ruler, open_editor, open_history, open_settings";
 
@@ -175,6 +175,36 @@ fn forward_to_running(args: &[String]) -> bool {
     true
 }
 
+/// Named event a running copy waits on; `snapit --quit` sets it. A kernel event needs no
+/// window lookup or cross-process window messages, so it works from any installer context.
+const QUIT_EVENT: windows::core::PCWSTR = w!("Local\\SnapIt.Quit");
+const WM_APP_QUIT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 7;
+
+fn signal_quit() {
+    use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+    // Nothing running means no event: nothing to do.
+    if let Ok(ev) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, QUIT_EVENT) } {
+        unsafe {
+            let _ = SetEvent(ev);
+            let _ = windows::Win32::Foundation::CloseHandle(ev);
+        }
+    }
+}
+
+/// Exits cleanly (as the tray's Exit does) when the quit event is set.
+fn watch_quit_event(main: HWND) {
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+    // Kept open for the life of the process.
+    let Ok(ev) = (unsafe { CreateEventW(None, false, false, QUIT_EVENT) }) else { return };
+    let (ev, main) = (ev.0 as isize, main.0 as isize);
+    let _ = std::thread::Builder::new().name("snapit-quit".into()).spawn(move || unsafe {
+        let ev = windows::Win32::Foundation::HANDLE(ev as *mut _);
+        if WaitForSingleObject(ev, INFINITE) == windows::Win32::Foundation::WAIT_OBJECT_0 {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(HWND(main as *mut _)), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
 fn main() -> Result<()> {
     // Only load DLLs from System32 (blocks DLL planting next to the exe).
     unsafe {
@@ -200,6 +230,12 @@ fn main() -> Result<()> {
         std::process::exit(selftest::run(&dir));
     }
 
+    // `--quit` (used by the installers): signal a running copy, never start one.
+    if args.iter().any(|a| a == "--quit") {
+        signal_quit();
+        return Ok(());
+    }
+
     // Single instance: a second launch forwards its arguments and exits.
     let _mutex = unsafe { CreateMutexW(None, true, w!("Local\\SnapIt.SingleInstance"))? };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -216,6 +252,7 @@ fn main() -> Result<()> {
     // Worker threads (OCR, recording) use the MTA; keep it alive for the whole process.
     snapit_record::ensure_mta();
     let hwnd = create_main_window()?;
+    watch_quit_event(hwnd);
 
     app::init(app::State {
         settings: std::rc::Rc::new(settings::Settings::load()),
@@ -331,6 +368,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         tasks::WM_SAVED => {
             let r = unsafe { Box::from_raw(lparam.0 as *mut tasks::SaveResult) };
             tasks::on_saved(*r);
+            LRESULT(0)
+        }
+        WM_APP_QUIT => {
+            request_exit();
             LRESULT(0)
         }
         WM_COPYDATA => {

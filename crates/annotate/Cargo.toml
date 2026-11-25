@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 snapit-gfx = { path = "../gfx" }
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

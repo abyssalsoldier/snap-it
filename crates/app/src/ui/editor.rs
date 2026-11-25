@@ -32,8 +32,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::dialogs::{self, Answer};
 use super::icons::Icon;
 use super::theme::{self, Theme};
-use super::toolbar::{self, StickerPopup, StyleHit, StylePopup, Toolbar};
+use super::tool_options::{ColorHit, ColorPopup, Opt, OptHit, OptionsBar, Values};
+use super::toolbar::{self, StickerPopup, Toolbar};
 use super::{backbuffer, Backbuffer, Handler, Win};
+use crate::settings::ToolOptions;
 use crate::app::{self, Command};
 
 pub const WM_EDITOR_INSERT: u32 = WM_APP + 20;
@@ -58,7 +60,6 @@ enum EBtn {
     Tool(ETool),
     Stickers,
     Image,
-    Style,
     Undo,
     Redo,
     Effects,
@@ -72,8 +73,9 @@ enum EBtn {
 #[derive(Clone, Copy, PartialEq)]
 enum Popup {
     None,
-    Style,
     Stickers,
+    /// Colour choices for one of the options strip's swatches.
+    Color(Opt),
 }
 
 enum Drag {
@@ -110,7 +112,14 @@ struct Editor {
     palette: Toolbar<EBtn>,
     popup: Popup,
     tool: ETool,
+    /// Colour, border size and text size for new items.
     style: Style,
+    /// The rest of the tool options (fill, shadow, dashes, blur radius…).
+    opts: ToolOptions,
+    /// Mouse position for hover effects in the options strip.
+    opt_hover: Option<(i32, i32)>,
+    /// The options strip did not fit beside the top toolbar and sits on its own row.
+    opts_row2: bool,
     sticker: Sticker,
     drag: Drag,
     editing: Option<usize>,
@@ -129,7 +138,7 @@ pub fn open(image: Pixmap, path: Option<PathBuf>) {
 pub fn open_with(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>) {
     let s = app::settings();
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let style = Style { color: s.annotate.color, width: s.annotate.width, font_size: s.annotate.font_size, fill: false };
+    let style = Style { color: s.annotate.color, width: s.annotate.width, font_size: s.annotate.font_size, ..Style::default() };
     let (iw, ih) = (image.width() as i32, image.height() as i32);
     let ed = Editor {
         id,
@@ -154,6 +163,9 @@ pub fn open_with(image: Pixmap, path: Option<PathBuf>, items: Vec<Item>) {
         popup: Popup::None,
         tool: ETool::Ann(Tool::Arrow),
         style,
+        opts: s.annotate.tools,
+        opt_hover: None,
+        opts_row2: false,
         sticker: Sticker::Check,
         drag: Drag::None,
         editing: None,
@@ -228,6 +240,7 @@ fn palette_buttons() -> Vec<toolbar::Button<EBtn>> {
         b(t(Tool::Pixelate), Icon::Pixelate, "Pixelate  (X)"),
         b(t(Tool::Eraser), Icon::Eraser, "Smart eraser  (G)"),
         b(t(Tool::Magnify), Icon::Magnify, "Magnify  (M)"),
+        b(t(Tool::Spotlight), Icon::Spotlight, "Spotlight: dim everything else  (S)"),
         b(EBtn::Stickers, Icon::Sticker, "Stickers  (I)"),
         b(EBtn::Image, Icon::Image, "Insert image…"),
         sep(EBtn::Tool(ETool::Crop), Icon::Crop, "Crop  (C)"),
@@ -238,8 +251,7 @@ fn palette_buttons() -> Vec<toolbar::Button<EBtn>> {
 fn top_buttons() -> Vec<toolbar::Button<EBtn>> {
     use toolbar::{b, sep};
     vec![
-        b(EBtn::Style, Icon::Fill, "Colour, width & text size"),
-        sep(EBtn::Undo, Icon::Undo, "Undo  (Ctrl+Z)"),
+        b(EBtn::Undo, Icon::Undo, "Undo  (Ctrl+Z)"),
         b(EBtn::Redo, Icon::Redo, "Redo  (Ctrl+Y)"),
         sep(EBtn::Effects, Icon::Effects, "Effects…"),
         b(EBtn::Fit, Icon::ZoomFit, "Fit to window  (Ctrl+0)"),
@@ -266,6 +278,7 @@ fn key_tool(k: u8) -> Option<ETool> {
         b'X' => ETool::Ann(Tool::Pixelate),
         b'G' => ETool::Ann(Tool::Eraser),
         b'M' => ETool::Ann(Tool::Magnify),
+        b'S' => ETool::Ann(Tool::Spotlight),
         b'C' => ETool::Crop,
         b'U' => ETool::CutOut,
         _ => return None,
@@ -286,6 +299,8 @@ const RESIZE: [(f32, &str); 5] = [(0.25, "25%"), (0.5, "50%"), (0.75, "75%"), (1
 const IMG_FILE: usize = 1;
 const IMG_CLIP: usize = 2;
 const IMG_SCREEN: usize = 3;
+/// Extra top-bar height when the options strip wraps to its own row (unscaled).
+const OPT_ROW_H: f32 = 36.0;
 
 impl Editor {
     fn s(&self) -> f32 {
@@ -293,7 +308,42 @@ impl Editor {
     }
 
     fn top_h(&self) -> i32 {
-        (46.0 * self.s()) as i32
+        ((46.0 + if self.opts_row2 { OPT_ROW_H } else { 0.0 }) * self.s()) as i32
+    }
+
+    /// The tool whose options the strip shows: the selected item's, else the current tool's.
+    fn opt_tool(&self) -> Option<Tool> {
+        if let Some(t) = self.editing.or(self.selected).and_then(|i| self.items.get(i)).and_then(|it| it.tool()) {
+            return Some(t);
+        }
+        match self.tool {
+            ETool::Ann(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn options_bar(&self) -> OptionsBar {
+        let s = self.s();
+        let (x, y) = if self.opts_row2 {
+            (14.0 * s, (46.0 + (OPT_ROW_H - 28.0) / 2.0 - 2.0) * s)
+        } else {
+            (self.top.rect().right() as f32 + 20.0 * s, self.top.y + (self.top.size().1 - 28.0 * s) / 2.0)
+        };
+        OptionsBar { x, y, scale: s, tool: self.opt_tool(), hover: self.opt_hover }
+    }
+
+    fn values(&self) -> Values {
+        Values { style: self.style, opts: self.opts, marker: self.marker }
+    }
+
+    /// Whether the options strip fits beside the top toolbar for the widest tool.
+    fn options_fit_inline(&self) -> bool {
+        let s = self.s();
+        let widest = [Tool::Rect, Tool::Magnify, Tool::Arrow]
+            .into_iter()
+            .map(|t| OptionsBar { x: 0.0, y: 0.0, scale: s, tool: Some(t), hover: None }.width())
+            .fold(0.0, f32::max);
+        self.top.rect().right() as f32 + 20.0 * s + widest + 12.0 * s <= self.client.0 as f32
     }
 
     fn status_h(&self) -> i32 {
@@ -310,6 +360,7 @@ impl Editor {
         self.top.scale = s;
         self.top.x = 8.0 * s;
         self.top.y = 3.0 * s;
+        self.opts_row2 = !self.options_fit_inline();
         // Shrink the tool palette if the window is too short for it.
         self.palette.vertical = true;
         self.palette.scale = s;
@@ -659,7 +710,6 @@ impl Editor {
                 self.tool = ETool::Ann(Tool::Sticker(self.sticker));
             }
             EBtn::Image => self.image_menu(w.hwnd),
-            EBtn::Style => self.popup = if self.popup == Popup::Style { Popup::None } else { Popup::Style },
             EBtn::Undo => self.undo(),
             EBtn::Redo => self.redo(),
             EBtn::Effects => self.effects_menu(w.hwnd),
@@ -688,9 +738,17 @@ impl Editor {
         self.update_title(w.hwnd);
     }
 
-    fn style_popup(&self) -> StylePopup {
-        let r = self.top.button_bounds(EBtn::Style).unwrap_or_default();
-        StylePopup { x: r.x as f32, y: self.top_h() as f32 + 2.0, scale: self.s(), palette: app::settings().annotate.palette.clone() }
+    fn color_popup(&self, o: Opt) -> ColorPopup {
+        let r = self.options_bar().swatch_rect(o).unwrap_or_default();
+        let v = self.values();
+        ColorPopup {
+            x: (r.x as f32 - 8.0 * self.s()).max(0.0),
+            y: r.bottom() as f32 + 4.0 * self.s(),
+            scale: self.s(),
+            palette: app::settings().annotate.palette.clone(),
+            allow_none: o == Opt::FillColor,
+            current: v.swatch(o),
+        }
     }
 
     fn sticker_popup(&self) -> StickerPopup {
@@ -701,51 +759,198 @@ impl Editor {
     fn popup_rect(&self) -> Option<Rect> {
         match self.popup {
             Popup::None => None,
-            Popup::Style => Some(self.style_popup().rect()),
+            Popup::Color(o) => Some(self.color_popup(o).rect()),
             Popup::Stickers => Some(self.sticker_popup().rect()),
         }
     }
 
-    /// True when colour changes should go to the highlighter's own colour.
-    fn marker_context(&self) -> bool {
-        self.tool == ETool::Ann(Tool::Highlight) || self.selected.and_then(|i| self.items.get(i)).is_some_and(|it| matches!(it.shape, Shape::Highlight(_)))
-    }
-
-    fn shown_color(&self) -> Rgba {
-        if self.marker_context() { self.marker } else { self.style.color }
-    }
-
-    fn apply_style(&mut self, h: StyleHit) {
-        let marker = self.marker_context();
-        match h {
-            StyleHit::Color(c) if marker => self.marker = c,
-            StyleHit::Color(c) => self.style.color = c,
-            StyleHit::Width(v) => self.style.width = v,
-            StyleHit::FontSize(v) => self.style.font_size = v,
-            StyleHit::ToggleFill => self.style.fill = !self.style.fill,
+    /// The style a new item of `tool` gets from the current options.
+    fn item_style(&self, tool: Tool) -> Style {
+        let o = &self.opts;
+        let mut st = Style {
+            fill: false,
+            fill_color: o.fill_color,
+            corner_radius: o.corner_radius,
+            dash: o.dash,
+            shadow: o.shadow,
+            heads: o.heads,
+            step_type: o.step_type,
+            strength: 0.0,
+            ..self.style
+        };
+        match tool {
+            Tool::Rect | Tool::Ellipse => st.fill = o.fill,
+            // A text item's `fill` is its background.
+            Tool::Text => st.fill = o.text_background,
+            Tool::Highlight => st.color = self.marker,
+            Tool::Blur => st.strength = o.blur_radius,
+            Tool::Pixelate => st.strength = o.pixel_size,
+            Tool::Spotlight => st.strength = o.spot_dim,
+            _ => {}
         }
-        let st = self.style;
-        let mk = self.marker;
+        st
+    }
+
+    /// Options that live in the shape rather than the style.
+    fn finish_new_item(&self, it: &mut Item) {
+        match &mut it.shape {
+            Shape::Magnify { zoom, .. } => *zoom = self.opts.zoom,
+            Shape::Spotlight { ellipse, .. } => *ellipse = self.opts.spot_ellipse,
+            _ => {}
+        }
+    }
+
+    /// Selecting an item shows its options (as ShareX does), so editing them restyles it.
+    fn load_from_item(&mut self, i: usize) {
+        let Some(it) = self.items.get(i) else { return };
+        let st = it.style;
+        let o = &mut self.opts;
+        match &it.shape {
+            Shape::Highlight(_) => self.marker = st.color,
+            Shape::Blur(_) => o.blur_radius = if st.strength > 0.0 { st.strength } else { o.blur_radius },
+            Shape::Pixelate(_) => o.pixel_size = if st.strength > 0.0 { st.strength } else { o.pixel_size },
+            Shape::Spotlight { dim, ellipse, .. } => {
+                o.spot_dim = (*dim as f32 / 2.55).round();
+                o.spot_ellipse = *ellipse;
+            }
+            Shape::Text { background, .. } => {
+                o.text_background = *background;
+                self.style.color = st.color;
+                self.style.font_size = st.font_size;
+                o.shadow = st.shadow;
+            }
+            Shape::Image { .. } | Shape::Sticker { .. } | Shape::Eraser(..) => {}
+            shape => {
+                self.style.color = st.color;
+                self.style.width = st.width;
+                self.style.font_size = st.font_size;
+                if matches!(shape, Shape::Rect(_) | Shape::Ellipse(_)) {
+                    o.fill = st.fill;
+                    o.fill_color = st.fill_color;
+                }
+                o.corner_radius = st.corner_radius;
+                o.dash = st.dash;
+                o.shadow = st.shadow;
+                o.heads = st.heads;
+                o.step_type = st.step_type;
+                if let Shape::Magnify { zoom, .. } = shape {
+                    o.zoom = *zoom;
+                }
+            }
+        }
+    }
+
+    fn select(&mut self, i: Option<usize>) {
+        self.selected = i;
+        if let Some(i) = i {
+            self.load_from_item(i);
+        }
+    }
+
+    /// Stores new option values, remembers them, and restyles the selected item.
+    fn set_values(&mut self, v: Values, changed: Opt) {
+        if v == self.values() {
+            return;
+        }
+        self.style = v.style;
+        self.opts = v.opts;
+        self.marker = v.marker;
+        let (st, opts, mk) = (self.style, self.opts, self.marker);
         app::update_settings(|s| {
             s.annotate.color = st.color;
             s.annotate.highlight = mk;
             s.annotate.width = st.width;
             s.annotate.font_size = st.font_size;
+            s.annotate.tools = opts;
         });
-        if let Some(i) = self.editing.or(self.selected).filter(|&i| i < self.items.len()) {
-            let before = self.items.clone();
-            let it = &mut self.items[i];
-            let fill = if h == StyleHit::ToggleFill { !it.style.fill } else { it.style.fill };
-            let color = if matches!(it.shape, Shape::Highlight(_)) { mk } else { st.color };
-            it.style = Style { fill, color, ..st };
-            if let (StyleHit::ToggleFill, Shape::Text { background, .. }) = (h, &mut it.shape) {
-                *background = !*background;
+        let Some(i) = self.editing.or(self.selected).filter(|&i| i < self.items.len()) else { return };
+        let Some(tool) = self.items[i].tool() else { return };
+        let before = self.items.clone();
+        let new = self.item_style(tool);
+        let it = &mut self.items[i];
+        match changed {
+            Opt::Color => it.style.color = new.color,
+            Opt::Highlight => it.style.color = mk,
+            Opt::FillColor => {
+                it.style.fill = new.fill;
+                it.style.fill_color = new.fill_color;
             }
+            Opt::Width => it.style.width = new.width,
+            Opt::FontSize => it.style.font_size = new.font_size,
+            Opt::Radius => it.style.corner_radius = new.corner_radius,
+            Opt::Dash => it.style.dash = new.dash,
+            Opt::Shadow => it.style.shadow = new.shadow,
+            Opt::Heads => it.style.heads = new.heads,
+            Opt::StepType => it.style.step_type = new.step_type,
+            Opt::Blur | Opt::Pixel => it.style.strength = new.strength,
+            Opt::Background => {
+                it.style.fill = opts.text_background;
+                if let Shape::Text { background, .. } = &mut it.shape {
+                    *background = opts.text_background;
+                }
+            }
+            Opt::Zoom => {
+                if let Shape::Magnify { zoom, .. } = &mut it.shape {
+                    *zoom = opts.zoom;
+                }
+            }
+            Opt::Dim => {
+                if let Shape::Spotlight { dim, .. } = &mut it.shape {
+                    *dim = (opts.spot_dim * 2.55).clamp(0.0, 255.0) as u8;
+                }
+            }
+            Opt::SpotShape => {
+                if let Shape::Spotlight { ellipse, .. } = &mut it.shape {
+                    *ellipse = opts.spot_ellipse;
+                }
+            }
+        }
+        if self.items != before {
             if self.editing.is_none() {
                 self.push_items(before);
             }
             self.changed();
         }
+    }
+
+    fn on_option(&mut self, w: &mut Win, h: OptHit) {
+        let Some(tool) = self.opt_tool() else { return };
+        let mut v = self.values();
+        match h {
+            OptHit::Swatch(o) => {
+                self.popup = if self.popup == Popup::Color(o) { Popup::None } else { Popup::Color(o) };
+                return;
+            }
+            OptHit::Step(o, d) => {
+                v.step(o, d, tool);
+                self.set_values(v, o);
+            }
+            OptHit::Choice(o, i) => {
+                v.choose(o, i);
+                self.set_values(v, o);
+            }
+            OptHit::Toggle(o) => {
+                v.toggle(o);
+                self.set_values(v, o);
+            }
+        }
+        self.update_title(w.hwnd);
+    }
+
+    fn on_color(&mut self, w: &mut Win, o: Opt, h: ColorHit) {
+        self.popup = Popup::None;
+        let mut v = self.values();
+        let c = match h {
+            ColorHit::Color(c) => Some(c),
+            ColorHit::None => None,
+            ColorHit::Custom => match dialogs::choose_color(w.hwnd, v.swatch(o).unwrap_or(Rgba::WHITE)) {
+                Some(c) => Some(c),
+                None => return,
+            },
+        };
+        v.set_swatch(o, c);
+        self.set_values(v, o);
+        self.update_title(w.hwnd);
     }
 
     /// Corner handles (screen space) of the selected box-shaped item.
@@ -767,9 +972,9 @@ impl Editor {
         if let Some(pr) = self.popup_rect() {
             if pr.contains(x, y) {
                 match self.popup {
-                    Popup::Style => {
-                        if let Some(h) = self.style_popup().hit(x, y) {
-                            self.apply_style(h);
+                    Popup::Color(o) => {
+                        if let Some(h) = self.color_popup(o).hit(x, y) {
+                            self.on_color(w, o, h);
                         }
                     }
                     Popup::Stickers => {
@@ -783,7 +988,17 @@ impl Editor {
                 }
                 return;
             }
+            let was = self.popup;
             self.popup = Popup::None;
+            // A click on the swatch that opened the popup just closes it.
+            if let (Popup::Color(o), Some(OptHit::Swatch(o2))) = (was, self.options_bar().hit(x, y)) {
+                if o == o2 {
+                    return;
+                }
+            }
+        }
+        if let Some(h) = self.options_bar().hit(x, y) {
+            return self.on_option(w, h);
         }
         if let Some(b) = self.top.hit(x, y).or_else(|| self.palette.hit(x, y)) {
             return self.on_button(w, b);
@@ -807,7 +1022,7 @@ impl Editor {
                 if let (Some(c), Some(i)) = (self.handle_at(x, y), self.selected) {
                     self.drag = Drag::ResizeItem { idx: i, corner: c, before: self.items.clone() };
                 } else if let Some(i) = ann::hit_test(&self.items, p) {
-                    self.selected = Some(i);
+                    self.select(Some(i));
                     self.drag = Drag::MoveItem { idx: i, last: p, before: self.items.clone() };
                 } else {
                     self.selected = None;
@@ -816,9 +1031,8 @@ impl Editor {
             }
             ETool::Ann(tool) => {
                 let sample = pixel_at(&self.base, p.x as i32, p.y as i32).unwrap_or(Rgba::WHITE);
-                let fill = self.style.fill && matches!(tool, Tool::Rect | Tool::Ellipse | Tool::Text);
-                let color = if tool == Tool::Highlight { self.marker } else { self.style.color };
-                if let Some(item) = Item::begin(tool, p, Style { fill, color, ..self.style }, &self.items, sample) {
+                if let Some(mut item) = Item::begin(tool, p, self.item_style(tool), &self.items, sample) {
+                    self.finish_new_item(&mut item);
                     let before = self.items.clone();
                     self.items.push(item);
                     self.selected = None;
@@ -843,6 +1057,7 @@ impl Editor {
         self.cursor = (x, y);
         self.top.set_hover(x, y);
         self.palette.set_hover(x, y);
+        self.opt_hover = matches!(self.drag, Drag::None).then_some((x, y));
         let p = self.to_img(x, y);
         let shift = super::shift();
         match &mut self.drag {
@@ -1133,7 +1348,7 @@ impl Editor {
 
         // Selection outline and resize handles.
         if let Some(it) = self.selected.and_then(|i| self.items.get(i)) {
-            let b = it.bounds();
+            let b = it.outline();
             let (x0, y0) = self.to_screen(PointF::new(b.x0, b.y0));
             let (x1, y1) = self.to_screen(PointF::new(b.x1, b.y1));
             if let Some(p) = snapit_gfx::tiny_skia::Rect::from_ltrb(x0, y0, x1, y1).map(PathBuilder::from_rect) {
@@ -1226,11 +1441,25 @@ impl Editor {
         let active = |b: EBtn| match b {
             EBtn::Tool(x) => x == tool,
             EBtn::Stickers => matches!(tool, ETool::Ann(Tool::Sticker(_))) || popup == Popup::Stickers,
-            EBtn::Style => popup == Popup::Style,
             _ => false,
         };
         self.palette.draw(pm, t, active, None);
-        self.top.draw(pm, t, active, Some((EBtn::Style, self.shown_color(), self.style.width)));
+        self.top.draw(pm, t, active, None);
+        let bar = self.options_bar();
+        if self.opts_row2 {
+            // A hairline between the toolbar row and the options row.
+            if let Some(r) = snapit_gfx::tiny_skia::Rect::from_xywh(0.0, 46.0 * s - 1.0, self.client.0 as f32, 1.0) {
+                pm.fill_rect(r, &t.border.paint(), id, None);
+            }
+        }
+        if bar.tool.is_some_and(tool_options_empty) {
+            let hint = "No options for this tool";
+            let size = 12.5 * s;
+            let l = text::layout(hint, size, false);
+            text::draw(pm, hint, bar.x, bar.y + (28.0 * s - l.height) / 2.0, size, false, t.subtext, None);
+        } else {
+            bar.draw(pm, t, &self.values());
+        }
 
         let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
         let status = format!(
@@ -1246,11 +1475,15 @@ impl Editor {
         text::draw(pm, &status, 10.0 * s, (self.client.1 - self.status_h()) as f32 + (self.status_h() as f32 - l.height) / 2.0, ts, false, t.subtext, None);
 
         match self.popup {
-            Popup::Style => self.style_popup().draw(pm, t, self.shown_color(), self.style.width, self.style.font_size, self.style.fill),
+            Popup::Color(o) => self.color_popup(o).draw(pm, t),
             Popup::Stickers => self.sticker_popup().draw(pm, t, Some(self.sticker)),
             Popup::None => {}
         }
     }
+}
+
+fn tool_options_empty(t: Tool) -> bool {
+    super::tool_options::options_for(t).is_empty() && !matches!(t, Tool::Pointer)
 }
 
 trait TextClone {
@@ -1348,7 +1581,14 @@ impl Handler for Editor {
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(w.hwnd, &mut p);
                 }
-                if super::ctrl() {
+                let stepper = self.options_bar().stepper_at(p.x, p.y);
+                if let (Some(o), Some(tool)) = (stepper, self.opt_tool()) {
+                    // Wheel over a number in the options strip changes it.
+                    let mut v = self.values();
+                    if v.step(o, if delta > 0 { 1 } else { -1 }, tool) {
+                        self.set_values(v, o);
+                    }
+                } else if super::ctrl() {
                     self.zoom_at(if delta > 0 { 1.25 } else { 0.8 }, p.x, p.y);
                 } else {
                     let step = delta as f32 / 120.0 * 60.0 * self.s();

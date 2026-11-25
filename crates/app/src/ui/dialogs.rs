@@ -3,10 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::HWND;
+use snapit_gfx::Rgba;
+use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
-    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    ChooseColorW, GetOpenFileNameW, GetSaveFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+    OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDCANCEL, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNOCANCEL,
@@ -95,6 +97,30 @@ pub fn ask_save(owner: HWND, what: &str) -> Answer {
         IDCANCEL => Answer::Cancel,
         _ => Answer::No,
     }
+}
+
+thread_local! {
+    /// The colour dialog's 16 custom-colour slots, kept for the session.
+    static CUSTOM_COLORS: std::cell::RefCell<[COLORREF; 16]> = const { std::cell::RefCell::new([COLORREF(0x00FF_FFFF); 16]) };
+}
+
+/// The standard Windows colour picker, starting at `initial`. Keeps alpha.
+pub fn choose_color(owner: HWND, initial: Rgba) -> Option<Rgba> {
+    CUSTOM_COLORS.with(|cc| {
+        let mut cc = cc.borrow_mut();
+        let mut c = CHOOSECOLORW {
+            lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+            hwndOwner: owner,
+            rgbResult: COLORREF(initial.r as u32 | (initial.g as u32) << 8 | (initial.b as u32) << 16),
+            lpCustColors: cc.as_mut_ptr(),
+            Flags: CC_RGBINIT | CC_FULLOPEN,
+            ..Default::default()
+        };
+        unsafe { ChooseColorW(&mut c) }.as_bool().then(|| {
+            let v = c.rgbResult.0;
+            Rgba::new((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8, if initial.a == 0 { 255 } else { initial.a })
+        })
+    })
 }
 
 pub fn info(owner: Option<HWND>, title: &str, body: &str) {

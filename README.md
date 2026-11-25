@@ -4,6 +4,20 @@ A fast, local-only screenshot and screen-recording tool for Windows 10/11, writt
 It covers the everyday ShareX workflow (capture, annotate, copy/save/pin, record) and leaves out
 everything that tends to trip endpoint detection (EDR) or antivirus heuristics.
 
+## Install
+
+Download from the [latest release](https://github.com/abyssalsoldier/snap-it/releases/latest):
+
+| File | What it is |
+|---|---|
+| `SnapIt-<ver>-setup-x64.exe` | Installer. Installs for your user only (no admin rights), adds a Start menu shortcut (desktop shortcut optional) and an uninstaller in Settings → Apps. |
+| `SnapIt-<ver>-x64.msi` | The same as an MSI package, for managed deployment (`msiexec /i SnapIt-<ver>-x64.msi /qn`). |
+| `SnapIt-<ver>-portable-x64.zip` | No install. Unzip anywhere; settings and screenshots stay in that folder. |
+
+Both installers upgrade an existing install in place and close a running Snap It first. Uninstalling
+also removes Snap It's own "Start with Windows" shortcut and Explorer menu entries; your settings
+in `%APPDATA%\SnapIt` and your screenshots are kept.
+
 ## Features
 
 **Capture**
@@ -98,7 +112,12 @@ cargo test --workspace          # unit tests (graphics, annotation, capture, OCR
 cargo run -p snap-it            # debug build with a console for logs
 ./scripts/release.ps1           # tests + release build + SHA-256 + Defender scan
 ./scripts/release.ps1 -CertThumbprint <sha1>   # …and Authenticode-sign it
+./scripts/package.ps1           # all of the above, then setup .exe + .msi + portable .zip in dist/
 ```
+
+`package.ps1` needs Inno Setup 6 (`winget install JRSoftware.InnoSetup`) and WiX v5
+(`dotnet tool install --global wix --version 5.0.2 --add-source https://api.nuget.org/v3/index.json`).
+The installer sources are in [installer/](installer/).
 
 Extra checks:
 
@@ -129,11 +148,17 @@ Extra checks:
 ./scripts/bump-version.ps1 patch      # or minor / major / 1.2.3 (run on dev; commits the bump)
 git push                              # dev
 git switch master; git merge --ff-only dev
-git tag -a v0.1.1 -m "Snap It 0.1.1"
-git push origin master v0.1.1
+git push origin master                # CI builds and publishes the release
 git switch dev
-./scripts/release.ps1 -CertThumbprint <sha1>   # build, sign, scan -> dist/
 ```
+
+Pushing `master` runs [.github/workflows/release.yml](.github/workflows/release.yml). It runs
+the tests, builds the setup .exe, .msi and portable .zip, and publishes them as the GitHub
+release `vX.Y.Z` for the version in `Cargo.toml`, with that version's CHANGELOG section as the
+notes. It creates the tag if you didn't push one. If that version is already released, the files
+are attached to the workflow run only, so bump the version to publish a new release.
+To sign the builds, add the repository secrets `SIGN_PFX_BASE64` (the .pfx, base64-encoded) and
+`SIGN_PFX_PASSWORD`.
 
 ## Command line
 

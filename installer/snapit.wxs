@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Snap It: .msi (WiX Toolset v5).
+
+  Built by scripts/package.ps1:
+    wix build installer/snapit.wxs -arch x64 -d Version=0.1.0 -d ExePath=dist/snapit.exe -d IconPath=assets/snapit.ico -o dist/SnapIt-0.1.0-x64.msi
+
+  Per-user install (no admin prompt) to %LOCALAPPDATA%\Programs\Snap It, with a Start menu
+  shortcut. A newer MSI upgrades an older one in place (same UpgradeCode).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!-- Never change UpgradeCode: it is how upgrades find the existing install. -->
+  <Package
+      Name="Snap It"
+      Manufacturer="Snap It"
+      Version="$(Version)"
+      UpgradeCode="E49D01CC-FE53-4020-BCD5-0AFD4EEA61F4"
+      Scope="perUser"
+      Compressed="yes">
+    <SummaryInformation Description="Snap It screenshot tool" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Snap It is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Snap It is a tray app: on upgrade or uninstall, ask a running copy to quit
+         (running the installed exe with the quit flag forwards it to the running copy)
+         before files are checked for being in use. -->
+    <CustomAction Id="QuitRunningSnapIt" Directory="INSTALLFOLDER" ExeCommand="&quot;[INSTALLFOLDER]snapit.exe&quot; --quit" Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="QuitRunningSnapIt" Before="InstallValidate" Condition="Installed OR WIX_UPGRADE_DETECTED" />
+    </InstallExecuteSequence>
+
+    <Icon Id="SnapIt.ico" SourceFile="$(IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="SnapIt.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/abyssalsoldier/snap-it" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Snap It" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="StartupFolder" />
+
+    <!-- Per-user components keep an HKCU value as their key path (MSI rule for profile folders),
+         which rules out auto-generated GUIDs. Never change these GUIDs. -->
+    <Component Id="MainExecutable" Directory="INSTALLFOLDER" Guid="340365CE-2B77-4A70-8ACC-B743EE4DA808">
+      <File Id="SnapItExe" Source="$(ExePath)" Name="snapit.exe" KeyPath="no" />
+      <RegistryValue Root="HKCU" Key="Software\SnapIt\Installer" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+      <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveUserProgramsDir" Directory="UserProgramsDir" On="uninstall" />
+      <!-- The app's own opt-in extras: the Startup shortcut and the Explorer verbs. -->
+      <RemoveFile Id="RemoveStartupLink" Directory="StartupFolder" Name="Snap It.lnk" On="uninstall" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\Classes\SystemFileAssociations\image\shell\SnapIt.Edit" Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU" Key="Software\Classes\SystemFileAssociations\image\shell\SnapIt.Pin" Action="removeOnUninstall" />
+    </Component>
+
+    <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder" Guid="5E50315D-F4AB-4B7E-A753-25A6BDC5A563">
+      <Shortcut
+          Id="SnapItStartMenu"
+          Name="Snap It"
+          Description="Screenshots, annotation and screen recording"
+          Target="[INSTALLFOLDER]snapit.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="SnapIt.ico" />
+      <RegistryValue Root="HKCU" Key="Software\SnapIt\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="Snap It" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

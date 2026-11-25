@@ -14,14 +14,21 @@ pub struct Button<B> {
     pub icon: Icon,
     pub tip: &'static str,
     pub sep_before: bool,
+    /// Horizontal toolbars only: start a new row with this button.
+    pub row_before: bool,
 }
 
 pub fn b<B>(id: B, icon: Icon, tip: &'static str) -> Button<B> {
-    Button { id, icon, tip, sep_before: false }
+    Button { id, icon, tip, sep_before: false, row_before: false }
 }
 
 pub fn sep<B>(id: B, icon: Icon, tip: &'static str) -> Button<B> {
-    Button { id, icon, tip, sep_before: true }
+    Button { id, icon, tip, sep_before: true, row_before: false }
+}
+
+/// First button of a new row (horizontal toolbars).
+pub fn row<B>(id: B, icon: Icon, tip: &'static str) -> Button<B> {
+    Button { id, icon, tip, sep_before: false, row_before: true }
 }
 
 pub struct Toolbar<B> {
@@ -31,22 +38,45 @@ pub struct Toolbar<B> {
     pub scale: f32,
     pub hover: Option<usize>,
     pub vertical: bool,
+    /// Button size in unscaled pixels.
+    pub btn: f32,
 }
 
-const BTN: f32 = 34.0;
+pub const BTN: f32 = 34.0;
 const PAD: f32 = 5.0;
 const SEP: f32 = 9.0;
+/// Gap between rows.
+const ROW_GAP: f32 = 2.0;
 
 impl<B: Copy + PartialEq> Toolbar<B> {
     pub fn new(buttons: Vec<Button<B>>, scale: f32) -> Self {
-        Toolbar { buttons, x: 0.0, y: 0.0, scale, hover: None, vertical: false }
+        Toolbar { buttons, x: 0.0, y: 0.0, scale, hover: None, vertical: false, btn: BTN }
+    }
+
+    /// Unscaled (row, offset along the row) of each button.
+    fn slots(&self) -> Vec<(usize, f32)> {
+        let mut row = 0;
+        let mut along = PAD;
+        let mut out = Vec::with_capacity(self.buttons.len());
+        for (j, b) in self.buttons.iter().enumerate() {
+            if b.row_before && !self.vertical && j > 0 {
+                row += 1;
+                along = PAD;
+            } else if b.sep_before && j > 0 {
+                along += SEP;
+            }
+            out.push((row, along));
+            along += self.btn;
+        }
+        out
     }
 
     pub fn size(&self) -> (f32, f32) {
         let s = self.scale;
-        let seps = self.buttons.iter().filter(|b| b.sep_before).count() as f32;
-        let long = PAD * 2.0 + self.buttons.len() as f32 * BTN + seps * SEP;
-        let short = BTN + PAD * 2.0;
+        let slots = self.slots();
+        let rows = slots.last().map_or(1, |l| l.0 + 1) as f32;
+        let long = slots.iter().map(|(_, a)| a + self.btn).fold(0.0, f32::max) + PAD;
+        let short = rows * self.btn + (rows - 1.0) * ROW_GAP + PAD * 2.0;
         if self.vertical { (short * s, long * s) } else { (long * s, short * s) }
     }
 
@@ -64,20 +94,12 @@ impl<B: Copy + PartialEq> Toolbar<B> {
 
     fn button_rect(&self, i: usize) -> (f32, f32, f32) {
         let s = self.scale;
-        let mut along = PAD * s;
-        for (j, b) in self.buttons.iter().enumerate() {
-            if b.sep_before {
-                along += SEP * s;
-            }
-            if j == i {
-                break;
-            }
-            along += BTN * s;
-        }
+        let (row, along) = self.slots().get(i).copied().unwrap_or((0, PAD));
+        let across = PAD + row as f32 * (self.btn + ROW_GAP);
         if self.vertical {
-            (self.x + PAD * s, self.y + along, BTN * s)
+            (self.x + across * s, self.y + along * s, self.btn * s)
         } else {
-            (self.x + along, self.y + PAD * s, BTN * s)
+            (self.x + along * s, self.y + across * s, self.btn * s)
         }
     }
 
@@ -123,7 +145,7 @@ impl<B: Copy + PartialEq> Toolbar<B> {
         }
         for (i, btn) in self.buttons.iter().enumerate() {
             let (bx, by, sz) = self.button_rect(i);
-            if btn.sep_before {
+            if btn.sep_before && !(btn.row_before && !self.vertical) && i > 0 {
                 let sx = bx - SEP * s / 2.0;
                 let mut pb = PathBuilder::new();
                 pb.move_to(sx, by + sz * 0.2);
@@ -148,7 +170,12 @@ impl<B: Copy + PartialEq> Toolbar<B> {
                         pm.stroke_path(&dot, &t.text.with_alpha(160).paint(), &Stroke { width: 1.2, ..Default::default() }, Transform::identity(), None);
                     }
                 }
-                _ => icons::draw(pm, btn.icon, bx + sz * 0.18, by + sz * 0.18, sz * 0.64, fg),
+                _ => {
+                    // Bigger buttons get proportionally bigger glyphs.
+                    let k = if self.btn > BTN { 0.68 } else { 0.64 };
+                    let m = (1.0 - k) / 2.0;
+                    icons::draw(pm, btn.icon, bx + sz * m, by + sz * m, sz * k, fg)
+                }
             }
         }
         if let Some(i) = self.hover {
@@ -159,7 +186,8 @@ impl<B: Copy + PartialEq> Toolbar<B> {
                 let w = l.width + 12.0 * s;
                 draw_tip(pm, t, tip, bx + sz + PAD * s + 8.0 * s + w / 2.0, by + sz * 0.2, s);
             } else {
-                draw_tip(pm, t, tip, bx + sz / 2.0, by + sz + PAD * s + 6.0 * s, s);
+                // Below the whole bar, so a tip never covers a lower row.
+                draw_tip(pm, t, tip, bx + sz / 2.0, self.y + h + 6.0 * s, s);
             }
         }
     }

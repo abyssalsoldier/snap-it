@@ -7,6 +7,7 @@
 //! building a paint colour) and the import/export helpers in this crate.
 
 pub mod brand;
+pub mod edges;
 pub mod effects;
 pub mod geom;
 pub mod io;

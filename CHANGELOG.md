@@ -9,8 +9,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 - Versioning: `CHANGELOG.md`, `scripts/bump-version.ps1`, a `snapit --version` flag, and the
   version in the tray tooltip.
+- Region overlay: scroll the mouse wheel while hovering to widen or narrow the snap target
+  (control → enclosing panel → window). Text labels, tiny parts and boxes split by a divider
+  line are not picked by default; scroll down to reach them.
+- Setting "Use UI Automation to find controls in modern apps" (on by default).
+- **Editor tool options**, modelled on ShareX's: a strip in the top bar shows the options of
+  the current tool (or of the selected item, which they then restyle): border colour and size,
+  fill colour (or no fill), corner radius, line style (solid, dashed, dotted, dash-dot), drop
+  shadow, arrow heads (end, start, both), step type (1, A, a, I, i), text background, blur
+  radius, pixel size, magnify zoom, and spotlight dim and shape. Colours come from the palette
+  or the Windows colour picker; the mouse wheel changes numbers. Options are remembered.
+- **Spotlight** tool (S) in the editor and quick edit: dims everything outside a rectangle or
+  ellipse. Several spotlights share one dimmed layer.
+- **Installers:** a setup .exe (Inno Setup) and an .msi (WiX), both per-user with no admin
+  prompt, with a Start menu shortcut and an uninstaller, plus a portable .zip.
+  `scripts/package.ps1` builds all three; pushing `master` builds them in GitHub Actions and
+  publishes the GitHub release.
+- `snapit --quit` closes a running Snap It (the installers use it before upgrading or
+  uninstalling).
+
+### Changed
+- Quick-edit toolbar: about 25% bigger buttons, in two rows (tools on top, actions below).
+- The editor's Style button and popup are replaced by the tool-options strip.
 
 ### Fixed
+- Region snapping only found whole windows in apps without child windows (browsers, Electron
+  apps such as VS Code, WPF, WinUI, the Windows 11 shell). Control snapping now uses UI
+  Automation element bounds, fetched once per window on a background thread with timeouts,
+  and falls back to finding panels and boxes from edges in the screenshot.
 - Region overlay lag: rendering is deferred to WM_PAINT and limited to the areas that changed,
   and the annotated image is patched locally. About 3 ms per frame on a 4K desktop.
 

@@ -25,6 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
+pub mod uia;
+
 pub type Error = String;
 
 #[derive(Clone, Debug)]
