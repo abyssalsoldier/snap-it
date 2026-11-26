@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.8.0] - 2026-11-25
 ### Added
 - **Scroll out through nested boxes in any app.** In Region mode, scrolling up from the box under
   the cursor now steps out through each box around it (a button, then its toolbar, then the
@@ -294,7 +296,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.7.0...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.8.0...dev
+[0.8.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.5.1...v0.6.0
