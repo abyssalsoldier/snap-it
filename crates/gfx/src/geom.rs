@@ -34,6 +34,10 @@ impl Rect {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
     }
+    /// Is `o` entirely inside this rectangle?
+    pub fn contains_rect(&self, o: Rect) -> bool {
+        o.x >= self.x && o.y >= self.y && o.right() <= self.right() && o.bottom() <= self.bottom()
+    }
     pub fn area(&self) -> i64 {
         self.w.max(0) as i64 * self.h.max(0) as i64
     }

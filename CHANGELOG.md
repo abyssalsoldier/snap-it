@@ -5,6 +5,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Scroll out through nested boxes in any app.** In Region mode, scrolling up from the box under
+  the cursor now steps out through each box around it (a button, then its toolbar, then the
+  panel), even in games and apps that expose no UI Automation, instead of jumping straight to
+  the whole window. Scrolling down still reaches the finer parts.
+- **Finer boxes in apps whose UI Automation is coarse.** Where an app reports a whole panel as one
+  element (Discord, Slack, VS Code…), boxes Snap It sees in the pixels inside it are offered too:
+  scroll to pick one strip of the panel. The app's own element stays the default.
+- **Developer mode** (Settings > Capture). With it on, F9 while selecting a region saves what
+  snapping sees (the screenshot, every candidate box and a short report) to a `debug` folder in
+  your save folder, for reporting a wrong snap.
+
+### Changed
+- **Snapping finds buttons and icons inside pictures.** Games and other pixel-drawn interfaces
+  snap to whole buttons and slots; gradients and texture inside icon art no longer count as box
+  edges, and a badge or dot overlapping a button no longer merges it with its neighbour.
+- When list rows or cards overlap under the cursor (a row scrolled under a sticky header), the
+  one centred nearest the cursor is picked.
+- Scrolled-out (whole-window) hover now resets when the cursor moves onto another window.
+
+### Fixed
+- Region snapping no longer latches onto invisible parts of a window, such as the items of a
+  closed context menu in Firefox. Firefox's element list also loads about three times faster.
+- Snap It's own windows (editor, pins, History, Settings) can be snapped to again, instead of
+  the window behind them.
+- The magnifier and highlight no longer lag behind a fast-moving mouse.
 
 ## [0.7.0] - 2026-11-25
 ### Added

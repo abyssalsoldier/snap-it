@@ -241,6 +241,9 @@ pub struct Settings {
     pub theme_preset: ThemePreset,
     /// Opt-in: scrolling capture sends synthetic wheel input to the target window.
     pub scrolling_capture: bool,
+    /// Developer mode: F9 in the region overlay saves what snapping sees (the raw
+    /// screenshot, every candidate box, a text report) to `<save dir>\debug`.
+    pub developer_mode: bool,
     pub custom_region: Option<Rect>,
     pub last_region: Option<Rect>,
     pub history_limit: usize,
@@ -268,6 +271,7 @@ impl Default for Settings {
             theme: Theme::System,
             theme_preset: ThemePreset::Studio,
             scrolling_capture: false,
+            developer_mode: false,
             custom_region: None,
             last_region: None,
             history_limit: 500,

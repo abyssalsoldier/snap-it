@@ -132,8 +132,15 @@ struct Overlay {
     /// Default snap target the steps count from; moving onto another resets them.
     hover_base: Option<Rect>,
     /// Scrolled out to the outermost target (the window): stay there while the
-    /// cursor moves to other windows, until scrolled back in.
+    /// cursor moves within that window, until scrolled back in or the cursor
+    /// moves onto another window.
     hover_outer: bool,
+    /// The window under the cursor when the hover was last picked.
+    hover_win: Option<isize>,
+    /// The cursor moved since the hover was last picked. Picking scans the
+    /// screenshot, so it runs once per painted frame, not on every mouse move
+    /// (a fast mouse sends hundreds per second and would hold off painting).
+    hover_stale: bool,
     /// UI Automation element fetcher (started on the first message, once the window exists).
     uia: Option<Fetcher>,
     drag: Drag,
@@ -247,6 +254,8 @@ pub fn open(mode: Mode) {
         hover_step: 0,
         hover_base: None,
         hover_outer: false,
+        hover_win: None,
+        hover_stale: false,
         uia: None,
         drag: Drag::None,
         items: Vec::new(),
@@ -435,21 +444,41 @@ impl Overlay {
                     }
                 }
             }
+            if let Some(d) = out.iter().filter(|(_, f)| !f).map(|(r, _)| *r).min_by_key(|r| r.area()) {
+                // Apps' element trees are often coarser than what they draw (a
+                // user panel exposed as one element, holding visibly separate
+                // strips). Boxes seen in the pixels slot in between the app's own
+                // levels: below the app's default as finer steps, above it as
+                // steps out. The app's element stays the default. Searched across
+                // the window, not inside an element: drawn panels often overlap
+                // the elements around them, so an element would cut them short.
+                let seen: Vec<Rect> = edges::boxes_at(&self.shot, x, y, w.rect)
+                    .into_iter()
+                    .map(|(r, _)| r)
+                    .filter(|r| !out.iter().any(|(o, _)| edges::near(*o, *r)))
+                    .collect();
+                out.extend(seen.into_iter().map(|r| (r, r.area() < d.area())));
+            }
             if out.is_empty() {
                 let child = w.children.iter().find(|c| part(c)).and_then(|c| c.intersect(w.rect));
                 let bounds = child.unwrap_or(w.rect);
-                let outer = edges::outer_box_at(&self.shot, x, y, bounds);
-                let inner = edges::box_at(&self.shot, x, y, bounds);
-                out.extend(outer.map(|r| (r, false)));
-                out.extend(inner.filter(|i| Some(*i) != outer).map(|r| (r, true)));
+                out.extend(edges::boxes_at(&self.shot, x, y, bounds));
                 out.extend(child.map(|r| (r, false)));
             }
         }
         out.push((w.rect, false));
         let mut v: Vec<(Rect, bool)> = out.into_iter().filter_map(|(r, f)| r.intersect(full).map(|r| (r, f))).filter(|(r, _)| r.w >= 2 && r.h >= 2).collect();
+        // Same size: the one centred nearest the cursor first. Rows of a list are all
+        // the same size, and one scrolled under a sticky header can still report
+        // a rect overlapping the row the cursor is really on.
+        let off_centre = |r: &Rect| {
+            let (dx, dy) = ((2 * r.x + r.w - 2 * x) as i64, (2 * r.y + r.h - 2 * y) as i64);
+            dx * dx + dy * dy
+        };
         // Same rect from two sources: it is fine only if both say so.
-        v.sort_by_key(|(r, f)| (r.area(), r.x, r.y, r.w, *f));
-        v.dedup_by(|b, a| a.0 == b.0);
+        v.sort_by_key(|(r, f)| (r.area(), off_centre(r), r.x, r.y, r.w, *f));
+        // A same-sized neighbour (the overlapping row) is a sibling, not a step out.
+        v.dedup_by(|b, a| a.0.w == b.0.w && a.0.h == b.0.h);
         // Largest last: everything was clipped to the window, so that is the window.
         let default = if whole { v.len().saturating_sub(1) } else { v.iter().position(|(_, f)| !f).unwrap_or(0) };
         (v.into_iter().map(|(r, _)| r).collect(), default)
@@ -466,7 +495,26 @@ impl Overlay {
     }
 
     /// Re-picks the hovered target; returns whether it is the outermost one.
+    /// A new window under the cursor starts at its default target, not zoomed out.
+    fn sync_hover_win(&mut self, x: i32, y: i32) {
+        let win = self.wins.iter().find(|w| w.rect.contains(x, y)).map(|w| w.hwnd);
+        if win != self.hover_win {
+            self.hover_win = win;
+            self.hover_outer = false;
+            self.hover_step = 0;
+        }
+    }
+
+    /// Picks the hover for the current cursor if the mouse moved since the last pick.
+    fn refresh_hover(&mut self) {
+        if std::mem::take(&mut self.hover_stale) && self.choosing() {
+            let (x, y) = self.cursor;
+            self.update_hover(x, y);
+        }
+    }
+
     fn update_hover(&mut self, x: i32, y: i32) -> bool {
+        self.sync_hover_win(x, y);
         let (c, d) = self.candidates(x, y);
         let base = c.get(d).copied();
         if base != self.hover_base {
@@ -978,6 +1026,7 @@ impl Overlay {
     }
 
     fn mouse_down(&mut self, w: &mut Win, x: i32, y: i32) {
+        self.refresh_hover();
         // Popups, the options strip and the toolbar first.
         if let Some(pr) = self.popup_rect() {
             if pr.contains(x, y) {
@@ -1104,7 +1153,7 @@ impl Overlay {
         match &mut self.drag {
             Drag::None => {
                 if !self.annotating {
-                    self.update_hover(x, y);
+                    self.hover_stale = true; // picked in WM_PAINT
                 }
             }
             Drag::NewSel { x0, y0, moved } => {
@@ -1175,6 +1224,7 @@ impl Overlay {
     }
 
     fn mouse_up(&mut self, w: &mut Win, x: i32, y: i32) {
+        self.refresh_hover();
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -1229,7 +1279,81 @@ impl Overlay {
         w.close();
     }
 
+    /// Developer mode (F9): saves what region snapping sees under the cursor to
+    /// `<save dir>\debug`: the raw screenshot, the same with every snap candidate
+    /// outlined, and a text report, so a bad snap can be reproduced offline.
+    fn debug_dump(&self) {
+        use std::fmt::Write as _;
+        let dir = self.settings.save_dir().join("debug");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("F9 dump: cannot create {}: {e}", dir.display());
+            return;
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let (x, y) = self.cursor;
+        let (cands, default) = self.candidates(x, y);
+        let mut r = String::new();
+        let _ = writeln!(r, "cursor {x},{y} (screen {},{})", x + self.origin.0, y + self.origin.1);
+        let _ = writeln!(r, "mode {:?}  snaps_controls {}  hover_step {}  hover_outer {}", self.mode, self.snaps_controls(), self.hover_step, self.hover_outer);
+        let _ = writeln!(r, "hover {:?}", self.hover);
+        match self.wins.iter().find(|w| w.rect.contains(x, y)) {
+            Some(w) => {
+                let _ = writeln!(r, "window {:?} hwnd {:#x}\n  rect {:?}\n  client {:?}\n  {} child windows", w.title, w.hwnd, w.rect, w.client, w.children.len());
+                let uia = match self.uia.as_ref().map(|f| f.get(w.hwnd)) {
+                    None => "off".to_string(),
+                    Some(Fetch::Pending) => "pending".to_string(),
+                    Some(Fetch::Failed) => "failed".to_string(),
+                    Some(Fetch::Ready(els)) => format!("{} elements", els.len()),
+                };
+                let _ = writeln!(r, "  UI Automation: {uia}");
+                let _ = writeln!(r, "  edge boxes (fine = not default) {:?}", edges::boxes_at(&self.shot, x, y, w.rect));
+            }
+            None => {
+                let _ = writeln!(r, "no window under the cursor");
+            }
+        }
+        let _ = writeln!(r, "candidates (innermost first; * = default, > = current hover):");
+        for (i, c) in cands.iter().enumerate() {
+            let _ = writeln!(r, "  {}{} {i}: {:?}", if i == default { '*' } else { ' ' }, if Some(*c) == self.hover { '>' } else { ' ' }, c);
+        }
+        let mut marked = self.shot.clone();
+        let id = Transform::identity();
+        for (i, c) in cands.iter().enumerate() {
+            let (colour, width) = if Some(*c) == self.hover {
+                (Rgba::rgb(255, 40, 40), 3.0)
+            } else if i == default {
+                (Rgba::rgb(40, 220, 80), 2.0)
+            } else {
+                (Rgba::YELLOW, 1.0)
+            };
+            if let Some(p) = snapit_gfx::tiny_skia::Rect::from_xywh(c.x as f32 + 0.5, c.y as f32 + 0.5, c.w as f32 - 1.0, c.h as f32 - 1.0).map(PathBuilder::from_rect) {
+                marked.stroke_path(&p, &colour.paint(), &Stroke { width, ..Default::default() }, id, None);
+            }
+        }
+        // Cursor crosshair.
+        let mut pb = PathBuilder::new();
+        pb.move_to(x as f32 - 8.0, y as f32 + 0.5);
+        pb.line_to(x as f32 + 9.0, y as f32 + 0.5);
+        pb.move_to(x as f32 + 0.5, y as f32 - 8.0);
+        pb.line_to(x as f32 + 0.5, y as f32 + 9.0);
+        if let Some(p) = pb.finish() {
+            marked.stroke_path(&p, &Rgba::rgb(255, 0, 255).paint(), &Stroke { width: 1.0, ..Default::default() }, id, None);
+        }
+        let base = dir.join(format!("snap_{stamp}"));
+        let raw = base.with_extension("raw.png");
+        let mark = base.with_extension("marked.png");
+        let txt = base.with_extension("txt");
+        let res = snapit_gfx::io::save(&self.shot, &raw, snapit_gfx::io::Format::Png, 90)
+            .and_then(|_| snapit_gfx::io::save(&marked, &mark, snapit_gfx::io::Format::Png, 90))
+            .and_then(|_| std::fs::write(&txt, &r).map_err(|e| e.to_string()));
+        eprint!("F9 dump{}\n{r}", match res {
+            Ok(()) => format!(" saved to {}", txt.display()),
+            Err(e) => format!(" FAILED: {e}"),
+        });
+    }
+
     fn key_down(&mut self, w: &mut Win, vk: u16) {
+        self.refresh_hover();
         let ctrl = super::ctrl();
         if self.editing.is_some() {
             if ctrl && matches!(vk, 0x5A | 0x59) {
@@ -1247,6 +1371,7 @@ impl Overlay {
             }
         }
         match vk {
+            0x78 if self.settings.developer_mode => self.debug_dump(), // F9
             0x1B => {
                 if self.popup != Popup::None {
                     self.popup = Popup::None;
@@ -1322,16 +1447,18 @@ impl Overlay {
     }
 
     fn wheel(&mut self, delta: i16) {
+        self.refresh_hover();
         if !self.annotating {
             // While choosing: step out to the enclosing element, or back in.
             if matches!(self.drag, Drag::None) && self.sel.is_none() {
+                let (x, y) = self.cursor;
+                self.sync_hover_win(x, y);
                 if delta > 0 {
                     self.hover_step += 1;
                 } else {
                     self.hover_outer = false;
                     self.hover_step -= 1;
                 }
-                let (x, y) = self.cursor;
                 let outermost = self.update_hover(x, y);
                 // Scrolled all the way out: keep picking whole windows as the cursor moves.
                 if delta > 0 && outermost {
@@ -1523,6 +1650,11 @@ impl Overlay {
         }
         dirty.extend(self.sync_comp());
 
+        if self.hover_stale {
+            // Make sure a frame comes, so WM_PAINT picks the new hover.
+            let (x, y) = self.cursor;
+            dirty.push(Rect::new(x, y, 1, 1));
+        }
         let full = self.full();
         for r in dirty.into_iter().filter_map(|r| r.intersect(full)) {
             super::invalidate(w.hwnd, Some(r));
@@ -1863,6 +1995,12 @@ impl Handler for Overlay {
                 Some(LRESULT(0))
             }
             WM_PAINT => {
+                if self.hover_stale {
+                    // Pick the hover for where the cursor is now, then add whatever
+                    // that changed to this paint (the update region is read below).
+                    self.refresh_hover();
+                    self.redraw(w);
+                }
                 if self.first_paint {
                     // First paint: compose everything once.
                     self.first_paint = false;

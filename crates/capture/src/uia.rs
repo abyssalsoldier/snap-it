@@ -5,7 +5,7 @@
 //! finds nothing to snap to. UI Automation exposes their element tree instead.
 //!
 //! The overlay never calls UIA while the mouse moves. One worker thread fetches
-//! every element rectangle of a window in a single cached `FindAllBuildCache`
+//! every element rectangle of a window in a single cached `BuildUpdatedCache`
 //! call, with connection/transaction timeouts so a hung app cannot stall it,
 //! and the overlay hit-tests that list locally.
 
@@ -18,13 +18,13 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomation2, TreeScope_Subtree, UIA_BoundingRectanglePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement, TreeScope_Subtree, UIA_BoundingRectanglePropertyId,
     UIA_ControlTypePropertyId, UIA_IsOffscreenPropertyId, UIA_TextControlTypeId, UIA_TitleBarControlTypeId,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 /// Hard cap on elements kept per window (a big web page can expose tens of thousands).
-const MAX_ELEMENTS: i32 = 20_000;
+const MAX_ELEMENTS: usize = 20_000;
 /// Milliseconds UIA may wait on a provider before giving up.
 const TIMEOUT_MS: u32 = 1500;
 
@@ -115,25 +115,41 @@ unsafe fn elements_of(uia: &IUIAutomation, hwnd: isize) -> Option<Vec<Element>> 
     cache.AddProperty(UIA_BoundingRectanglePropertyId).ok()?;
     cache.AddProperty(UIA_IsOffscreenPropertyId).ok()?;
     cache.AddProperty(UIA_ControlTypePropertyId).ok()?;
-    let cond = uia.ControlViewCondition().ok()?;
-    let all = root.FindAllBuildCache(TreeScope_Subtree, &cond, &cache).ok()?;
-    let n = all.Length().ok()?.min(MAX_ELEMENTS);
-    let mut out = Vec::with_capacity(n.max(0) as usize);
-    for i in 0..n {
-        let Ok(e) = all.GetElement(i) else { continue };
-        if e.CachedIsOffscreen().is_ok_and(|b| b.as_bool()) {
-            continue;
-        }
-        let Ok(r) = e.CachedBoundingRectangle() else { continue };
-        let r = Rect::from_ltrb(r.left, r.top, r.right, r.bottom);
-        if r.w > 4 && r.h > 4 {
-            let ty = e.CachedControlType().ok();
-            let text = ty == Some(UIA_TextControlTypeId);
-            let title = ty == Some(UIA_TitleBarControlTypeId);
-            out.push(Element { rect: r, fine: text || r.w < FINE_SIDE || r.h < FINE_SIDE, title });
-        }
-    }
+    // Cache the whole tree (not a flat list) in one cross-process call, so a hidden
+    // subtree can be skipped as a whole: closed menus (Firefox keeps its context
+    // menus in the tree) and background tabs are marked offscreen at their root
+    // while their items still claim to be visible at their last position.
+    cache.SetTreeScope(TreeScope_Subtree).ok()?;
+    cache.SetTreeFilter(&uia.ControlViewCondition().ok()?).ok()?;
+    let root = root.BuildUpdatedCache(&cache).ok()?;
+    let mut out = Vec::new();
+    collect(&root, &mut out);
     out.sort_by_key(|e| e.rect.area());
     out.dedup();
     Some(out)
+}
+
+/// Adds `e`'s cached children (and theirs), skipping every offscreen subtree.
+unsafe fn collect(e: &IUIAutomationElement, out: &mut Vec<Element>) {
+    let Ok(kids) = e.GetCachedChildren() else { return };
+    let n = kids.Length().unwrap_or(0);
+    for i in 0..n {
+        if out.len() >= MAX_ELEMENTS {
+            return;
+        }
+        let Ok(k) = kids.GetElement(i) else { continue };
+        if k.CachedIsOffscreen().is_ok_and(|b| b.as_bool()) {
+            continue;
+        }
+        if let Ok(r) = k.CachedBoundingRectangle() {
+            let r = Rect::from_ltrb(r.left, r.top, r.right, r.bottom);
+            if r.w > 4 && r.h > 4 {
+                let ty = k.CachedControlType().ok();
+                let text = ty == Some(UIA_TextControlTypeId);
+                let title = ty == Some(UIA_TitleBarControlTypeId);
+                out.push(Element { rect: r, fine: text || r.w < FINE_SIDE || r.h < FINE_SIDE, title });
+            }
+        }
+        collect(&k, out);
+    }
 }

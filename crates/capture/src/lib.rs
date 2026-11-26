@@ -217,7 +217,8 @@ fn client_rect(h: HWND) -> Rect {
     Rect::new(p.x, p.y, r.right - r.left, r.bottom - r.top)
 }
 
-/// Visible top-level windows in z-order (topmost first), excluding this process's own windows.
+/// Visible top-level windows in z-order (topmost first), excluding this process's
+/// overlay and recording-frame windows.
 /// Snapshotted once when the region overlay opens; no per-mouse-move cross-process calls.
 pub fn visible_windows() -> Vec<WindowInfo> {
     struct Ctx {
@@ -242,11 +243,6 @@ pub fn visible_windows() -> Vec<WindowInfo> {
         if !IsWindowVisible(h).as_bool() || IsIconic(h).as_bool() || is_cloaked(h) {
             return TRUE;
         }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(h, Some(&mut pid));
-        if pid == ctx.own_pid {
-            return TRUE;
-        }
         let Some(rect) = window_rect(h.0 as isize) else { return TRUE };
         if rect.w < 8 || rect.h < 8 {
             return TRUE;
@@ -254,6 +250,14 @@ pub fn visible_windows() -> Vec<WindowInfo> {
         let class = text_of(h, true);
         if class == "Progman" || class == "WorkerW" {
             return TRUE; // the desktop; monitors cover that case
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        // Our own editor, pins, history and settings windows are in the screenshot,
+        // so they must stay snap targets (skipping them made the hover pick the
+        // window behind). Only the overlay and the recording frame are not content.
+        if pid == ctx.own_pid && (class == "SnapItOverlay" || class.starts_with("SnapItRec")) {
+            return TRUE;
         }
         let mut children = Vec::new();
         let _ = EnumChildWindows(Some(h), Some(child_cb), LPARAM(&mut children as *mut _ as isize));

@@ -165,6 +165,7 @@ const TOG_UIA: u16 = 24;
 const TOG_MAGNIFIER: u16 = 25;
 const TOG_CROSSHAIR: u16 = 26;
 const TOG_SCROLLING: u16 = 27;
+const TOG_DEV: u16 = 28;
 const TOG_T_COPY: u16 = 30;
 const TOG_T_SAVE: u16 = 31;
 const TOG_T_EDITOR: u16 = 32;
@@ -212,6 +213,7 @@ struct SettingsWin {
     crosshair: bool,
     dim: TextInput,
     scrolling_capture: bool,
+    developer_mode: bool,
     custom_region: Option<Rect>,
 
     t_copy: bool,
@@ -284,6 +286,7 @@ pub fn open() {
         crosshair: s.region.crosshair,
         dim: TextInput::new(s.region.dim_opacity.to_string(), "110", true, false),
         scrolling_capture: s.scrolling_capture,
+        developer_mode: s.developer_mode,
         custom_region: s.custom_region,
         t_copy: s.tasks.copy,
         t_save: s.tasks.save,
@@ -418,6 +421,7 @@ impl SettingsWin {
         s.region.crosshair = self.crosshair;
         s.region.dim_opacity = Self::parse_num(&self.dim, 110, 0, 230) as u8;
         s.scrolling_capture = self.scrolling_capture;
+        s.developer_mode = self.developer_mode;
         s.custom_region = self.custom_region;
 
         s.tasks.copy = self.t_copy;
@@ -680,6 +684,7 @@ impl SettingsWin {
             TOG_MAGNIFIER => &mut self.magnifier,
             TOG_CROSSHAIR => &mut self.crosshair,
             TOG_SCROLLING => &mut self.scrolling_capture,
+            TOG_DEV => &mut self.developer_mode,
             TOG_T_COPY => &mut self.t_copy,
             TOG_T_SAVE => &mut self.t_save,
             TOG_T_EDITOR => &mut self.t_editor,
@@ -956,6 +961,23 @@ impl SettingsWin {
         widgets::draw_button(pm, &t, clr_r, "Clear", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_CLEAR_CUSTOM)), self.custom_region.is_none(), s);
         self.add(cr, clr_r, Hit::Btn(BTN_CLEAR_CUSTOM), "Clear custom region", &custom);
         *y += c3_h + 14.0 * s;
+
+        // Card 4: Developer mode
+        let c4_h = 86.0 * s;
+        widgets::draw_card(pm, &t, Rect::new(x0 as i32, *y as i32, cw as i32, c4_h as i32), 10.0, s);
+        let mut cy = *y + 16.0 * s;
+        self.draw_toggle_row(
+            pm,
+            cr,
+            ix,
+            iw,
+            &mut cy,
+            TOG_DEV,
+            "Developer mode",
+            Some("F9 while selecting a region saves what snapping sees, to a \"debug\" folder in your save folder."),
+            self.developer_mode,
+        );
+        *y += c4_h + 14.0 * s;
     }
 
     fn draw_after(&mut self, pm: &mut PixmapMut, cr: Rect, x0: f32, cw: f32, y: &mut f32) {
