@@ -66,6 +66,8 @@ pub enum Click {
     ShowFile(PathBuf),
     /// Open the first-launch setup (it has new steps since this user last saw it).
     OpenWelcome,
+    /// Open "Report a bug" (Snap It crashed last time).
+    ReportBug,
 }
 
 pub struct State {

@@ -251,6 +251,9 @@ pub struct Settings {
     /// The first-launch setup this user last finished or skipped (`ui::welcome::SETUP_VERSION`).
     /// 0 = never (including settings from before the setup existed).
     pub setup_version: u32,
+    /// When crash.log was last offered for a bug report (seconds since 1970), so the
+    /// "closed unexpectedly" notification shows once per crash.
+    pub last_crash_seen: u64,
 }
 
 impl Default for Settings {
@@ -282,6 +285,7 @@ impl Default for Settings {
                 Workflow::new("Ctrl+Shift+PrintScreen", Action::RecordMp4),
             ],
             setup_version: 0,
+            last_crash_seen: 0,
         }
     }
 }

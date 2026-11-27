@@ -3,6 +3,7 @@
 
 mod actions;
 mod app;
+mod bugreport;
 mod clipboard;
 mod commands;
 mod history;
@@ -194,6 +195,7 @@ fn main() -> Result<()> {
     unsafe {
         let _ = windows::Win32::System::LibraryLoader::SetDefaultDllDirectories(windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
+    bugreport::install_panic_hook();
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     if args.first().is_some_and(|a| a == "--version" || a == "-V") {
         // Release builds have no console, so show the version in a message box there.
@@ -309,6 +311,7 @@ fn main() -> Result<()> {
         );
     }
     log("running; right-click the tray icon for the menu");
+    bugreport::check_previous_crash();
     if let Some(old) = updated_from {
         app::post(Command::Notify { title: format!("Snap It updated to {}", env!("CARGO_PKG_VERSION")), body: format!("The running copy ({old}) was closed and replaced.") });
     }
@@ -378,6 +381,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     Some(app::Click::Url(url)) => shell::open_url(&url),
                     Some(app::Click::ShowFile(p)) => shell::show_in_folder(&p),
                     Some(app::Click::OpenWelcome) => app::post(Command::OpenWelcome),
+                    Some(app::Click::ReportBug) => app::post(Command::Run(Action::ReportBug)),
                     None => app::post(Command::OpenLastCapture),
                 },
                 _ => {}

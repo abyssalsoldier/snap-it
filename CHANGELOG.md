@@ -5,6 +5,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Report a bug** (tray menu, and Settings > System). Opens a new GitHub issue in your browser,
+  already filled in with your Snap It version, Windows build, monitors and scaling, and a few
+  settings, after showing you exactly what will be included. Snap It sends nothing itself; you
+  review the issue and submit it on GitHub. Folders, file names and hotkeys are never included.
+- **Crash log.** If Snap It crashes, the error is saved to `crash.log` in the settings folder. The
+  next time it starts, a notification offers to report it, with the crash included.
+
+### Changed
+- The Settings page "Integration" is now called **System**.
 
 ## [0.8.0] - 2026-11-25
 ### Added

@@ -281,7 +281,7 @@ fn parse_release(v: &serde_json::Value) -> Result<Release, String> {
 
 fn check(repo: &str) -> Result<Option<Release>, String> {
     if !valid_repo(repo) {
-        return Err("Set the update repository as owner/repo in Settings > Integration.".into());
+        return Err("Set the update repository as owner/repo in Settings > System.".into());
     }
     let body = https_get("api.github.com", &format!("/repos/{repo}/releases/latest"))?;
     let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
@@ -357,7 +357,7 @@ pub fn notes_text(md: &str) -> String {
 }
 
 /// The release repository: the setting, or this project's own when it is left empty.
-fn update_repo() -> String {
+pub(crate) fn update_repo() -> String {
     let r = app::settings().integration.update_repo.trim().to_string();
     if r.is_empty() { crate::settings::DEFAULT_UPDATE_REPO.to_string() } else { r }
 }

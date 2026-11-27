@@ -23,6 +23,7 @@ pub enum Action {
     OpenHistory,
     OpenFolder,
     OpenSettings,
+    ReportBug,
     Exit,
 }
 
@@ -47,6 +48,7 @@ const TABLE: &[(Action, &str, &str)] = &[
     (Action::OpenHistory, "open_history", "History"),
     (Action::OpenFolder, "open_folder", "Screenshots folder"),
     (Action::OpenSettings, "open_settings", "Settings…"),
+    (Action::ReportBug, "report_bug", "Report a bug…"),
     (Action::Exit, "exit", "Exit"),
 ];
 

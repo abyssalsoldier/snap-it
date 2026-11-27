@@ -140,6 +140,7 @@ pub fn run_action(a: Action, allow_delay: bool) {
         Action::OpenHistory => crate::ui::history::open(),
         Action::OpenFolder => crate::shell::open_folder(&s.save_dir()),
         Action::OpenSettings => crate::ui::settings_window::open(),
+        Action::ReportBug => crate::bugreport::report(),
         Action::Exit => crate::request_exit(),
     }
 }

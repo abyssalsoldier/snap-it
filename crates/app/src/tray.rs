@@ -95,7 +95,7 @@ pub fn show_menu(hwnd: HWND) -> Result<()> {
         submenu(menu, "Record", &[RecordMp4, RecordGif])?;
         submenu(menu, "Tools", &[Ocr, ScanQr, MakeQr, ColorPicker, Ruler, OpenEditor])?;
         AppendMenuW(menu, MF_SEPARATOR, 0, None)?;
-        for a in [OpenHistory, OpenFolder, OpenSettings] {
+        for a in [OpenHistory, OpenFolder, OpenSettings, ReportBug] {
             add_item(menu, a)?;
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, None)?;

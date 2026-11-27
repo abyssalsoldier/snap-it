@@ -47,7 +47,7 @@ const TABS: [(&str, Icon); 6] = [
     ("After capture", Icon::Bolt),
     ("Hotkeys", Icon::Keyboard),
     ("Recording", Icon::Video),
-    ("Integration", Icon::Plug),
+    ("System", Icon::Plug),
 ];
 
 /// Actions that can have a hotkey, in display order.
@@ -153,6 +153,7 @@ const BTN_WELCOME: u16 = 4;
 const BTN_CLEAR_CUSTOM: u16 = 5;
 const BTN_CHECK_NOW: u16 = 6;
 const BTN_OPEN_CONFIG: u16 = 7;
+const BTN_REPORT_BUG: u16 = 8;
 
 const SEG_FORMAT: u16 = 10;
 const SEG_THEME: u16 = 11;
@@ -1167,6 +1168,9 @@ impl SettingsWin {
         let open_r = Rect::new(x0 as i32, *y as i32, (190.0 * s) as i32, (34.0 * s) as i32);
         widgets::draw_button(pm, &t, open_r, "Open settings folder", Some(Icon::Folder), BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_OPEN_CONFIG)), false, s);
         self.add(cr, open_r, Hit::Btn(BTN_OPEN_CONFIG), "Open settings folder", "");
+        let bug_r = Rect::new(open_r.right() + (10.0 * s) as i32, *y as i32, (150.0 * s) as i32, (34.0 * s) as i32);
+        widgets::draw_button(pm, &t, bug_r, "Report a bug…", None, BtnStyle::Secondary, self.hover == Some(Hit::Btn(BTN_REPORT_BUG)), false, s);
+        self.add(cr, bug_r, Hit::Btn(BTN_REPORT_BUG), "Report a bug", "Opens a pre-filled GitHub issue in your browser");
         *y += 46.0 * s;
     }
 
@@ -1217,6 +1221,7 @@ impl SettingsWin {
                     w.close();
                 }
                 BTN_OPEN_CONFIG => crate::shell::open_folder(&crate::paths::config_dir()),
+                BTN_REPORT_BUG => app::post(app::Command::Run(crate::actions::Action::ReportBug)),
                 _ => {}
             },
         }
