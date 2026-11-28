@@ -56,7 +56,7 @@ pub enum Mode {
 impl Mode {
     fn hint(self) -> &'static str {
         match self {
-            Mode::Region => "Drag to select · Click a control, or hold Ctrl for the whole window · Scroll to widen or narrow · Esc to cancel",
+            Mode::Region => "Click to capture the highlighted area · Scroll to expand or shrink selection · Drag for a custom size · Ctrl for the whole window · Esc to cancel",
             Mode::Window => "Click a window to capture it · Esc to cancel",
             Mode::SetCustomRegion => "Drag to set your custom region · Esc to cancel",
             Mode::Scrolling => "Select the scrolling area · Esc cancels · once it scrolls, Esc or a right-click stops it",

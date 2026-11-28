@@ -5,6 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- The Region mode tip now explains each action plainly: click to capture the highlighted area,
+  scroll to expand or shrink the selection, or drag for a custom size.
 
 ## [0.9.0] - 2026-11-27
 ### Added
