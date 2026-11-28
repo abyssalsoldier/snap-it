@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.9.1] - 2026-11-28
 ### Changed
 - The Region mode tip now explains each action plainly: click to capture the highlighted area,
   scroll to expand or shrink the selection, or drag for a custom size.
@@ -311,7 +313,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Opt-in integrations:** start with Windows, Explorer context menu, notify-only update check.
 - Release script (build, sign, SHA-256, Defender scan) and the EDR audit report.
 
-[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.9.0...dev
+[Unreleased]: https://github.com/abyssalsoldier/snap-it/compare/v0.9.1...dev
+[0.9.1]: https://github.com/abyssalsoldier/snap-it/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/abyssalsoldier/snap-it/compare/v0.6.1...v0.7.0
